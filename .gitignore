@@ -1,0 +1,16 @@
+target/
+build/
+ui/build/
+.conan/
+CMakeUserPresets.json
+*.env
+.env*
+config.toml
+config.local.toml
+secrets/
+*.pem
+*.key
+.idea/
+.vscode/
+*.swp
+.DS_Store

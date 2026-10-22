@@ -1,0 +1,4 @@
+[toolchain]
+# Stable актуален на 2026-10-22: 1.99.1. Для воспроизводимости CI можно закрепить точную версию.
+channel = "stable"
+components = ["rustfmt", "clippy"]

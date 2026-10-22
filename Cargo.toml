@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/vulture-proto", "crates/vulture-server", "crates/vulture-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/OWNER/vulture"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+prost = "0.14"
+prost-build = "0.14"
+protoc-bin-vendored = "3.3"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "signal"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
