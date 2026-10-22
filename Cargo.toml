@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
-repository = "https://github.com/OWNER/vulture"
+repository = "https://github.com/matyushov/vulture"
 
 [workspace.dependencies]
 anyhow = "1.0"
