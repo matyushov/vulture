@@ -14,3 +14,7 @@ secrets/
 .vscode/
 *.swp
 .DS_Store
+# research raw data and tool venvs
+research/data/
+research/tools/**/.venv/
+__pycache__/

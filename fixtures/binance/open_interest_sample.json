@@ -1,0 +1,27 @@
+[
+ {
+  "symbol": "BTCUSDT",
+  "openInterest": "91955.828",
+  "time": 1792775447389
+ },
+ {
+  "symbol": "ETHUSDT",
+  "openInterest": "2325894.586",
+  "time": 1792775447660
+ },
+ {
+  "symbol": "SOLUSDT",
+  "openInterest": "8421891.02",
+  "time": 1792775449680
+ },
+ {
+  "symbol": "BTCUSDC",
+  "openInterest": "21216.057",
+  "time": 1792776309795
+ },
+ {
+  "symbol": "币安人生USDT",
+  "openInterest": "72183771",
+  "time": 1792776311493
+ }
+]
