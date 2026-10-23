@@ -1,4 +1,4 @@
-# Сборка vulture-ui (Qt6 + conan). Отдельный workflow: не блокирует Rust-задания ci.yml.
+# vulture-ui build (Qt6 + conan). A separate workflow: does not block the Rust jobs of ci.yml.
 name: ui
 
 on:
@@ -18,15 +18,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Qt 6, последняя доступная ветка; при смене править только здесь.
+  # Qt 6, latest available branch; when changing it, edit only here.
   QT_VERSION: "6.12.*"
 
 jobs:
   ui:
     name: ui (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Зависимости берутся готовыми из Nexus (их собирает conan-deps.yml). Без читающих
-    # секретов (форки) сборка grpc из исходников долгая, поэтому лимит большой.
+    # Dependencies are taken prebuilt from Nexus (conan-deps.yml builds them). Without read-only
+    # secrets (forks) building grpc from source is slow, so the limit is large.
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -61,8 +61,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Читающий пользователь Nexus (секреты репозитория). Пусто: форки и PR без секретов
-      # работают с conan-center.
+      # Read-only Nexus user (repository secrets). Empty: forks and PRs without secrets
+      # use conan-center.
       - name: Set up Conan
         uses: ./.github/actions/setup-conan
         with:
@@ -75,7 +75,7 @@ jobs:
           key: conan-${{ matrix.profile }}-${{ hashFiles('ui/conan.lock', 'ui/conanfile.py', 'ui/conan/profiles/*') }}
           restore-keys: conan-${{ matrix.profile }}-
 
-      # Профиль + conan.lock дают те же package_id, что выгрузил conan-deps.yml.
+      # The profile + conan.lock yield the same package_id values that conan-deps.yml uploaded.
       - name: Conan install
         shell: bash
         run: >

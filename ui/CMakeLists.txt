@@ -5,8 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-# --- Контракт vulture.v1 для C++ (protoc + grpc_cpp_plugin из conan tool_requires) ---
-# Без grpc/protobuf (например, нет conan install) цель vulture-proto-cpp отключается.
+# --- The vulture.v1 contract for C++ (protoc + grpc_cpp_plugin from conan tool_requires) ---
+# Without grpc/protobuf (for example, no conan install) the vulture-proto-cpp target is disabled.
 find_package(Protobuf CONFIG QUIET)
 find_package(gRPC CONFIG QUIET)
 find_program(VULTURE_PROTOC protoc)
@@ -16,7 +16,7 @@ if(Protobuf_FOUND AND gRPC_FOUND AND VULTURE_PROTOC AND VULTURE_GRPC_CPP_PLUGIN)
     set(VULTURE_PROTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../proto")
     set(VULTURE_PROTO_GEN "${CMAKE_CURRENT_BINARY_DIR}/gen")
     file(MAKE_DIRECTORY "${VULTURE_PROTO_GEN}")
-    # Файлы с сервисами дают ещё *.grpc.pb.*; common.proto - только сообщения.
+    # Files with services also produce *.grpc.pb.*; common.proto has messages only.
     set(VULTURE_PROTO_MSG_ONLY common)
     set(VULTURE_PROTO_SERVICES stream history control)
     set(VULTURE_PROTO_SRCS "")
@@ -46,7 +46,7 @@ else()
     message(WARNING "protobuf/gRPC/protoc/grpc_cpp_plugin not found: target vulture-proto-cpp is disabled (run conan install)")
 endif()
 
-# Если Qt6 не найден и опция выключена, конфигурация проходит без цели vulture-ui.
+# If Qt6 is not found and the option is off, configuration succeeds without the vulture-ui target.
 option(VULTURE_UI_REQUIRE_QT "Fail configuration if Qt6 is not found" OFF)
 
 if(VULTURE_UI_REQUIRE_QT)

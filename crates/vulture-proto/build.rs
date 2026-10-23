@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto");
     let protos: Vec<PathBuf> = PROTOS.iter().map(|p| proto_root.join(p)).collect();
 
-    // protoc берём из вендорного крейта: системный не требуется.
+    // protoc is taken from the vendored crate: a system one is not required.
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
 

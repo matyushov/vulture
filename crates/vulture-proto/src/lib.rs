@@ -1,4 +1,4 @@
-//! Сгенерированный код контракта `vulture.v1`.
+//! Generated code of the `vulture.v1` contract.
 
 #[allow(clippy::all)]
 pub mod v1 {
@@ -172,8 +172,8 @@ mod tests {
         assert_eq!(decoded.mark_price, Some(0.0));
     }
 
-    // Golden bytes: фиксируют проводной формат. Менять нельзя; изменение означает
-    // несовместимость контракта.
+    // Golden bytes: they pin the wire format. They must not be changed; a change means
+    // a contract incompatibility.
     const GOLDEN_LIQUIDATION: &str = "0a0f313730303030303030303132332d30524c0a0762696e616e63651207425443555344541a0d4254432d555344542d5045525020fbd095ffbc312896d195ffbc31300139000000001017e14041000000000000d03f49000000001017c140";
     const GOLDEN_OI: &str = "0a0f313730303030303030303132332d305a480a0562796269741207455448555344541a0d4554482d555344542d5045525020e8d795ffbc3128f2d795ffbc31310000000000408f40390000000080843e41410000000000409f40";
     const GOLDEN_GAP: &str = "0a0f313730303030303030303132332d3062210a036f6b78120c6c69717569646174696f6e7318d0df95ffbc312088f795ffbc31";

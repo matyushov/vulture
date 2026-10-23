@@ -323,19 +323,19 @@ real coins (divide by the prefix) or sum by a per-exchange alias table. Open que
 2. README: OKX "OI channel `open-interest`" - correct; add `oi` contracts, `oiCcy` coin, `oiUsd` USD, per-`instId`
    subscription (not instType-wide), and that mark price needs the separate `mark-price` channel (README says
    mark price arrives "in tickers" for OKX; OKX `tickers` has no mark price: wrong).
-3. README: Bybit and OKX mark price "в тикерах" - Bybit yes, OKX no (see 2).
-4. README: BitMEX "публичный канал `liquidation`, OI в данных инструмента" - correct, but the liquidation table
+3. README: Bybit and OKX mark price "in tickers" - Bybit yes, OKX no (see 2).
+4. README: BitMEX "public channel `liquidation`, OI in instrument data" - correct, but the liquidation table
    is order events (insert/update/delete with `leavesQty`), not fills; units of `openValue` differ per
    settlement currency; XBT alias needed.
-5. README: Deribit "OI в тикере" - correct; add `raw` needs authentication so use `100ms`/`agg2`, and that OI
+5. README: Deribit "OI in the ticker" - correct; add `raw` needs authentication so use `100ms`/`agg2`, and that OI
    is USD for inverse and base coin for linear; no dedicated liquidation channel.
-6. README: Bitget/Gate "публичный поток ликвидаций может быть неполным или приватным" - Bitget public but
+6. README: Bitget/Gate "public liquidation stream may be incomplete or private" - Bitget public but
    sampled (largest long and short per pair per second); Gate public and (since 2026-08-20) complete;
    Hyperliquid has no public liquidation stream; KuCoin and MEXC not confirmed.
-7. Epic V2-2 note "ping строкой `ping`" is correct; `WS_SERVICE_MESSAGES.md` says OKX ping format unknown:
+7. Epic V2-2 note "ping as the string `ping`" is correct; `WS_SERVICE_MESSAGES.md` says OKX ping format unknown:
    it is the plain text `ping`/`pong`, idle limit 30 s.
 8. OKX port 8443 is being retired (changelog entry of 2026-10-16): use 443.
-9. Epic V7: "Символы: `XBTUSDT`, `ETHUSDT`" - raw names fine, normalized base must be BTC, not XBT.
+9. Epic V7: "Symbols: `XBTUSDT`, `ETHUSDT`" - raw names fine, normalized base must be BTC, not XBT.
 
 ## 7. Open items (not confirmed)
 

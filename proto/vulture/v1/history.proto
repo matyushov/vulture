@@ -1,4 +1,4 @@
-// История и агрегаты. Все расчёты выполняет сервер.
+// History and aggregates. All calculations are performed by the server.
 syntax = "proto3";
 
 package vulture.v1;
@@ -6,10 +6,10 @@ package vulture.v1;
 import "vulture/v1/common.proto";
 
 service History {
-  // События за период (свежее из Redis, старше из ClickHouse прозрачно). Постраничность:
-  // курсор = Event.id последнего полученного события, передаётся в HistoryRequest.cursor.
+  // Events for a period (recent from Redis, older from ClickHouse, transparently). Pagination:
+  // cursor = Event.id of the last received event, passed in HistoryRequest.cursor.
   rpc Query(HistoryRequest) returns (stream Event);
-  // Агрегаты по бирже, символу или базовому активу с шагом час/день/неделя/месяц.
+  // Aggregates by exchange, symbol or base asset with an hour/day/week/month step.
   rpc Aggregate(AggregateRequest) returns (AggregateResponse);
 }
 
@@ -17,10 +17,10 @@ message HistoryRequest {
   repeated string exchanges = 1;
   repeated string symbols = 2;
   repeated EventType types = 3;
-  // Границы периода, мс, [from_ts, to_ts).
+  // Period bounds, ms, [from_ts, to_ts).
   int64 from_ts = 4;
   int64 to_ts = 5;
-  // 0 = лимит сервера по умолчанию.
+  // 0 = the server default limit.
   uint32 limit = 6;
   string cursor = 7;
   reserved 8 to 15;
@@ -43,30 +43,30 @@ enum Step {
 
 enum Metric {
   METRIC_UNSPECIFIED = 0;
-  // Ликвидации: сумма USD и число.
+  // Liquidations: USD sum and count.
   METRIC_LIQ_SUM_USD = 1;
   METRIC_LIQ_COUNT = 2;
-  // Ликвидации по сторонам, USD.
+  // Liquidations by side, USD.
   METRIC_LIQ_LONG_USD = 3;
   METRIC_LIQ_SHORT_USD = 4;
-  // Максимальная ликвидация, USD.
+  // Largest liquidation, USD.
   METRIC_LIQ_MAX_USD = 5;
-  // Изменение OI за шаг: в базовой монете и в USD.
+  // OI change over the step: in the base coin and in USD.
   METRIC_OI_CHANGE_BASE = 6;
   METRIC_OI_CHANGE_USD = 7;
-  // Суммарный OI по базовому активу (все биржи), USD, на конец шага.
+  // Total OI per base asset (all exchanges), USD, at the end of the step.
   METRIC_OI_TOTAL_USD = 8;
-  // Доля ликвидаций от OI: liq_usd / oi_usd.
+  // Liquidations as a share of OI: liq_usd / oi_usd.
   METRIC_LIQ_TO_OI_RATIO = 9;
 }
 
 message AggregateRequest {
   GroupBy group_by = 1;
   Step step = 2;
-  // Период, мс, [from_ts, to_ts).
+  // Period, ms, [from_ts, to_ts).
   int64 from_ts = 3;
   int64 to_ts = 4;
-  // Фильтры; пустой список = без фильтра.
+  // Filters; an empty list = no filter.
   repeated string exchanges = 5;
   repeated string symbols = 6;
   repeated string base_assets = 7;
@@ -76,24 +76,24 @@ message AggregateRequest {
 
 message MetricValue {
   Metric metric = 1;
-  // Нет данных (например нет OI в шаге) - значение отсутствует.
+  // No data (for example, no OI in the step): the value is absent.
   optional double value = 2;
 }
 
 message AggregateRow {
-  // Начало шага, мс.
+  // Step start, ms.
   int64 bucket_start = 1;
-  // Ключ группы: биржа, нормализованный символ или базовый актив (по group_by).
+  // Group key: exchange, normalized symbol or base asset (per group_by).
   string group = 2;
   repeated MetricValue values = 3;
-  // Шаг пересекает Gap или источник неполон (например Binance !forceOrder).
+  // The step overlaps a Gap or the source is incomplete (for example Binance !forceOrder).
   bool partial = 4;
   reserved 5 to 9;
 }
 
 message AggregateResponse {
   repeated AggregateRow rows = 1;
-  // Хотя бы одна строка partial: суммы - нижняя оценка.
+  // At least one row is partial: the sums are a lower bound.
   bool partial = 2;
   reserved 3 to 9;
 }

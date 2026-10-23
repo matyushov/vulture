@@ -1,22 +1,22 @@
-# Пример конфигурации vulture-server. Копия без секретов; реальный конфиг не коммитить.
+# Example vulture-server configuration. A copy without secrets; do not commit the real config.
 
 [server]
-listen = "0.0.0.0:8443"        # gRPC (TLS обязателен)
-data_dir = "/var/lib/vulture"  # токен (хеш) и служебное состояние
+listen = "0.0.0.0:8443"        # gRPC (TLS is mandatory)
+data_dir = "/var/lib/vulture"  # token (hash) and service state
 
 [tls]
-cert = "/etc/vulture/tls/fullchain.pem"   # перечитывается по SIGHUP
+cert = "/etc/vulture/tls/fullchain.pem"   # reloaded on SIGHUP
 key = "/etc/vulture/tls/privkey.pem"
-# client_ca = "/etc/vulture/tls/client-ca.pem"   # включает mTLS (опционально)
+# client_ca = "/etc/vulture/tls/client-ca.pem"   # enables mTLS (optional)
 
 [redis]
 url = "redis://127.0.0.1:6379"
 window_hours = 24
 
 [exchanges]
-# Набор бирж задаётся списком, а не вшивается в код.
+# The set of exchanges is given as a list rather than hardcoded.
 enabled = ["binance", "bybit", "okx"]
 oi_poll_interval_secs = 15
 
 [metrics]
-listen = "127.0.0.1:9090"      # Prometheus, отдельный порт
+listen = "127.0.0.1:9090"      # Prometheus, separate port

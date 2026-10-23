@@ -1,6 +1,6 @@
 use clap::Parser;
 
-/// Консольный клиент и администрирование vulture.
+/// Command-line client and administration for vulture.
 #[derive(Parser)]
 #[command(name = "vulture-cli", version, about)]
 struct Cli {}

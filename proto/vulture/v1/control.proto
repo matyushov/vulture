@@ -1,36 +1,36 @@
-// Управление сервисом. Все RPC требуют токена (admin подразумевается, роли в контракте нет).
-// Первая версия: основные операции; полнота и валидация - эпик V4.
+// Service management. All RPCs require a token (admin is implied, there is no role in the contract).
+// First version: the main operations; completeness and validation belong to epic V4.
 syntax = "proto3";
 
 package vulture.v1;
 
 service Control {
-  // Подписки: биржи и символы.
+  // Subscriptions: exchanges and symbols.
   rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
   rpc SetSubscription(SetSubscriptionRequest) returns (SetSubscriptionResponse);
-  // Статус коннекторов.
+  // Connector status.
   rpc GetConnectorStatus(GetConnectorStatusRequest) returns (GetConnectorStatusResponse);
-  // Интервал опроса OI.
+  // OI polling interval.
   rpc SetOiInterval(SetOiIntervalRequest) returns (SetOiIntervalResponse);
-  // Правила оповещений.
+  // Alert rules.
   rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
   rpc UpsertRule(UpsertRuleRequest) returns (UpsertRuleResponse);
   rpc DeleteRule(DeleteRuleRequest) returns (DeleteRuleResponse);
-  // Каналы доставки (Telegram, Discord); секреты наружу не отдаются.
+  // Delivery channels (Telegram, Discord); secrets are never returned.
   rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
   rpc UpsertChannel(UpsertChannelRequest) returns (UpsertChannelResponse);
   rpc DeleteChannel(DeleteChannelRequest) returns (DeleteChannelResponse);
-  // Статус Redis и flusher.
+  // Redis and flusher status.
   rpc GetStorageStatus(GetStorageStatusRequest) returns (GetStorageStatusResponse);
-  // Ротация токена; новый токен возвращается один раз.
+  // Token rotation; the new token is returned once.
   rpc RotateToken(RotateTokenRequest) returns (RotateTokenResponse);
 }
 
-// --- Подписки ---
+// --- Subscriptions ---
 
 message Subscription {
   string exchange = 1;
-  // Пустой список = все символы биржи.
+  // An empty list = all symbols of the exchange.
   repeated string symbols = 2;
   bool enabled = 3;
   reserved 4 to 9;
@@ -48,7 +48,7 @@ message SetSubscriptionRequest {
 
 message SetSubscriptionResponse {}
 
-// --- Коннекторы ---
+// --- Connectors ---
 
 enum ConnectorState {
   CONNECTOR_STATE_UNSPECIFIED = 0;
@@ -61,9 +61,9 @@ enum ConnectorState {
 message ConnectorStatus {
   string exchange = 1;
   ConnectorState state = 2;
-  // Время последнего события, мс.
+  // Time of the last event, ms.
   int64 last_event_ts = 3;
-  // Лаг получения относительно времени биржи, мс.
+  // Receive lag relative to exchange time, ms.
   int64 lag_ms = 4;
   reserved 5 to 9;
 }
@@ -74,7 +74,7 @@ message GetConnectorStatusResponse {
   repeated ConnectorStatus connectors = 1;
 }
 
-// --- Интервал OI ---
+// --- OI interval ---
 
 message SetOiIntervalRequest {
   string exchange = 1;
@@ -83,7 +83,7 @@ message SetOiIntervalRequest {
 
 message SetOiIntervalResponse {}
 
-// --- Правила ---
+// --- Rules ---
 
 message LiquidationRule {
   double min_notional_usd = 1;
@@ -99,7 +99,7 @@ message GapRule {
 }
 
 message Rule {
-  // Пусто при создании: id назначает сервер.
+  // Empty on creation: the server assigns the id.
   string id = 1;
   string name = 2;
   bool enabled = 3;
@@ -108,7 +108,7 @@ message Rule {
     OiChangeRule oi_change = 11;
     GapRule gap = 12;
   }
-  // Фильтры; пустой список = без фильтра.
+  // Filters; an empty list = no filter.
   repeated string exchanges = 4;
   repeated string symbols = 5;
   repeated string channel_ids = 6;
@@ -136,7 +136,7 @@ message DeleteRuleRequest {
 
 message DeleteRuleResponse {}
 
-// --- Каналы ---
+// --- Channels ---
 
 enum ChannelKind {
   CHANNEL_KIND_UNSPECIFIED = 0;
@@ -149,9 +149,9 @@ message Channel {
   string name = 2;
   ChannelKind kind = 3;
   bool enabled = 4;
-  // Для системных алертов.
+  // For system alerts.
   bool system = 5;
-  // Только в ответах: маска секрета, например "****abcd". Сам секрет никогда не возвращается.
+  // Responses only: a secret mask, for example "****abcd". The secret itself is never returned.
   string secret_mask = 6;
   reserved 7 to 9;
 }
@@ -164,7 +164,7 @@ message ListChannelsResponse {
 
 message UpsertChannelRequest {
   Channel channel = 1;
-  // Только в запросе: токен бота или URL вебхука; пусто = оставить прежний.
+  // Request only: a bot token or webhook URL; empty = keep the current one.
   string secret = 2;
 }
 
@@ -178,27 +178,27 @@ message DeleteChannelRequest {
 
 message DeleteChannelResponse {}
 
-// --- Хранилище ---
+// --- Storage ---
 
 message GetStorageStatusRequest {}
 
 message GetStorageStatusResponse {
-  // Redis: используемая память и лимит, байты.
+  // Redis: used memory and limit, bytes.
   uint64 redis_used_bytes = 1;
   uint64 redis_max_bytes = 2;
-  // Длины стримов по имени.
+  // Stream lengths by name.
   map<string, uint64> stream_lengths = 3;
-  // Flusher: водяной знак (Event.id) и отставание, мс.
+  // Flusher: watermark (Event.id) and lag, ms.
   string flusher_watermark = 4;
   int64 flusher_lag_ms = 5;
   reserved 6 to 15;
 }
 
-// --- Токен ---
+// --- Token ---
 
 message RotateTokenRequest {}
 
 message RotateTokenResponse {
-  // Показывается один раз; сервер хранит только хеш.
+  // Shown once; the server stores only the hash.
   string new_token = 1;
 }

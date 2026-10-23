@@ -8,7 +8,7 @@ compiler.runtime=dynamic
 compiler.cppstd=17
 
 [options]
-# Нужны и в контексте build (tool_requires grpc): опции из conanfile.py его не касаются.
+# Needed in the build context too (tool_requires grpc): the options from conanfile.py do not apply to it.
 grpc/*:shared=False
 grpc/*:cpp_plugin=True
 grpc/*:csharp_plugin=False

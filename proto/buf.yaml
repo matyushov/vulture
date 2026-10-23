@@ -5,12 +5,12 @@ lint:
   use:
     - STANDARD
   except:
-    # Сервисы названы по роли (Stream, History, Control), без суффикса Service.
+    # Services are named by role (Stream, History, Control), without the Service suffix.
     - SERVICE_SUFFIX
-    # Серверные стримы отдают общий Event, а не <Rpc>Response.
+    # Server streams return the shared Event, not <Rpc>Response.
     - RPC_RESPONSE_STANDARD_NAME
     - RPC_REQUEST_RESPONSE_UNIQUE
-    # History.Query принимает HistoryRequest.
+    # History.Query takes HistoryRequest.
     - RPC_REQUEST_STANDARD_NAME
 breaking:
   use:

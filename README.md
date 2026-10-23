@@ -1,22 +1,22 @@
 # vulture
 
-Open source сервис сбора **ликвидаций** и **открытого интереса** с криптобирж: Rust-сервер,
-gRPC-API, горячее хранилище Redis Streams и история в ClickHouse, плюс Qt6-клиент.
+Open source service that collects **liquidations** and **open interest** from crypto exchanges: a Rust server,
+gRPC API, Redis Streams hot storage and ClickHouse history, plus a Qt6 client.
 
-Состояние: каркас, контракт proto v0 и CI; бизнес-логики пока нет.
+Status: scaffold, proto v0 contract and CI; no business logic yet.
 
-## Состав
+## Components
 
-| Часть | Язык | Назначение | Лицензия |
+| Part | Language | Purpose | License |
 |---|---|---|---|
-| `proto/`, `crates/vulture-proto` | protobuf / Rust | контракт `vulture.v1` | Apache-2.0 |
-| `crates/vulture-server` | Rust | коннекторы, хранилище, gRPC | Apache-2.0 |
-| `crates/vulture-cli` | Rust | консольный клиент и администрирование | Apache-2.0 |
-| `ui/` (`vulture-ui`) | C++ / Qt6 | GUI-клиент | GPLv3 |
+| `proto/`, `crates/vulture-proto` | protobuf / Rust | `vulture.v1` contract | Apache-2.0 |
+| `crates/vulture-server` | Rust | connectors, storage, gRPC | Apache-2.0 |
+| `crates/vulture-cli` | Rust | command-line client and administration | Apache-2.0 |
+| `ui/` (`vulture-ui`) | C++ / Qt6 | GUI client | GPLv3 |
 
-## Сборка
+## Build
 
-Rust (протоколу нужен только вендорный `protoc`, системный не требуется):
+Rust (only the vendored `protoc` is needed; a system one is not required):
 
 ```sh
 cargo build --workspace
@@ -25,66 +25,66 @@ cargo run -p vulture-server
 cargo run -p vulture-cli -- --help
 ```
 
-UI (нужны Qt6 и CMake; зависимости gRPC/protobuf описаны в `ui/conanfile.py`):
+UI (requires Qt6 and CMake; gRPC/protobuf dependencies are described in `ui/conanfile.py`):
 
 ```sh
-cmake -S ui -B ui/build   # без Qt6 цель vulture-ui отключается с предупреждением
+cmake -S ui -B ui/build   # without Qt6 the vulture-ui target is disabled with a warning
 cmake --build ui/build
 ```
 
-Пример конфигурации: [config.example.toml](config.example.toml). Секреты в репозиторий не
-добавляются.
+Example configuration: [config.example.toml](config.example.toml). Secrets are not
+added to the repository.
 
-## Контракт (proto)
+## Contract (proto)
 
-`proto/vulture/v1/`: `common.proto` (Exchange как строка, `Side`, `Liquidation`, `OpenInterest`,
+`proto/vulture/v1/`: `common.proto` (Exchange as a string, `Side`, `Liquidation`, `OpenInterest`,
 `Gap`, `Event`), `stream.proto` (`Stream.Subscribe`), `history.proto` (`History.Query`,
-`History.Aggregate`), `control.proto` (`Control`). Метки времени - int64, миллисекунды Unix epoch;
-числа - `double`. Правила эволюции: только добавление полей, номера не переиспользуются,
-удалённое помечается `reserved`. Проверки: `cd proto && buf lint`. Rust-код генерируется в
-`build.rs` (вендорный protoc, tonic server+client), C++ для UI - `protoc` и `grpc_cpp_plugin` из
-conan (`ui/CMakeLists.txt`, цель `vulture-proto-cpp`).
+`History.Aggregate`), `control.proto` (`Control`). Timestamps are int64, Unix epoch milliseconds;
+numbers are `double`. Evolution rules: fields may only be added, numbers are not reused,
+removed fields are marked `reserved`. Checks: `cd proto && buf lint`. Rust code is generated in
+`build.rs` (vendored protoc, tonic server+client); C++ for the UI uses `protoc` and `grpc_cpp_plugin` from
+conan (`ui/CMakeLists.txt`, target `vulture-proto-cpp`).
 
 ## CI
 
-GitHub Actions, запуск на `pull_request` и `push` в `develop` и `main`; права `GITHUB_TOKEN` -
-`contents: read`, `pull_request_target` не используется.
+GitHub Actions, run on `pull_request` and on `push` to `develop` and `main`; `GITHUB_TOKEN` permissions are
+`contents: read`; `pull_request_target` is not used.
 
-| Workflow / задание | Что делает |
+| Workflow / job | What it does |
 |---|---|
-| `ci.yml` / `rust` | `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`, кэш `Swatinem/rust-cache` |
-| `ci.yml` / `supply-chain` | `cargo-deny` (лицензии, источники, advisories по `deny.toml`), `cargo-audit` |
-| `ci.yml` / `secrets` | gitleaks по всей истории |
-| `ci.yml` / `proto` | `buf lint`, `buf breaking` против базовой ревизии |
-| `ui.yml` / `ui` | матрица ubuntu/macos/windows: Qt 6 (`jurplel/install-qt-action`, версия в `QT_VERSION`), conan 2 с профилями `ui/conan/profiles/`, кэш conan; сборка не блокирует Rust-задания |
+| `ci.yml` / `rust` | `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`, `Swatinem/rust-cache` cache |
+| `ci.yml` / `supply-chain` | `cargo-deny` (licenses, sources, advisories per `deny.toml`), `cargo-audit` |
+| `ci.yml` / `secrets` | gitleaks over the whole history |
+| `ci.yml` / `proto` | `buf lint`, `buf breaking` against the base revision |
+| `ui.yml` / `ui` | ubuntu/macos/windows matrix: Qt 6 (`jurplel/install-qt-action`, version in `QT_VERSION`), conan 2 with the profiles in `ui/conan/profiles/`, conan cache; the build does not block the Rust jobs |
 
-| `conan-deps.yml` / `deps` | матрица ubuntu/macos/windows: собирает недостающие conan-зависимости UI (grpc, protobuf, ...) и выгружает их в Nexus; запуск на ветках `vendor/**` и вручную (`rebuild_all`), окружение `nexus` |
+| `conan-deps.yml` / `deps` | ubuntu/macos/windows matrix: builds the missing conan dependencies of the UI (grpc, protobuf, ...) and uploads them to Nexus; runs on `vendor/**` branches and manually (`rebuild_all`), environment `nexus` |
 
-### Зависимости UI и Nexus
+### UI dependencies and Nexus
 
-Сторонние пакеты UI собираются один раз и лежат в Nexus (`https://repo.blissbit.cc/repository/conan-local/`,
-remote `nexus-local`); `ui.yml` только скачивает их. Одинаковые `package_id` у сборщика и
-потребителя обеспечивают закреплённые профили `ui/conan/profiles/*` и `ui/conan.lock`.
+Third-party UI packages are built once and stored in Nexus (`https://repo.blissbit.cc/repository/conan-local/`,
+remote `nexus-local`); `ui.yml` only downloads them. Identical `package_id` values for the builder and
+the consumer are ensured by the pinned profiles `ui/conan/profiles/*` and `ui/conan.lock`.
 
-Обновление зависимостей:
+Updating dependencies:
 
-1. `git checkout -b vendor/<что>` (например `vendor/grpc-1.85`).
-2. Изменить `ui/conanfile.py` (и при необходимости профили), пересоздать lock:
-   `conan lock create ui -pr:a ui/conan/profiles/<профиль> --lockfile-out=ui/conan.lock`
-   для каждого профиля с объединением через `conan lock merge`.
-3. `git push`: `conan-deps.yml` соберёт недостающее и выгрузит в Nexus.
-4. Открыть PR `vendor/<что>` в `develop`: `ui.yml` скачает готовые бинарники.
+1. `git checkout -b vendor/<what>` (for example `vendor/grpc-1.85`).
+2. Change `ui/conanfile.py` (and the profiles if needed), recreate the lock:
+   `conan lock create ui -pr:a ui/conan/profiles/<profile> --lockfile-out=ui/conan.lock`
+   for each profile, merging the results with `conan lock merge`.
+3. `git push`: `conan-deps.yml` builds the missing packages and uploads them to Nexus.
+4. Open a PR `vendor/<what>` into `develop`: `ui.yml` downloads the prebuilt binaries.
 
-Секреты: пишущий пользователь `NEXUS_USERNAME` / `NEXUS_PASSWORD` - секреты окружения `nexus`
-(Settings -> Environments), используются только в `conan-deps.yml`; читающий `NEXUS_RO_USERNAME` /
-`NEXUS_RO_PASSWORD` - секреты репозитория, используются в `ui.yml`. Без них (форки) remote не
-добавляется и берётся conan-center. Значения в репозиторий не попадают.
+Secrets: the writing user `NEXUS_USERNAME` / `NEXUS_PASSWORD` are secrets of the `nexus` environment
+(Settings -> Environments), used only in `conan-deps.yml`; the reading user `NEXUS_RO_USERNAME` /
+`NEXUS_RO_PASSWORD` are repository secrets, used in `ui.yml`. Without them (forks) the remote is not
+added and conan-center is used. The values never enter the repository.
 
-Локально: `conan install ui -pr:a ui/conan/profiles/<профиль> --lockfile=ui/conan.lock --build=missing`
-(на хосте с другой версией компилятора скопируйте профиль и поправьте `compiler.version`; lock
-остаётся тем же, но пакеты придётся собирать).
+Locally: `conan install ui -pr:a ui/conan/profiles/<profile> --lockfile=ui/conan.lock --build=missing`
+(on a host with a different compiler version, copy the profile and adjust `compiler.version`; the lock
+stays the same, but the packages will have to be built).
 
-## Лицензии
+## Licenses
 
-Rust-код и proto: Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)). UI: GPLv3
-([ui/LICENSE](ui/LICENSE)). Сервер и UI общаются только по gRPC.
+Rust code and proto: Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)). UI: GPLv3
+([ui/LICENSE](ui/LICENSE)). The server and the UI communicate only over gRPC.

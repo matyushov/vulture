@@ -1,4 +1,4 @@
-// Живой поток событий.
+// Live event stream.
 syntax = "proto3";
 
 package vulture.v1;
@@ -6,19 +6,19 @@ package vulture.v1;
 import "vulture/v1/common.proto";
 
 service Stream {
-  // Живой поток ликвидаций, OI и Gap. Если задан resume_from, сначала отдаётся пропущенное
-  // (из Redis), затем live. Слишком старый resume_from -> FAILED_PRECONDITION (используйте
-  // History). Медленный клиент отключается с RESOURCE_EXHAUSTED.
+  // Live stream of liquidations, OI and Gap. If resume_from is set, the missed events are sent first
+  // (from Redis), then live. A resume_from that is too old -> FAILED_PRECONDITION (use
+  // History). A slow client is disconnected with RESOURCE_EXHAUSTED.
   rpc Subscribe(SubscribeRequest) returns (stream Event);
 }
 
 message SubscribeRequest {
-  // Пустой список = без фильтра по полю.
+  // An empty list = no filter on the field.
   repeated string exchanges = 1;
-  // Нормализованные символы (BTC-USDT-PERP).
+  // Normalized symbols (BTC-USDT-PERP).
   repeated string symbols = 2;
   repeated EventType types = 3;
-  // Event.id последнего полученного события.
+  // Event.id of the last received event.
   string resume_from = 4;
   reserved 5 to 15;
 }

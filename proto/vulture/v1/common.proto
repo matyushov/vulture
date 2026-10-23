@@ -1,24 +1,24 @@
-// Общие типы контракта vulture.v1.
+// Common types of the vulture.v1 contract.
 //
-// Правила эволюции: только добавление полей; номера не переиспользуются; удалённое поле или
-// значение enum помечается `reserved` (номер и имя). Роль пользователя в контракте не вводится
-// (пользователь один, подразумевается admin); для расширения оставлены зарезервированные номера.
+// Evolution rules: fields may only be added; numbers are not reused; a removed field or
+// enum value is marked `reserved` (number and name). A user role is not introduced in the contract
+// (there is a single user, admin is implied); reserved numbers are left for extension.
 //
-// Единицы: все метки времени - int64, миллисекунды Unix epoch (UTC). Числа - double.
+// Units: all timestamps are int64, Unix epoch milliseconds (UTC). Numbers are double.
 syntax = "proto3";
 
 package vulture.v1;
 
-// Сторона ликвидированной позиции.
+// Side of the liquidated position.
 enum Side {
   SIDE_UNSPECIFIED = 0;
-  // Ликвидирована длинная позиция (принудительная продажа).
+  // A long position was liquidated (forced sale).
   SIDE_LONG = 1;
-  // Ликвидирована короткая позиция (принудительная покупка).
+  // A short position was liquidated (forced purchase).
   SIDE_SHORT = 2;
 }
 
-// Тип события, для фильтров.
+// Event type, for filters.
 enum EventType {
   EVENT_TYPE_UNSPECIFIED = 0;
   EVENT_TYPE_LIQUIDATION = 1;
@@ -26,58 +26,58 @@ enum EventType {
   EVENT_TYPE_GAP = 3;
 }
 
-// Ликвидация. Биржа - строка из конфигурации сервера (например "binance"), не enum.
+// Liquidation. The exchange is a string from the server configuration (for example "binance"), not an enum.
 message Liquidation {
   string exchange = 1;
-  // Символ как отдаёт биржа (BTCUSDT).
+  // Symbol as the exchange returns it (BTCUSDT).
   string symbol_raw = 2;
-  // Нормализованный символ BASE-QUOTE-PERP (BTC-USDT-PERP).
+  // Normalized symbol BASE-QUOTE-PERP (BTC-USDT-PERP).
   string symbol = 3;
-  // Время события на бирже, мс.
+  // Event time on the exchange, ms.
   int64 exchange_ts = 4;
-  // Время получения сервером, мс.
+  // Time received by the server, ms.
   int64 recv_ts = 5;
   Side side = 6;
   double price = 7;
-  // Количество в базовой монете.
+  // Quantity in the base coin.
   double qty = 8;
-  // Номинал в USD (price * qty с учётом множителя контракта).
+  // Notional in USD (price * qty, taking the contract multiplier into account).
   double notional_usd = 9;
   reserved 10 to 15;
 }
 
-// Срез открытого интереса.
+// Open interest snapshot.
 message OpenInterest {
   string exchange = 1;
   string symbol_raw = 2;
   string symbol = 3;
   int64 exchange_ts = 4;
   int64 recv_ts = 5;
-  // OI в базовой монете.
+  // OI in the base coin.
   double oi_base = 6;
-  // OI в USD, если биржа отдаёт.
+  // OI in USD, if the exchange provides it.
   optional double oi_usd = 7;
-  // Mark price на момент среза, если известна.
+  // Mark price at the time of the snapshot, if known.
   optional double mark_price = 8;
   reserved 9 to 15;
 }
 
-// Обрыв источника: данные в интервале [from_ts, to_ts] неполны.
+// Source interruption: data in the interval [from_ts, to_ts] is incomplete.
 message Gap {
   string exchange = 1;
-  // Имя потока внутри биржи (например "liquidations", "open_interest").
+  // Stream name within the exchange (for example "liquidations", "open_interest").
   string stream = 2;
-  // Последнее полученное событие до обрыва, мс.
+  // Last event received before the interruption, ms.
   int64 from_ts = 3;
-  // Момент восстановления, мс.
+  // Recovery time, ms.
   int64 to_ts = 4;
   reserved 5 to 9;
 }
 
-// Обёртка события.
+// Event wrapper.
 message Event {
-  // Идентификатор записи Redis Stream, присвоенный сервером; для resume (Stream.Subscribe)
-  // и курсора (History.Query). Для клиента непрозрачная строка, порядок сравнивает сервер.
+  // Redis Stream entry identifier assigned by the server; for resume (Stream.Subscribe)
+  // and the cursor (History.Query). An opaque string to the client; the server compares order.
   string id = 1;
   oneof payload {
     Liquidation liquidation = 10;
