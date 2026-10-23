@@ -65,6 +65,8 @@ pub struct BinanceStatus {
     pub paused_until_ms: AtomicI64,
     /// Current effective polling interval in milliseconds (gauge).
     pub oi_interval_ms: AtomicU64,
+    /// `Gap` events published for REST pauses (418 bans and long 429 pauses).
+    pub oi_gaps: AtomicU64,
     /// Completed polling cycles.
     pub oi_cycles: AtomicU64,
 

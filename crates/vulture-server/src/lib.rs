@@ -6,6 +6,7 @@
 //! - [`app`]: shared application context, signal handling, the run loop.
 //! - [`exchange`]: the [`exchange::Exchange`] trait implemented by every connector.
 //! - [`normalize`]: symbols, base asset aliases, open interest units, market filter.
+//! - [`store`]: the Redis Streams layout, the writer and its in-memory test double.
 //! - [`ws`]: the reconnecting WebSocket session manager shared by all connectors.
 //! - [`logging`]: `tracing` setup.
 
@@ -14,4 +15,5 @@ pub mod config;
 pub mod exchange;
 pub mod logging;
 pub mod normalize;
+pub mod store;
 pub mod ws;

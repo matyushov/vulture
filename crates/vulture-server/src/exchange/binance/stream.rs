@@ -195,6 +195,7 @@ pub struct MarkEntry {
 #[derive(Debug, Default)]
 pub struct MarkPrices {
     map: RwLock<HashMap<String, MarkEntry>>,
+    first: tokio::sync::Notify,
 }
 
 #[derive(Deserialize)]
@@ -223,16 +224,21 @@ impl MarkPrices {
             }
         }
         let applied = parsed.len();
-        let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
-        for (s, price, exchange_ts) in parsed {
-            map.insert(
-                s,
-                MarkEntry {
-                    price,
-                    exchange_ts,
-                    recv_ts,
-                },
-            );
+        {
+            let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
+            for (s, price, exchange_ts) in parsed {
+                map.insert(
+                    s,
+                    MarkEntry {
+                        price,
+                        exchange_ts,
+                        recv_ts,
+                    },
+                );
+            }
+        }
+        if applied > 0 {
+            self.first.notify_waiters();
         }
         Ok((applied, rejected))
     }
@@ -243,6 +249,20 @@ impl MarkPrices {
         map.get(raw)
             .filter(|m| now_ms - m.recv_ts <= max_age_ms)
             .copied()
+    }
+
+    /// Resolves as soon as at least one price is known (immediately if one already is).
+    pub async fn wait_first(&self) {
+        loop {
+            let notified = self.first.notified();
+            tokio::pin!(notified);
+            // Register before checking so that a frame applied in between cannot be missed.
+            notified.as_mut().enable();
+            if !self.is_empty() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Number of symbols with a price.

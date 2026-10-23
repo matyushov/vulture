@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::exchange::{EVENT_CHANNEL_CAPACITY, Exchange, build_connectors};
 use crate::normalize::{AliasError, BaseAliases};
+use crate::store::{RedisClientStore, RedisStore, RedisWriter, WriterConfig};
+use crate::ws::SystemClock;
 
 /// Context shared by every component. Cheap to clone.
 #[derive(Clone)]
@@ -72,71 +74,55 @@ pub fn cancel_on_signals(token: CancellationToken) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Interval of the placeholder consumer's summary line.
-const COUNT_LOG_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Event counters by type for the placeholder consumer.
-#[derive(Debug, Default, Clone, Copy)]
-struct EventCounts {
-    liquidations: u64,
-    open_interest: u64,
-    gaps: u64,
+/// Why the server could not start.
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    /// Neither `redis.url` nor `redis.url_file` is set.
+    #[error("redis.url or redis.url_file is required")]
+    RedisUrlMissing,
+    /// The Redis URL could not be read or is malformed. The message never contains the URL.
+    #[error("redis: {0}")]
+    Redis(String),
 }
 
-impl EventCounts {
-    fn add(&mut self, event: &vulture_proto::v1::Event) {
-        use vulture_proto::v1::event::Payload;
-        match &event.payload {
-            Some(Payload::Liquidation(_)) => self.liquidations += 1,
-            Some(Payload::OpenInterest(_)) => self.open_interest += 1,
-            Some(Payload::Gap(_)) => self.gaps += 1,
-            None => {}
-        }
-    }
+/// Runs the server with the Redis store described by the configuration until `ctx.shutdown` is cancelled.
+pub async fn run(ctx: AppContext) -> Result<(), AppError> {
+    let url = ctx
+        .config
+        .redis
+        .resolve_url()
+        .map_err(|e| AppError::Redis(e.to_string()))?
+        .ok_or(AppError::RedisUrlMissing)?;
+    let store = RedisClientStore::new(&url, &ctx.config.redis.stream_key)
+        .map_err(|e| AppError::Redis(e.to_string()))?;
+    run_with_store(ctx, Arc::new(store)).await;
+    Ok(())
 }
 
-/// Runs the server until `ctx.shutdown` is cancelled, then stops the connectors within
-/// `server.shutdown_timeout_secs`.
-pub async fn run(ctx: AppContext) {
-    let connectors: Vec<Arc<dyn Exchange>> =
-        build_connectors(&ctx).into_iter().map(Arc::from).collect();
-    let (sink, mut events) = mpsc::channel::<vulture_proto::v1::Event>(EVENT_CHANNEL_CAPACITY);
+/// Runs the server on the given store until `ctx.shutdown` is cancelled, then stops the connectors and flushes
+/// the writer within `server.shutdown_timeout_secs`.
+pub async fn run_with_store(ctx: AppContext, store: Arc<dyn RedisStore>) {
+    let connectors = build_connectors(&ctx);
+    run_with_connectors(ctx, store, connectors).await;
+}
 
-    // Placeholder consumer; the Redis writer (V1-5) replaces it. Logs event counts by type once a minute.
-    // Ends when every sender is dropped.
-    let consumer = tokio::spawn(async move {
-        let mut total = EventCounts::default();
-        let mut window = EventCounts::default();
-        let mut tick = tokio::time::interval(COUNT_LOG_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.tick().await;
-        loop {
-            tokio::select! {
-                event = events.recv() => match event {
-                    Some(event) => {
-                        total.add(&event);
-                        window.add(&event);
-                    }
-                    None => break,
-                },
-                _ = tick.tick() => {
-                    tracing::info!(
-                        liquidations = window.liquidations,
-                        open_interest = window.open_interest,
-                        gaps = window.gaps,
-                        "events in the last minute"
-                    );
-                    window = EventCounts::default();
-                }
-            }
-        }
-        tracing::info!(
-            liquidations = total.liquidations,
-            open_interest = total.open_interest,
-            gaps = total.gaps,
-            "event consumer finished (totals)"
-        );
-    });
+/// Like [`run_with_store`] with an explicit list of connectors (tests inject fakes).
+pub async fn run_with_connectors(
+    ctx: AppContext,
+    store: Arc<dyn RedisStore>,
+    connectors: Vec<Box<dyn Exchange>>,
+) {
+    let connectors: Vec<Arc<dyn Exchange>> = connectors.into_iter().map(Arc::from).collect();
+    let (sink, events) = mpsc::channel::<vulture_proto::v1::Event>(EVENT_CHANNEL_CAPACITY);
+
+    let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
+    let writer = RedisWriter::new(
+        store,
+        WriterConfig::from_redis(&ctx.config.redis, deadline),
+        Arc::new(SystemClock),
+    );
+    // Ends when every sender is dropped (connectors stopped) and the buffer is flushed, or at the deadline.
+    let writer_task = tokio::spawn(writer.run(events, ctx.shutdown.clone()));
 
     let mut tasks = Vec::new();
     for connector in connectors {
@@ -155,14 +141,13 @@ pub async fn run(ctx: AppContext) {
     tracing::info!(connectors = tasks.len(), "vulture-server running");
     ctx.shutdown.cancelled().await;
 
-    let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
     let stop = async {
         for task in tasks {
             let _ = task.await;
         }
-        let _ = consumer.await;
+        let _ = writer_task.await;
     };
-    if tokio::time::timeout(deadline, stop).await.is_err() {
+    if tokio::time::timeout(deadline * 2, stop).await.is_err() {
         tracing::warn!(?deadline, "graceful shutdown timed out; exiting anyway");
     }
     tracing::info!("vulture-server stopped");
@@ -171,12 +156,13 @@ pub async fn run(ctx: AppContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::MemoryStore;
 
     #[tokio::test]
     async fn run_without_exchanges_stops_on_cancel() {
         let token = CancellationToken::new();
         let ctx = AppContext::new(Config::default(), token.clone());
-        let handle = tokio::spawn(run(ctx));
+        let handle = tokio::spawn(run_with_store(ctx, Arc::new(MemoryStore::new())));
         tokio::task::yield_now().await;
         token.cancel();
         tokio::time::timeout(Duration::from_secs(2), handle)

@@ -42,7 +42,7 @@ fn config_check_accepts_the_example() {
 fn config_check_reports_problems_readably() {
     let bad = temp_file(
         "bad.toml",
-        "[server]\nlisten = \"nope\"\n[redis]\nwindow_hours = 0\n",
+        "[server]\nlisten = \"nope\"\n[redis]\nwindow_secs = 0\n",
     );
     let out = Command::new(BIN)
         .args(["config", "check", "--config"])
@@ -52,7 +52,7 @@ fn config_check_reports_problems_readably() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("server.listen"), "{err}");
-    assert!(err.contains("redis.window_hours"), "{err}");
+    assert!(err.contains("redis.window_secs"), "{err}");
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn config_check_applies_environment_overrides() {
 fn run_without_exchanges_stops_on_sigterm() {
     let cfg = temp_file(
         "empty.toml",
-        "[logging]\nlevel = \"info\"\nformat = \"json\"\n",
+        "[logging]\nlevel = \"info\"\nformat = \"json\"\n[redis]\nurl = \"redis://127.0.0.1:1\"\n",
     );
     let mut child = Command::new(BIN)
         .args(["run", "--config"])
@@ -115,4 +115,34 @@ fn run_without_exchanges_stops_on_sigterm() {
     std::io::Read::read_to_string(&mut reader, &mut stdout).unwrap();
     assert!(stdout.contains("vulture-server running"), "{stdout}");
     assert!(stdout.contains("SIGTERM"), "{stdout}");
+}
+
+#[test]
+fn run_without_a_redis_url_fails_with_a_clear_message() {
+    let cfg = temp_file("no_redis.toml", "[logging]\nlevel = \"info\"\n");
+    let out = Command::new(BIN)
+        .args(["run", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("redis.url"), "{err}");
+}
+
+#[test]
+fn a_bad_redis_url_is_rejected_without_echoing_it() {
+    let cfg = temp_file(
+        "bad_redis.toml",
+        "[redis]\nurl = \"http://user:hunter2secret@host:1\"\n",
+    );
+    let out = Command::new(BIN)
+        .args(["config", "check", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("redis.url"), "{err}");
+    assert!(!err.contains("hunter2secret"), "{err}");
 }

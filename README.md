@@ -3,9 +3,10 @@
 Open source service that collects **liquidations** and **open interest** from crypto exchanges: a Rust server,
 gRPC API, Redis Streams hot storage and ClickHouse history, plus a Qt6 client.
 
-Status: scaffold, proto v0 contract, CI, and the server foundation (configuration, exchange trait, symbol and
-open interest normalization, reconnecting WebSocket manager) and the Binance USDT-M connector. Storage, gRPC
-and the other exchanges are not implemented yet; the server currently logs per-type event counts once a minute.
+Status: scaffold, proto v0 contract, CI, the server foundation (configuration, exchange trait, symbol and
+open interest normalization, reconnecting WebSocket manager), the Binance USDT-M connector and the Redis Streams
+writer (24-hour hot window). gRPC, ClickHouse history and the other exchanges are not implemented yet; the server
+needs a Redis instance (`redis.url`) and logs per-type event counts once a minute.
 
 ## Components
 
@@ -24,7 +25,7 @@ Rust (only the vendored `protoc` is needed; a system one is not required):
 cargo build --workspace
 cargo test --workspace
 cargo run -p vulture-server -- config check --config config.example.toml
-cargo run -p vulture-server -- run --config config.example.toml
+cargo run -p vulture-server -- run --config config.example.toml   # needs redis.url, see "Redis storage"
 cargo run -p vulture-cli -- --help
 ```
 
@@ -43,6 +44,9 @@ added to the repository.
 `crates/vulture-server` is a library plus a thin binary (`vulture-server run|config check --config <file>`).
 - `config`: TOML plus `VULTURE__SECTION__KEY` environment overrides; the exchange list and symbols are data;
   secrets are wrapped so they never reach logs. `app`: shared context and graceful shutdown on SIGINT/SIGTERM.
+- `store`: Redis Streams hot storage: the `RedisStore` trait (append, range read, health, server settings) with a
+  `redis`-crate implementation and an in-memory double, and the `RedisWriter` that batches, survives outages and
+  records gaps (see "Redis storage").
 - `exchange`: the `Exchange` trait (`name()`, `run(ctx, sink)`); a connector owns its loop and pushes
   `vulture_proto::v1::Event` into a bounded channel until the shutdown token fires.
 - `normalize`: raw symbol to `BASE-QUOTE-PERP` (metadata first, string parsing only as a fallback), base asset
@@ -73,11 +77,68 @@ test overrides `ws_url` / `rest_url`.
 - **Open interest:** REST `/fapi/v1/openInterest`, one snapshot per symbol per interval
   `max(oi_poll_interval_secs, N / 1440 * 60)` seconds, spread evenly (about `interval / N` apart), at most 12
   requests in flight, token bucket at 60% of the 2400 weight/min limit, slowdown above 60% of the limit as read
-  from `X-MBX-USED-WEIGHT-1M`, pause on 429 (`Retry-After`) and on 418 (IP ban).
+  from `X-MBX-USED-WEIGHT-1M`, pause on 429 (`Retry-After`) and on 418 (IP ban). The first poll waits for the
+  first mark price frame (at most 10 s) so that the first snapshots already carry `oi_usd` and `mark_price`. A
+  418 ban, and a 429 pause longer than one polling interval, publish a `Gap` (`stream` `open_interest`) from the
+  start to the planned end of the pause.
 - **Status:** `BinanceConnector::status()` exposes counters (frames, parse errors, duplicates, retries, ban state,
   used weight) for the future metrics endpoint.
 - **Live check:** `cargo test -p vulture-server --test binance -- --ignored binance_live --nocapture` connects to
   the real public endpoints for about 75 seconds (not run in CI).
+
+## Redis storage
+
+Every event goes into a **single stream** (`redis.stream_key`, default `vulture:events`): one resume cursor for the
+gRPC reader and one source for the ClickHouse flusher. The volume is small (about 20 open interest events/s and
+about 1 liquidation/s), so filtering on read is cheap. Each entry has four fields:
+
+| field | value |
+|---|---|
+| `t` | event type: `liq`, `oi` or `gap` |
+| `x` | exchange (`binance`; `*` for gaps written by the writer itself) |
+| `s` | normalized symbol (`BTC-USDT-PERP`); empty for gaps |
+| `d` | the protobuf-encoded `Event` **without** `id` |
+
+The Redis entry ID (`<ms>-<seq>`) is the public `Event.id`; readers set it from the entry ID when they decode `d`.
+`t`, `x` and `s` let a reader filter without decoding.
+
+- **Trimming** on every batch: `XTRIM MINID ~ <now - window_secs>` (24 h by default) and `XTRIM MAXLEN ~
+  maxlen_safeguard`, so a broken time trimming never fills Redis. `~` trimming removes whole internal nodes, so the
+  stream may hold slightly more than the window.
+- **Writer:** one pipeline (`MULTI`/`EXEC`) per batch of up to `batch_size` (500) events or `flush_interval_ms`
+  (50 ms), order preserved. Delivery is at least once: a batch is applied entirely or not at all, but if the
+  connection dies after `EXEC` ran and before the reply arrived, the retry repeats that batch.
+- **Outage:** the server starts even if Redis is down. Failed writes are retried with exponential backoff (1 s to
+  30 s, jitter); meanwhile events wait in a bounded in-memory buffer (`buffer_limit`, 100 000). When it is full the
+  oldest events are dropped and counted, and the first write after recovery starts with one `Gap`
+  (`exchange` `*`, `stream` `redis-writer`, `from_ts`/`to_ts` span the timestamps of the dropped events). Connectors
+  are never blocked.
+- **Shutdown:** the writer flushes what it holds within `server.shutdown_timeout_secs` and stops.
+- **Startup check** (best effort, warnings only): `appendonly yes`, `appendfsync everysec`, `maxmemory` set,
+  `maxmemory-policy noeviction`. If `CONFIG GET` is not allowed this is logged at debug level.
+- **Status** for the future metrics: written, batches, retries, buffered, dropped, last error, last write time and
+  connection state (`RedisWriter::status()`).
+- **Size:** measured on Redis 7, 20 000 entries with realistic values: about 138 bytes per open interest entry, 130
+  per liquidation, 152 for the expected mix (`MEMORY USAGE`; the protobuf payload itself is about 80 bytes). At 21
+  events/s for 24 hours that is roughly 260 MiB.
+
+Recommended Redis settings: persistence `appendonly yes` with `appendfsync everysec`, `maxmemory 3gb` to `4gb`,
+`maxmemory-policy noeviction` (a full Redis then refuses writes, which the writer survives, instead of silently
+evicting history). `redis.url` is a secret: put it in `VULTURE__REDIS__URL` or `redis.url_file`; it is never
+logged. `rediss://` is supported (rustls, bundled web PKI roots).
+
+Tests: the writer and the storage layer have unit tests on the in-memory store (batching, ordering, overflow and
+gap, shutdown). The integration tests in `crates/vulture-server/tests/redis_store.rs` need a Redis server and read
+its URL from `VULTURE_TEST_REDIS_URL`; without it they skip with a message. Use a throwaway local instance:
+
+```sh
+docker run -d --rm --name vulture-test-redis -p 127.0.0.1:6379:6379 redis:7
+VULTURE_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -p vulture-server --test redis_store -- --nocapture
+docker stop vulture-test-redis
+```
+
+`--nocapture` shows the stored size per entry. The tests kill all other client connections of the server
+(`CLIENT KILL`) to check reconnection, so never point them at a shared Redis. CI runs them against a Redis service.
 
 ## Contract (proto)
 
@@ -96,7 +157,7 @@ GitHub Actions, run on `pull_request` and on `push` to `develop` and `main`; `GI
 
 | Workflow / job | What it does |
 |---|---|
-| `ci.yml` / `rust` | `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`, `Swatinem/rust-cache` cache |
+| `ci.yml` / `rust` | `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` against a Redis service (`VULTURE_TEST_REDIS_URL`), `Swatinem/rust-cache` cache |
 | `ci.yml` / `supply-chain` | `cargo-deny` (licenses, sources, advisories per `deny.toml`), `cargo-audit` |
 | `ci.yml` / `secrets` | gitleaks over the whole history |
 | `ci.yml` / `proto` | `buf lint`, `buf breaking` against the base revision |

@@ -19,7 +19,15 @@ key = "/etc/vulture/tls/privkey.pem"
 # The URL may contain a password: prefer VULTURE__REDIS__URL or url_file over writing it here.
 # url = "redis://127.0.0.1:6379"
 # url_file = "/run/secrets/redis_url"
-window_hours = 24
+
+# One stream holds every event of every exchange (layout: README, "Redis storage").
+stream_key = "vulture:events"
+window_secs = 86400            # hot window; older entries are trimmed on every write (XTRIM MINID ~)
+maxlen_safeguard = 5000000     # upper bound for the stream length (XTRIM MAXLEN ~), so Redis never fills up
+batch_size = 500               # events per write pipeline, at most
+flush_interval_ms = 50         # longest wait before a partial batch is written
+buffer_limit = 100000          # events kept in memory while Redis is down; above it the oldest are dropped
+                               # and one Gap event (exchange "*", stream "redis-writer") is written afterwards
 
 # The set of exchanges and symbols is data, not code. Symbols are normalized (BASE-QUOTE-PERP);
 # an empty list means every linear USDT/USDC perpetual the exchange offers.

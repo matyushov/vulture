@@ -1032,6 +1032,167 @@ async fn http_418_stops_all_requests_until_the_ban_ends() {
     rig.stop().await;
 }
 
+/// A 429 with `Retry-After: secs` on the first open interest request, normal answers afterwards.
+fn http_with_first_429(secs: u64) -> Arc<MockHttp> {
+    let calls = AtomicUsize::new(0);
+    MockHttp::new(move |path, _| {
+        if path.starts_with("/fapi/v1/exchangeInfo") {
+            return Reply::ok(&info_body(&[("BTCUSDT", "BTC", "USDT")]));
+        }
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Reply::status(429, "{}").retry_after(secs);
+        }
+        Reply::ok(&oi_body("BTCUSDT", "1", 5))
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ban_produces_an_open_interest_gap_covering_the_pause() {
+    let calls = AtomicUsize::new(0);
+    let http = MockHttp::new(move |path, _| {
+        if path.starts_with("/fapi/v1/exchangeInfo") {
+            return Reply::ok(&info_body(&[("BTCUSDT", "BTC", "USDT")]));
+        }
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Reply::status(418, "{}").retry_after(300);
+        }
+        Reply::ok(&oi_body("BTCUSDT", "1", 5))
+    });
+    let mut rig = start(config(&[], 30), quiet_ws(&[("BTCUSDT", "1")]), http);
+    // No snapshot exists before the ban, so the gap is the first event, then data resumes.
+    let first = rig.next().await;
+    let Some(Payload::Gap(gap)) = first.payload else {
+        panic!("expected a gap first, got {first:?}");
+    };
+    assert_eq!(gap.exchange, "binance");
+    assert_eq!(gap.stream, "open_interest");
+    assert_eq!(
+        gap.to_ts - gap.from_ts,
+        300_000,
+        "the gap covers the whole ban"
+    );
+    assert!(gap.from_ts >= EPOCH_MS);
+    assert_eq!(rig.next_oi().await.symbol_raw, "BTCUSDT");
+    assert_eq!(rig.count(|s| &s.oi_gaps), 1);
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_429_pause_longer_than_the_interval_produces_a_gap() {
+    let mut rig = start(
+        config(&[], 30),
+        quiet_ws(&[("BTCUSDT", "1")]),
+        http_with_first_429(100),
+    );
+    let gap = rig.next_gap().await;
+    assert_eq!(
+        (gap.exchange.as_str(), gap.stream.as_str()),
+        ("binance", "open_interest")
+    );
+    assert_eq!(gap.to_ts - gap.from_ts, 100_000);
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_429_pause_produces_no_gap() {
+    let mut rig = start(
+        config(&[], 30),
+        quiet_ws(&[("BTCUSDT", "1")]),
+        http_with_first_429(20),
+    );
+    // Several cycles after the pause: only open interest events, no gap.
+    for _ in 0..4 {
+        let ev = rig.next().await;
+        assert!(
+            matches!(ev.payload, Some(Payload::OpenInterest(_))),
+            "unexpected {ev:?}"
+        );
+    }
+    assert_eq!(rig.count(|s| &s.http_429), 1);
+    assert_eq!(rig.count(|s| &s.oi_gaps), 0);
+    rig.stop().await;
+}
+
+/// Mark prices start only after `delay` (the WebSocket handshake itself is immediate).
+fn late_marks_ws(delay: Duration, marks: &[(&str, &str)]) -> Arc<MockWs> {
+    let frame = mark_frame(marks);
+    MockWs::new(
+        vec![],
+        script(move |mut ws, _| {
+            let frame = frame.clone();
+            async move {
+                if !handshake(&mut ws, None).await {
+                    return;
+                }
+                sleep(delay).await;
+                let mut timer = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        incoming = ws.next() => match incoming {
+                            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                            Some(Ok(_)) => {}
+                        },
+                        _ = timer.tick() => {
+                            if ws.send(Message::text(frame.clone())).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_first_poll_waits_for_the_first_mark_price() {
+    let http = standard_http(vec![info_body(&btc_eth())], KNOWN.to_vec(), "2", |r| r);
+    let ws = late_marks_ws(
+        Duration::from_secs(4),
+        &[("BTCUSDT", "100"), ("ETHUSDT", "10")],
+    );
+    let mut rig = start(config(&[], 30), ws, http.clone());
+    let first = rig.next_oi().await;
+    let second = rig.next_oi().await;
+    assert!(
+        first.mark_price.is_some() && first.oi_usd.is_some(),
+        "{first:?}"
+    );
+    assert!(
+        second.mark_price.is_some() && second.oi_usd.is_some(),
+        "{second:?}"
+    );
+    let t0 = http.oi_requests()[0].0;
+    assert!(
+        t0 >= Duration::from_secs(4) && t0 < Duration::from_secs(6),
+        "first request at {t0:?}"
+    );
+    assert_eq!(rig.count(|s| &s.oi_without_mark), 0);
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_any_mark_price_the_first_poll_starts_after_ten_seconds() {
+    let http = standard_http(vec![info_body(&btc_eth())], KNOWN.to_vec(), "2", |r| r);
+    let ws = late_marks_ws(Duration::from_secs(3600), &[("BTCUSDT", "100")]);
+    let mut rig = start_with(
+        config(&[], 30),
+        BinanceTuning::default(),
+        ws,
+        http.clone(),
+        None,
+    );
+    let first = rig.next_oi().await;
+    assert_eq!((first.mark_price, first.oi_usd), (None, None));
+    let t0 = http.oi_requests()[0].0;
+    assert!(
+        t0 >= Duration::from_secs(10) && t0 < Duration::from_secs(11),
+        "fallback after 10 s, first request at {t0:?}"
+    );
+    assert!(rig.count(|s| &s.oi_without_mark) >= 1);
+    rig.stop().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn one_hanging_symbol_does_not_block_the_others() {
     let syms: Vec<Sym> = vec![

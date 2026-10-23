@@ -5,7 +5,9 @@
 //!   stream is also the liveness stream for the watchdog of [`crate::ws`].
 //! - Mark price: kept in memory only, never published; used for `oi_usd` of the REST snapshots.
 //! - Open interest: REST `/fapi/v1/openInterest` for every symbol, spread over the polling interval
-//!   ([`oi`]), with rate control ([`rate`]).
+//!   ([`oi`]), with rate control ([`rate`]). The first poll waits for the first mark price frame (at most 10 s).
+//!   A 418 ban, and a 429 pause longer than one polling interval, produce a `Gap` with stream
+//!   [`OPEN_INTEREST_STREAM`] covering the pause.
 //! - Symbols: `exchangeInfo`, reloaded hourly ([`info`], [`symbols`]).
 
 mod http;
@@ -29,7 +31,8 @@ pub use http::{HttpClient, HttpError, HttpResponse, ReqwestClient, encode_query_
 pub use info::EXCHANGE_INFO_PATH;
 pub use oi::OPEN_INTEREST_PATH;
 pub use rate::{
-    BUDGET_FRACTION, MAX_SLOWDOWN, WEIGHT_LIMIT_PER_MIN, effective_interval, slowdown_factor,
+    BUDGET_FRACTION, MAX_SLOWDOWN, PauseSpan, WEIGHT_LIMIT_PER_MIN, effective_interval,
+    slowdown_factor,
 };
 pub use status::{BinanceStatus, WsLink};
 pub use stream::{
@@ -56,6 +59,8 @@ pub const DEFAULT_WS_URL: &str = "wss://fstream.binance.com/market/ws";
 pub const DEFAULT_REST_URL: &str = "https://fapi.binance.com";
 /// `Gap.stream` / profile stream name for the WebSocket data.
 pub const LIQUIDATION_STREAM: &str = "liquidations";
+/// `Gap.stream` for the REST open interest data.
+pub const OPEN_INTEREST_STREAM: &str = "open_interest";
 
 /// What the `[[exchanges]]` entry says, with defaults applied.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +114,9 @@ pub struct BinanceTuning {
     pub default_418_pause: Duration,
     /// Cap of a 418 pause.
     pub max_418_pause: Duration,
+    /// How long the first open interest poll waits for the first mark price frame, so that the first
+    /// snapshots carry `oi_usd` and `mark_price`; after that the poller starts without it.
+    pub first_mark_wait: Duration,
     /// Regular `exchangeInfo` reload.
     pub info_reload_interval: Duration,
     /// First retry delay after a failed `exchangeInfo` load; doubles up to `info_retry`.
@@ -132,6 +140,7 @@ impl Default for BinanceTuning {
             max_429_pause: Duration::from_secs(5 * 60),
             default_418_pause: Duration::from_secs(5 * 60),
             max_418_pause: Duration::from_secs(3 * 24 * 3600),
+            first_mark_wait: Duration::from_secs(10),
             info_reload_interval: Duration::from_secs(3600),
             info_initial_retry: Duration::from_secs(5),
             info_retry: Duration::from_secs(60),

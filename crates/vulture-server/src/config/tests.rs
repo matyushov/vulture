@@ -29,7 +29,11 @@ fn example_config_is_valid() {
 fn empty_file_gives_defaults() {
     let cfg = parse("", no_env()).unwrap();
     assert!(cfg.exchanges.is_empty());
-    assert_eq!(cfg.redis.window_hours, 24);
+    assert_eq!(cfg.redis.window_secs, 86_400);
+    assert_eq!(cfg.redis.stream_key, "vulture:events");
+    assert_eq!(cfg.redis.batch_size, 500);
+    assert_eq!(cfg.redis.flush_interval_ms, 50);
+    assert_eq!(cfg.redis.buffer_limit, 100_000);
     assert!(cfg.tls.is_none());
 }
 
@@ -50,7 +54,7 @@ fn env_overrides_scalars_and_creates_sections() {
         env(&[
             ("VULTURE__LOGGING__LEVEL", "debug"),
             ("VULTURE__LOGGING__FORMAT", "json"),
-            ("VULTURE__REDIS__WINDOW_HOURS", "48"),
+            ("VULTURE__REDIS__WINDOW_SECS", "172800"),
             ("VULTURE__TLS__CERT", "/a/cert.pem"),
             ("VULTURE__TLS__KEY", "/a/key.pem"),
             ("UNRELATED", "x"),
@@ -59,7 +63,7 @@ fn env_overrides_scalars_and_creates_sections() {
     .unwrap();
     assert_eq!(cfg.logging.level, "debug");
     assert_eq!(cfg.logging.format, LogFormat::Json);
-    assert_eq!(cfg.redis.window_hours, 48);
+    assert_eq!(cfg.redis.window_secs, 172_800);
     assert_eq!(cfg.tls.unwrap().cert, PathBuf::from("/a/cert.pem"));
 }
 
@@ -113,7 +117,7 @@ fn malformed_toml_is_a_parse_error() {
 
 #[test]
 fn wrong_type_is_a_parse_error() {
-    let err = parse("[redis]\nwindow_hours = \"many\"\n", no_env()).unwrap_err();
+    let err = parse("[redis]\nwindow_secs = \"many\"\n", no_env()).unwrap_err();
     assert!(matches!(err, ConfigError::Parse(_)));
 }
 
@@ -125,7 +129,10 @@ listen = "not-an-address"
 [metrics]
 listen = "also bad"
 [redis]
-window_hours = 0
+window_secs = 0
+batch_size = 0
+stream_key = ""
+url = "http://not-redis"
 [logging]
 level = "info,foo=bar=baz"
 [[exchanges]]
@@ -147,7 +154,10 @@ name = "okx"
     for needle in [
         "server.listen",
         "metrics.listen",
-        "redis.window_hours",
+        "redis.window_secs",
+        "redis.batch_size",
+        "redis.stream_key",
+        "redis.url",
         "logging.level",
         "exchanges[0].name",
         "exchanges[0].oi_poll_interval_secs",

@@ -9,7 +9,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
-use vulture_proto::v1::{Event, OpenInterest, event::Payload};
+use vulture_proto::v1::{Event, Gap, OpenInterest, event::Payload};
 
 use super::BinanceTuning;
 use super::http::{HttpClient, HttpError, encode_query_value};
@@ -71,6 +71,15 @@ impl OiPoller {
         ));
         let mut tasks: JoinSet<()> = JoinSet::new();
         let mut symbols = this.symbols.clone();
+        // The first snapshots should carry `oi_usd` and `mark_price`: wait for the first mark price frame, but
+        // never longer than `first_mark_wait`.
+        tokio::select! {
+            _ = this.marks.wait_first() => {}
+            _ = sleep(this.tuning.first_mark_wait) => {
+                tracing::warn!(wait = ?this.tuning.first_mark_wait, "no mark price yet; starting open interest polling without it");
+            }
+            _ = this.shutdown.cancelled() => return,
+        }
         let mut next_at = Instant::now();
 
         'cycles: loop {
@@ -93,6 +102,9 @@ impl OiPoller {
                     None => break 'cycles,
                     Some(true) => next_at = Instant::now(),
                     Some(false) => {}
+                }
+                if !this.publish_pause_gaps(interval).await {
+                    break 'cycles;
                 }
                 tokio::select! {
                     _ = sleep_until(next_at) => {}
@@ -125,6 +137,39 @@ impl OiPoller {
         }
         // Tasks end on their own: they watch the same shutdown token.
         while tasks.join_next().await.is_some() {}
+    }
+
+    /// Turns finished REST pauses into `Gap` events (`open_interest` stream): every 418 ban, and a 429 pause
+    /// longer than one polling interval (shorter ones only delay a cycle). Returns `false` if the sink is gone.
+    async fn publish_pause_gaps(&self, interval: Duration) -> bool {
+        for span in self.rate.take_finished() {
+            let long = span.to_ms - span.from_ms > interval.as_millis() as i64;
+            if !(span.banned || long) {
+                continue;
+            }
+            let gap = Gap {
+                exchange: super::NAME.into(),
+                stream: super::OPEN_INTEREST_STREAM.into(),
+                from_ts: span.from_ms,
+                to_ts: span.to_ms,
+            };
+            tracing::warn!(
+                from_ts = gap.from_ts,
+                to_ts = gap.to_ts,
+                banned = span.banned,
+                "open interest gap after a REST pause"
+            );
+            let event = Event {
+                id: String::new(),
+                payload: Some(Payload::Gap(gap)),
+            };
+            if self.sink.send(event).await.is_err() {
+                self.sink_closed.store(true, Ordering::Relaxed);
+                return false;
+            }
+            BinanceStatus::inc(&self.status.oi_gaps);
+        }
+        true
     }
 
     /// One symbol: up to `oi_max_attempts` tries with backoff; the pause rules of 429/418 apply to everyone.

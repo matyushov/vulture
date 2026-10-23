@@ -54,7 +54,10 @@ async fn main() -> anyhow::Result<()> {
 fn check(path: PathBuf) -> anyhow::Result<()> {
     let config = Config::load(&path)?;
     // Secrets are only checked for being readable, never printed.
-    config.redis.resolve_url()?;
+    if let Some(url) = config.redis.resolve_url()? {
+        vulture_server::store::validate_url(url.expose())
+            .map_err(|e| anyhow::anyhow!("redis URL: {e}"))?;
+    }
     if let Some(file) = &config.normalize.base_aliases_file {
         vulture_server::normalize::BaseAliases::load(file)?;
     }
@@ -74,10 +77,9 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         config = %path.display(),
         "vulture-server starting"
     );
-    config.redis.resolve_url()?;
     let shutdown = CancellationToken::new();
     app::cancel_on_signals(shutdown.clone()).context("cannot install signal handlers")?;
     let ctx = AppContext::from_config(config, shutdown)?;
-    app::run(ctx).await;
+    app::run(ctx).await?;
     Ok(())
 }

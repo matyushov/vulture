@@ -17,6 +17,7 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    "BSL-1.0",               # xxhash-rust (dependency of the redis client); Boost, permissive
     "CDLA-Permissive-2.0",   # webpki-roots (Mozilla CA bundle for rustls)
 ]
 

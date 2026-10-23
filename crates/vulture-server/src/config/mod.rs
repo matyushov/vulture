@@ -114,8 +114,18 @@ pub struct RedisConfig {
     pub url: Option<Secret>,
     /// File holding the URL instead of `url` (for container secrets).
     pub url_file: Option<PathBuf>,
-    /// Hot window length, hours.
-    pub window_hours: u32,
+    /// Stream key holding every event of every exchange.
+    pub stream_key: String,
+    /// Hot window length, seconds (older entries are trimmed on every write).
+    pub window_secs: u64,
+    /// Upper bound for the stream length: a safeguard that keeps a broken time trimming from filling Redis.
+    pub maxlen_safeguard: u64,
+    /// Events per write pipeline, at most.
+    pub batch_size: usize,
+    /// Longest wait before a partial batch is written, milliseconds.
+    pub flush_interval_ms: u64,
+    /// Events kept in memory while Redis is unavailable; above it the oldest are dropped and a `Gap` is written.
+    pub buffer_limit: usize,
 }
 
 impl Default for RedisConfig {
@@ -123,7 +133,12 @@ impl Default for RedisConfig {
         Self {
             url: None,
             url_file: None,
-            window_hours: 24,
+            stream_key: "vulture:events".into(),
+            window_secs: 86_400,
+            maxlen_safeguard: 5_000_000,
+            batch_size: 500,
+            flush_interval_ms: 50,
+            buffer_limit: 100_000,
         }
     }
 }
@@ -279,8 +294,28 @@ impl Config {
         if self.server.shutdown_timeout_secs == 0 {
             problems.push("server.shutdown_timeout_secs must be greater than 0".into());
         }
-        if self.redis.window_hours == 0 {
-            problems.push("redis.window_hours must be greater than 0".into());
+        let r = &self.redis;
+        if r.stream_key.trim().is_empty() {
+            problems.push("redis.stream_key must not be empty".into());
+        }
+        for (name, ok) in [
+            ("redis.window_secs", r.window_secs > 0),
+            ("redis.maxlen_safeguard", r.maxlen_safeguard > 0),
+            ("redis.batch_size", r.batch_size > 0),
+            ("redis.flush_interval_ms", r.flush_interval_ms > 0),
+            ("redis.buffer_limit", r.buffer_limit > 0),
+        ] {
+            if !ok {
+                problems.push(format!("{name} must be greater than 0"));
+            }
+        }
+        if r.batch_size > r.buffer_limit {
+            problems.push("redis.batch_size must not exceed redis.buffer_limit".into());
+        }
+        if let Some(url) = &r.url
+            && let Err(e) = crate::store::validate_url(url.expose())
+        {
+            problems.push(format!("redis.url: {e}"));
         }
         if self.redis.url.is_some() && self.redis.url_file.is_some() {
             problems.push("redis.url and redis.url_file are mutually exclusive".into());

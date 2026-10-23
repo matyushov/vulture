@@ -46,11 +46,26 @@ pub fn effective_interval(configured_secs: u64, symbols: usize) -> Duration {
     Duration::from_secs_f64((configured_secs as f64).max(minimum))
 }
 
+/// A finished REST pause, in wall-clock milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PauseSpan {
+    /// When the pause began.
+    pub from_ms: i64,
+    /// When it was planned to end (the longest one, if it was extended).
+    pub to_ms: i64,
+    /// Whether any part of it was a 418 ban.
+    pub banned: bool,
+}
+
 /// Pause and weight state shared by every REST caller of the connector.
 pub struct RateState {
     status: Arc<BinanceStatus>,
     clock: Arc<dyn Clock>,
     pause_until: Mutex<Option<Instant>>,
+    /// The pause in progress.
+    current: Mutex<Option<PauseSpan>>,
+    /// Pauses that ended and were not yet taken by [`RateState::take_finished`].
+    finished: Mutex<Vec<PauseSpan>>,
 }
 
 impl RateState {
@@ -60,6 +75,8 @@ impl RateState {
             status,
             clock,
             pause_until: Mutex::new(None),
+            current: Mutex::new(None),
+            finished: Mutex::new(Vec::new()),
         })
     }
 
@@ -76,17 +93,33 @@ impl RateState {
     /// Stops all REST traffic for `d`. A longer pause is never shortened by a later, shorter one.
     pub fn pause(&self, d: Duration, banned: bool) {
         let until = Instant::now() + d;
+        let now_ms = self.clock.now_ms();
+        let until_ms = now_ms + d.as_millis() as i64;
         let mut guard = self.pause_until.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            let span = cur.get_or_insert(PauseSpan {
+                from_ms: now_ms,
+                to_ms: until_ms,
+                banned: false,
+            });
+            span.to_ms = span.to_ms.max(until_ms);
+            span.banned |= banned;
+        }
         if guard.is_none_or(|cur| until > cur) {
             *guard = Some(until);
-            self.status.paused_until_ms.store(
-                self.clock.now_ms() + d.as_millis() as i64,
-                Ordering::Relaxed,
-            );
+            self.status
+                .paused_until_ms
+                .store(until_ms, Ordering::Relaxed);
         }
         if banned {
             self.status.banned.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Pauses that have ended since the last call, oldest first.
+    pub fn take_finished(&self) -> Vec<PauseSpan> {
+        std::mem::take(&mut *self.finished.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Waits while a pause is active. Returns `None` on shutdown and `Some(waited)` otherwise.
@@ -106,6 +139,17 @@ impl RateState {
                     let mut guard = self.pause_until.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.is_some_and(|t| t <= Instant::now()) {
                         *guard = None;
+                        if let Some(span) = self
+                            .current
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
+                        {
+                            self.finished
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(span);
+                        }
                         self.status.banned.store(false, Ordering::Relaxed);
                         self.status.paused_until_ms.store(0, Ordering::Relaxed);
                     }
