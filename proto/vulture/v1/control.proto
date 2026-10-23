@@ -1,0 +1,204 @@
+// Управление сервисом. Все RPC требуют токена (admin подразумевается, роли в контракте нет).
+// Первая версия: основные операции; полнота и валидация - эпик V4.
+syntax = "proto3";
+
+package vulture.v1;
+
+service Control {
+  // Подписки: биржи и символы.
+  rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
+  rpc SetSubscription(SetSubscriptionRequest) returns (SetSubscriptionResponse);
+  // Статус коннекторов.
+  rpc GetConnectorStatus(GetConnectorStatusRequest) returns (GetConnectorStatusResponse);
+  // Интервал опроса OI.
+  rpc SetOiInterval(SetOiIntervalRequest) returns (SetOiIntervalResponse);
+  // Правила оповещений.
+  rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
+  rpc UpsertRule(UpsertRuleRequest) returns (UpsertRuleResponse);
+  rpc DeleteRule(DeleteRuleRequest) returns (DeleteRuleResponse);
+  // Каналы доставки (Telegram, Discord); секреты наружу не отдаются.
+  rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
+  rpc UpsertChannel(UpsertChannelRequest) returns (UpsertChannelResponse);
+  rpc DeleteChannel(DeleteChannelRequest) returns (DeleteChannelResponse);
+  // Статус Redis и flusher.
+  rpc GetStorageStatus(GetStorageStatusRequest) returns (GetStorageStatusResponse);
+  // Ротация токена; новый токен возвращается один раз.
+  rpc RotateToken(RotateTokenRequest) returns (RotateTokenResponse);
+}
+
+// --- Подписки ---
+
+message Subscription {
+  string exchange = 1;
+  // Пустой список = все символы биржи.
+  repeated string symbols = 2;
+  bool enabled = 3;
+  reserved 4 to 9;
+}
+
+message ListSubscriptionsRequest {}
+
+message ListSubscriptionsResponse {
+  repeated Subscription subscriptions = 1;
+}
+
+message SetSubscriptionRequest {
+  Subscription subscription = 1;
+}
+
+message SetSubscriptionResponse {}
+
+// --- Коннекторы ---
+
+enum ConnectorState {
+  CONNECTOR_STATE_UNSPECIFIED = 0;
+  CONNECTOR_STATE_CONNECTING = 1;
+  CONNECTOR_STATE_RUNNING = 2;
+  CONNECTOR_STATE_BACKOFF = 3;
+  CONNECTOR_STATE_STOPPED = 4;
+}
+
+message ConnectorStatus {
+  string exchange = 1;
+  ConnectorState state = 2;
+  // Время последнего события, мс.
+  int64 last_event_ts = 3;
+  // Лаг получения относительно времени биржи, мс.
+  int64 lag_ms = 4;
+  reserved 5 to 9;
+}
+
+message GetConnectorStatusRequest {}
+
+message GetConnectorStatusResponse {
+  repeated ConnectorStatus connectors = 1;
+}
+
+// --- Интервал OI ---
+
+message SetOiIntervalRequest {
+  string exchange = 1;
+  uint32 interval_seconds = 2;
+}
+
+message SetOiIntervalResponse {}
+
+// --- Правила ---
+
+message LiquidationRule {
+  double min_notional_usd = 1;
+}
+
+message OiChangeRule {
+  double min_change_pct = 1;
+  uint32 window_seconds = 2;
+}
+
+message GapRule {
+  int64 min_duration_ms = 1;
+}
+
+message Rule {
+  // Пусто при создании: id назначает сервер.
+  string id = 1;
+  string name = 2;
+  bool enabled = 3;
+  oneof kind {
+    LiquidationRule liquidation = 10;
+    OiChangeRule oi_change = 11;
+    GapRule gap = 12;
+  }
+  // Фильтры; пустой список = без фильтра.
+  repeated string exchanges = 4;
+  repeated string symbols = 5;
+  repeated string channel_ids = 6;
+  uint32 cooldown_seconds = 7;
+  reserved 8, 9;
+}
+
+message ListRulesRequest {}
+
+message ListRulesResponse {
+  repeated Rule rules = 1;
+}
+
+message UpsertRuleRequest {
+  Rule rule = 1;
+}
+
+message UpsertRuleResponse {
+  Rule rule = 1;
+}
+
+message DeleteRuleRequest {
+  string id = 1;
+}
+
+message DeleteRuleResponse {}
+
+// --- Каналы ---
+
+enum ChannelKind {
+  CHANNEL_KIND_UNSPECIFIED = 0;
+  CHANNEL_KIND_TELEGRAM = 1;
+  CHANNEL_KIND_DISCORD = 2;
+}
+
+message Channel {
+  string id = 1;
+  string name = 2;
+  ChannelKind kind = 3;
+  bool enabled = 4;
+  // Для системных алертов.
+  bool system = 5;
+  // Только в ответах: маска секрета, например "****abcd". Сам секрет никогда не возвращается.
+  string secret_mask = 6;
+  reserved 7 to 9;
+}
+
+message ListChannelsRequest {}
+
+message ListChannelsResponse {
+  repeated Channel channels = 1;
+}
+
+message UpsertChannelRequest {
+  Channel channel = 1;
+  // Только в запросе: токен бота или URL вебхука; пусто = оставить прежний.
+  string secret = 2;
+}
+
+message UpsertChannelResponse {
+  Channel channel = 1;
+}
+
+message DeleteChannelRequest {
+  string id = 1;
+}
+
+message DeleteChannelResponse {}
+
+// --- Хранилище ---
+
+message GetStorageStatusRequest {}
+
+message GetStorageStatusResponse {
+  // Redis: используемая память и лимит, байты.
+  uint64 redis_used_bytes = 1;
+  uint64 redis_max_bytes = 2;
+  // Длины стримов по имени.
+  map<string, uint64> stream_lengths = 3;
+  // Flusher: водяной знак (Event.id) и отставание, мс.
+  string flusher_watermark = 4;
+  int64 flusher_lag_ms = 5;
+  reserved 6 to 15;
+}
+
+// --- Токен ---
+
+message RotateTokenRequest {}
+
+message RotateTokenResponse {
+  // Показывается один раз; сервер хранит только хеш.
+  string new_token = 1;
+}

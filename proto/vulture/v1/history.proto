@@ -1,0 +1,99 @@
+// История и агрегаты. Все расчёты выполняет сервер.
+syntax = "proto3";
+
+package vulture.v1;
+
+import "vulture/v1/common.proto";
+
+service History {
+  // События за период (свежее из Redis, старше из ClickHouse прозрачно). Постраничность:
+  // курсор = Event.id последнего полученного события, передаётся в HistoryRequest.cursor.
+  rpc Query(HistoryRequest) returns (stream Event);
+  // Агрегаты по бирже, символу или базовому активу с шагом час/день/неделя/месяц.
+  rpc Aggregate(AggregateRequest) returns (AggregateResponse);
+}
+
+message HistoryRequest {
+  repeated string exchanges = 1;
+  repeated string symbols = 2;
+  repeated EventType types = 3;
+  // Границы периода, мс, [from_ts, to_ts).
+  int64 from_ts = 4;
+  int64 to_ts = 5;
+  // 0 = лимит сервера по умолчанию.
+  uint32 limit = 6;
+  string cursor = 7;
+  reserved 8 to 15;
+}
+
+enum GroupBy {
+  GROUP_BY_UNSPECIFIED = 0;
+  GROUP_BY_EXCHANGE = 1;
+  GROUP_BY_SYMBOL = 2;
+  GROUP_BY_BASE_ASSET = 3;
+}
+
+enum Step {
+  STEP_UNSPECIFIED = 0;
+  STEP_HOUR = 1;
+  STEP_DAY = 2;
+  STEP_WEEK = 3;
+  STEP_MONTH = 4;
+}
+
+enum Metric {
+  METRIC_UNSPECIFIED = 0;
+  // Ликвидации: сумма USD и число.
+  METRIC_LIQ_SUM_USD = 1;
+  METRIC_LIQ_COUNT = 2;
+  // Ликвидации по сторонам, USD.
+  METRIC_LIQ_LONG_USD = 3;
+  METRIC_LIQ_SHORT_USD = 4;
+  // Максимальная ликвидация, USD.
+  METRIC_LIQ_MAX_USD = 5;
+  // Изменение OI за шаг: в базовой монете и в USD.
+  METRIC_OI_CHANGE_BASE = 6;
+  METRIC_OI_CHANGE_USD = 7;
+  // Суммарный OI по базовому активу (все биржи), USD, на конец шага.
+  METRIC_OI_TOTAL_USD = 8;
+  // Доля ликвидаций от OI: liq_usd / oi_usd.
+  METRIC_LIQ_TO_OI_RATIO = 9;
+}
+
+message AggregateRequest {
+  GroupBy group_by = 1;
+  Step step = 2;
+  // Период, мс, [from_ts, to_ts).
+  int64 from_ts = 3;
+  int64 to_ts = 4;
+  // Фильтры; пустой список = без фильтра.
+  repeated string exchanges = 5;
+  repeated string symbols = 6;
+  repeated string base_assets = 7;
+  repeated Metric metrics = 8;
+  reserved 9 to 15;
+}
+
+message MetricValue {
+  Metric metric = 1;
+  // Нет данных (например нет OI в шаге) - значение отсутствует.
+  optional double value = 2;
+}
+
+message AggregateRow {
+  // Начало шага, мс.
+  int64 bucket_start = 1;
+  // Ключ группы: биржа, нормализованный символ или базовый актив (по group_by).
+  string group = 2;
+  repeated MetricValue values = 3;
+  // Шаг пересекает Gap или источник неполон (например Binance !forceOrder).
+  bool partial = 4;
+  reserved 5 to 9;
+}
+
+message AggregateResponse {
+  repeated AggregateRow rows = 1;
+  // Хотя бы одна строка partial: суммы - нижняя оценка.
+  bool partial = 2;
+  reserved 3 to 9;
+}

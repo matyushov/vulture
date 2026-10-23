@@ -1,21 +1,27 @@
 use std::path::PathBuf;
 
+const PROTOS: [&str; 4] = [
+    "vulture/v1/common.proto",
+    "vulture/v1/stream.proto",
+    "vulture/v1/history.proto",
+    "vulture/v1/control.proto",
+];
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto");
-    let protos = [proto_root.join("vulture/v1/vulture.proto")];
+    let protos: Vec<PathBuf> = PROTOS.iter().map(|p| proto_root.join(p)).collect();
 
     // protoc берём из вендорного крейта: системный не требуется.
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
 
-    tonic_prost_build::configure().compile_with_config(config, &protos, &[proto_root])?;
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_with_config(config, &protos, &[proto_root])?;
 
-    // Пока в пакете нет сообщений, prost файл не создаёт; include! в lib.rs его ждёт.
-    let generated = PathBuf::from(std::env::var("OUT_DIR")?).join("vulture.v1.rs");
-    if !generated.exists() {
-        std::fs::write(generated, "")?;
+    for proto in &protos {
+        println!("cargo:rerun-if-changed={}", proto.display());
     }
-
-    println!("cargo:rerun-if-changed={}", protos[0].display());
     Ok(())
 }

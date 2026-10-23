@@ -1,0 +1,88 @@
+// Общие типы контракта vulture.v1.
+//
+// Правила эволюции: только добавление полей; номера не переиспользуются; удалённое поле или
+// значение enum помечается `reserved` (номер и имя). Роль пользователя в контракте не вводится
+// (пользователь один, подразумевается admin); для расширения оставлены зарезервированные номера.
+//
+// Единицы: все метки времени - int64, миллисекунды Unix epoch (UTC). Числа - double.
+syntax = "proto3";
+
+package vulture.v1;
+
+// Сторона ликвидированной позиции.
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  // Ликвидирована длинная позиция (принудительная продажа).
+  SIDE_LONG = 1;
+  // Ликвидирована короткая позиция (принудительная покупка).
+  SIDE_SHORT = 2;
+}
+
+// Тип события, для фильтров.
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_LIQUIDATION = 1;
+  EVENT_TYPE_OPEN_INTEREST = 2;
+  EVENT_TYPE_GAP = 3;
+}
+
+// Ликвидация. Биржа - строка из конфигурации сервера (например "binance"), не enum.
+message Liquidation {
+  string exchange = 1;
+  // Символ как отдаёт биржа (BTCUSDT).
+  string symbol_raw = 2;
+  // Нормализованный символ BASE-QUOTE-PERP (BTC-USDT-PERP).
+  string symbol = 3;
+  // Время события на бирже, мс.
+  int64 exchange_ts = 4;
+  // Время получения сервером, мс.
+  int64 recv_ts = 5;
+  Side side = 6;
+  double price = 7;
+  // Количество в базовой монете.
+  double qty = 8;
+  // Номинал в USD (price * qty с учётом множителя контракта).
+  double notional_usd = 9;
+  reserved 10 to 15;
+}
+
+// Срез открытого интереса.
+message OpenInterest {
+  string exchange = 1;
+  string symbol_raw = 2;
+  string symbol = 3;
+  int64 exchange_ts = 4;
+  int64 recv_ts = 5;
+  // OI в базовой монете.
+  double oi_base = 6;
+  // OI в USD, если биржа отдаёт.
+  optional double oi_usd = 7;
+  // Mark price на момент среза, если известна.
+  optional double mark_price = 8;
+  reserved 9 to 15;
+}
+
+// Обрыв источника: данные в интервале [from_ts, to_ts] неполны.
+message Gap {
+  string exchange = 1;
+  // Имя потока внутри биржи (например "liquidations", "open_interest").
+  string stream = 2;
+  // Последнее полученное событие до обрыва, мс.
+  int64 from_ts = 3;
+  // Момент восстановления, мс.
+  int64 to_ts = 4;
+  reserved 5 to 9;
+}
+
+// Обёртка события.
+message Event {
+  // Идентификатор записи Redis Stream, присвоенный сервером; для resume (Stream.Subscribe)
+  // и курсора (History.Query). Для клиента непрозрачная строка, порядок сравнивает сервер.
+  string id = 1;
+  oneof payload {
+    Liquidation liquidation = 10;
+    OpenInterest open_interest = 11;
+    Gap gap = 12;
+  }
+  reserved 2 to 9;
+}
