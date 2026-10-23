@@ -1,0 +1,15 @@
+# Example Prometheus configuration for vulture-server. Adjust the target to where the metrics endpoint is
+# reachable from Prometheus (an internal network address or a reverse proxy; the endpoint is unauthenticated and
+# listens on 127.0.0.1:9100 by default).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: vulture
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:9100"]

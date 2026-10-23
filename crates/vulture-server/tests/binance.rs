@@ -806,6 +806,37 @@ async fn dropped_connection_produces_a_gap_event() {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
+async fn connector_state_is_exposed_as_metrics() {
+    let infos = [info_body(&btc_eth())];
+    let http = MockHttp::new(move |path, idx| {
+        if path.starts_with("/fapi/v1/exchangeInfo") {
+            return Reply::ok(&infos[0]);
+        }
+        let s = symbol_of(path, &KNOWN).unwrap();
+        Reply::ok(&oi_body(s, "2.5", 1_792_775_000_000 + idx as i64))
+    });
+    let mut rig = start(config(&[], 30), quiet_ws(&[("BTCUSDT", "100000.5")]), http);
+    rig.oi_events(2).await;
+    let mut families = vulture_server::metrics::Families::new();
+    rig.status.collect_metrics(&mut families);
+    let text = families.render();
+    for needle in [
+        "vulture_events_total{exchange=\"binance\",type=\"open_interest\"} ",
+        "vulture_symbols{exchange=\"binance\"} 2",
+        "vulture_ws_state{exchange=\"binance\",state=\"healthy\"} ",
+        "vulture_ws_reconnects_total{exchange=\"binance\"} 0",
+        "vulture_rest_banned{exchange=\"binance\"} 0",
+        "vulture_oi_requests_total{exchange=\"binance\"} ",
+        "vulture_mark_price_age_seconds{exchange=\"binance\"} ",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?} in\n{text}");
+    }
+    // Symbols never appear as label values.
+    assert!(!text.contains("BTC"), "{text}");
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn oi_uses_mark_price_when_known_and_stays_empty_otherwise() {
     // The mark price of BTC is known, ETH has none. exchangeInfo answers late so marks arrive first.
     let infos = [info_body(&btc_eth())];

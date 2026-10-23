@@ -35,7 +35,8 @@ pub fn parse_bearer(value: &str) -> Option<&str> {
 }
 
 /// Checks `authorization: Bearer <token>` on every RPC. Failures are counted per peer address and logged with
-/// the address and the reason, never with the presented value.
+/// the address and the reason, never with the presented value. Once a peer has too many failures, further
+/// *failed* attempts get `RESOURCE_EXHAUSTED`; a correct token is never refused.
 #[derive(Clone)]
 pub struct AuthInterceptor {
     authority: Arc<TokenAuthority>,
@@ -64,13 +65,8 @@ impl AuthInterceptor {
         header: Option<Result<&str, ()>>,
         now: Instant,
     ) -> Result<AuthContext, Status> {
-        if self.limiter.is_blocked(peer, now) {
-            self.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(peer = ?peer, "request refused: too many failed authentications");
-            return Err(Status::resource_exhausted(
-                "too many failed authentication attempts; try again later",
-            ));
-        }
+        // A valid token always passes, even from an address that is blocked for failed attempts: the limiter
+        // only slows down guessing and must never lock the owner out.
         let reason = match header {
             None => "missing",
             Some(Err(())) => "malformed",
@@ -82,6 +78,13 @@ impl AuthInterceptor {
                 },
             },
         };
+        if self.limiter.is_blocked(peer, now) {
+            self.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(peer = ?peer, "failed attempt refused: too many failed authentications");
+            return Err(Status::resource_exhausted(
+                "too many failed authentication attempts; try again later",
+            ));
+        }
         self.stats.failures.fetch_add(1, Ordering::Relaxed);
         let blocked = self.limiter.record_failure(peer, now);
         tracing::warn!(peer = ?peer, reason, blocked, "authentication failed");
@@ -192,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_failures_lead_to_resource_exhausted_even_for_a_valid_token() {
+    fn repeated_failures_are_limited_but_a_valid_token_always_passes() {
         let (_d, i, token, _a) = setup(3);
         let t0 = Instant::now();
         for _ in 0..3 {
@@ -201,19 +204,28 @@ mod tests {
                 tonic::Code::Unauthenticated
             );
         }
-        // Blocked: the valid token is not even looked at.
-        let valid = format!("Bearer {token}");
+        // Blocked: further failed attempts are refused with RESOURCE_EXHAUSTED ...
         assert_eq!(
-            i.check(PEER, Some(Ok(&valid)), t0).unwrap_err().code(),
+            i.check(PEER, Some(Ok("Bearer x")), t0).unwrap_err().code(),
             tonic::Code::ResourceExhausted
         );
         assert_eq!(i.stats.rate_limited.load(Ordering::Relaxed), 1);
+        // ... but the valid token passes from the very same address, however many failures preceded it.
+        let valid = format!("Bearer {token}");
+        assert!(i.check(PEER, Some(Ok(&valid)), t0).is_ok());
+        assert!(i.check(PEER, Some(Ok(&valid)), t0).is_ok());
+        assert_eq!(i.stats.rate_limited.load(Ordering::Relaxed), 1);
         // Other peers are fine, and the block ends with the window.
         let other = Some(IpAddr::from([192, 0, 2, 8]));
-        assert!(i.check(other, Some(Ok(&valid)), t0).is_ok());
-        assert!(
-            i.check(PEER, Some(Ok(&valid)), t0 + Duration::from_secs(61))
-                .is_ok()
+        assert_eq!(
+            i.check(other, Some(Ok("Bearer x")), t0).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            i.check(PEER, Some(Ok("Bearer x")), t0 + Duration::from_secs(61))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
         );
     }
 }

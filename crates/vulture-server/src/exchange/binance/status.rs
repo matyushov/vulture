@@ -69,6 +69,8 @@ pub struct BinanceStatus {
     pub oi_gaps: AtomicU64,
     /// Completed polling cycles.
     pub oi_cycles: AtomicU64,
+    /// Receive time (wall-clock ms) of the last mark price frame; 0 if none yet (gauge).
+    pub last_mark_ms: AtomicI64,
 
     /// Counters and state of the WebSocket manager, available once the connector runs.
     pub ws: OnceLock<WsLink>,
@@ -86,6 +88,11 @@ pub struct WsLink {
 impl BinanceStatus {
     pub(crate) fn inc(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adds the connector's samples to a metrics scrape (labels: `exchange`, `type`, `state`, `result`, `code`).
+    pub fn collect_metrics(&self, out: &mut crate::metrics::Families) {
+        super::metrics::collect(self, out);
     }
 
     /// Reads a counter.

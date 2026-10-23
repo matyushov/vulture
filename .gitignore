@@ -18,3 +18,7 @@ secrets/
 research/data/
 research/tools/**/.venv/
 __pycache__/
+# deployment: real environment files and local TLS material stay out of the repository; templates are committed
+!.env.example
+!deploy/.env.example
+deploy/tls/

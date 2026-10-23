@@ -304,14 +304,23 @@ async fn repeated_failures_from_one_address_are_limited() {
             .unwrap_err();
         assert_eq!(status.code(), Code::Unauthenticated);
     }
-    // Now even the right token is refused until the window passes.
+    // Failed attempts are now refused with RESOURCE_EXHAUSTED ...
     let status = server
-        .client()
+        .client_with(Auth::bearer("wrong-wrong-wrong-wrong"))
         .await
         .subscribe(request(""))
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::ResourceExhausted);
+    // ... but the right token from the same address still passes, many times over.
+    for _ in 0..20 {
+        server
+            .client()
+            .await
+            .subscribe(request(""))
+            .await
+            .expect("a valid token must never be blocked");
+    }
     assert_eq!(
         server
             .auth_stats

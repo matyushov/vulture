@@ -1,0 +1,57 @@
+# Example unit for running vulture-server directly on a host (without Docker).
+#
+#   sudo useradd --system --home-dir /var/lib/vulture --shell /usr/sbin/nologin vulture
+#   sudo install -m 0755 vulture-server /usr/local/bin/vulture-server
+#   sudo install -d -m 0750 -o root -g vulture /etc/vulture
+#   sudo install -m 0640 -o root -g vulture config.toml /etc/vulture/config.toml
+#   sudo install -m 0640 -o root -g vulture vulture.env /etc/vulture/vulture.env      # VULTURE__REDIS__URL=...
+#   sudo install -m 0644 vulture.service /etc/systemd/system/vulture.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vulture.service
+#
+# Paths are placeholders: /etc/vulture holds the configuration, the secret environment file and the TLS files,
+# /var/lib/vulture the data directory (the access token). The environment file is not part of the repository.
+[Unit]
+Description=vulture server (liquidations and open interest)
+Documentation=https://github.com/matyushov/vulture
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=vulture
+Group=vulture
+ExecStart=/usr/local/bin/vulture-server run --config /etc/vulture/config.toml
+# SIGHUP reloads the TLS certificate and key without dropping open streams.
+ExecReload=/bin/kill -HUP $MAINPID
+EnvironmentFile=/etc/vulture/vulture.env
+Restart=on-failure
+RestartSec=5s
+# The server flushes and stops within server.shutdown_timeout_secs after SIGTERM.
+TimeoutStopSec=20s
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The only writable place is the data directory (the access token lives there).
+ReadWritePaths=/var/lib/vulture
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

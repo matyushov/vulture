@@ -8,9 +8,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::TokenStore;
 use crate::config::Config;
-use crate::exchange::{EVENT_CHANNEL_CAPACITY, Exchange, build_connectors};
+use crate::exchange::{EVENT_CHANNEL_CAPACITY, Exchange, ExchangeMetrics, build_connectors};
+use crate::metrics::{
+    AuthMetrics, GrpcMetrics, MetricsHub, Readiness, RedisSampler, WriterMetrics,
+};
 use crate::normalize::{AliasError, BaseAliases};
 use crate::store::{RedisClientStore, RedisStore, RedisWriter, WriterConfig};
+use crate::tls::TlsReloader;
 use crate::ws::SystemClock;
 
 /// Context shared by every component. Cheap to clone.
@@ -90,6 +94,39 @@ pub enum AppError {
     /// The gRPC server could not start.
     #[error(transparent)]
     Grpc(#[from] crate::grpc::GrpcError),
+    /// The TLS files are unusable.
+    #[error(transparent)]
+    Tls(#[from] crate::tls::TlsError),
+    /// The metrics endpoint could not start.
+    #[error(transparent)]
+    Metrics(#[from] crate::metrics::MetricsError),
+    /// Signal handlers could not be installed.
+    #[error("cannot install signal handlers: {0}")]
+    Signals(std::io::Error),
+}
+
+/// How often the Redis stream length and age are sampled for the metrics.
+const REDIS_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Without TLS there is nothing to reload, but the default action of SIGHUP is to kill the process, and the
+/// deploy hooks send it unconditionally: swallow it and say so.
+fn ignore_sighup(shutdown: CancellationToken) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut hup = signal(SignalKind::hangup())?;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = hup.recv() => tracing::info!("SIGHUP received; TLS is not configured, nothing to reload"),
+                    _ = shutdown.cancelled() => return,
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = shutdown;
+    Ok(())
 }
 
 /// Runs the server with the Redis store described by the configuration until `ctx.shutdown` is cancelled.
@@ -114,22 +151,52 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
             TokenStore::new(&ctx.config.server.data_dir).path(),
         );
     }
-    if ctx.config.tls.is_some() {
-        tracing::warn!(
-            "[tls] is configured but TLS is not implemented yet (V1-8): serving plaintext"
-        );
-    }
+    let tls = match &ctx.config.tls {
+        Some(cfg) => Some(TlsReloader::load(cfg)?),
+        None => None,
+    };
+    let hub = Arc::new(MetricsHub::new());
+    let metrics_listener = crate::metrics::bind(&ctx.config.metrics.listen_addr).await?;
     let grpc = crate::grpc::start(
         &ctx.config.server,
+        tls.clone(),
         store.clone(),
         authority,
         ctx.shutdown.clone(),
     )
     .await?;
+    hub.register(Arc::new(GrpcMetrics(grpc.stats.clone())));
+    hub.register(Arc::new(AuthMetrics(grpc.auth_stats.clone())));
+    match &tls {
+        Some(tls) => {
+            hub.register(tls.clone());
+            let interval = Duration::from_secs(
+                ctx.config
+                    .tls
+                    .as_ref()
+                    .map_or(0, |t| t.reload_interval_secs),
+            );
+            crate::tls::spawn_watchers(tls.clone(), interval, ctx.shutdown.clone())
+                .map_err(AppError::Signals)?;
+        }
+        None => ignore_sighup(ctx.shutdown.clone()).map_err(AppError::Signals)?,
+    }
+    let sampler = RedisSampler::new();
+    hub.register(sampler.clone());
+    tokio::spawn(sampler.run(store.clone(), REDIS_SAMPLE_INTERVAL, ctx.shutdown.clone()));
+    tracing::info!(addr = %metrics_listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "metrics endpoint listening");
+    let metrics_task = tokio::spawn(crate::metrics::serve(
+        metrics_listener,
+        hub.clone(),
+        Arc::new(Readiness::new(store.clone(), grpc.running.clone())),
+        ctx.shutdown.clone(),
+    ));
 
     let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
-    run_with_store(ctx, store).await;
+    let connectors = build_connectors(&ctx);
+    run_with_hub(ctx, store, connectors, Some(hub)).await;
     grpc.wait(deadline * 2).await;
+    let _ = metrics_task.await;
     Ok(())
 }
 
@@ -146,6 +213,16 @@ pub async fn run_with_connectors(
     store: Arc<dyn RedisStore>,
     connectors: Vec<Box<dyn Exchange>>,
 ) {
+    run_with_hub(ctx, store, connectors, None).await;
+}
+
+/// Like [`run_with_connectors`]; the writer and the connectors register their metrics with `hub`.
+pub async fn run_with_hub(
+    ctx: AppContext,
+    store: Arc<dyn RedisStore>,
+    connectors: Vec<Box<dyn Exchange>>,
+    hub: Option<Arc<MetricsHub>>,
+) {
     let connectors: Vec<Arc<dyn Exchange>> = connectors.into_iter().map(Arc::from).collect();
     let (sink, events) = mpsc::channel::<vulture_proto::v1::Event>(EVENT_CHANNEL_CAPACITY);
 
@@ -155,6 +232,12 @@ pub async fn run_with_connectors(
         WriterConfig::from_redis(&ctx.config.redis, deadline),
         Arc::new(SystemClock),
     );
+    if let Some(hub) = &hub {
+        hub.register(Arc::new(WriterMetrics(writer.status())));
+        for connector in &connectors {
+            hub.register(Arc::new(ExchangeMetrics(connector.clone())));
+        }
+    }
     // Ends when every sender is dropped (connectors stopped) and the buffer is flushed, or at the deadline.
     let writer_task = tokio::spawn(writer.run(events, ctx.shutdown.clone()));
 

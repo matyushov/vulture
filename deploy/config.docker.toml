@@ -1,0 +1,34 @@
+# Configuration of the vulture-server container, mounted read-only at /etc/vulture/config.toml by
+# deploy/docker-compose.yml. It holds no secrets: the Redis URL (with its password) comes from the environment
+# (VULTURE__REDIS__URL, set by the compose file from REDIS_PASSWORD in your .env), and the access token lives in
+# the data volume. Reference of every key: config.example.toml in the repository root.
+
+[server]
+# Inside the container the server must listen on all interfaces so that the published port works. The compose
+# file publishes the ports to 127.0.0.1 of the host by default. Without [tls] the connection is plaintext, hence
+# the flag; remove it (and publish the port wider) only after enabling [tls] below.
+listen_addr = "0.0.0.0:50051"
+allow_plaintext = true
+data_dir = "/var/lib/vulture"
+
+# TLS: uncomment, mount the directory with the certificate (VULTURE_TLS_DIR in .env, see deploy/README.md) and
+# restart. After that certificate renewals are picked up without a restart (SIGHUP or the file poll).
+# [tls]
+# cert = "/etc/vulture/tls/fullchain.pem"
+# key = "/etc/vulture/tls/privkey.pem"
+# client_ca = "/etc/vulture/tls/client-ca.pem"   # optional: require client certificates (mTLS)
+# reload_interval_secs = 30
+
+[metrics]
+# Not authenticated. Published to the host's loopback by default; scrape it from a trusted network only.
+listen_addr = "0.0.0.0:9100"
+
+[logging]
+level = "info"
+format = "json"
+
+[[exchanges]]
+name = "binance"
+enabled = true
+symbols = []            # empty = every linear USDT/USDC perpetual
+oi_poll_interval_secs = 30

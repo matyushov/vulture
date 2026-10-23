@@ -5,9 +5,11 @@ gRPC API, Redis Streams hot storage and ClickHouse history, plus a Qt6 client.
 
 Status: scaffold, proto v0.2 contract, CI, the server foundation (configuration, exchange trait, symbol and
 open interest normalization, reconnecting WebSocket manager), the Binance USDT-M connector, the Redis Streams
-writer (24-hour hot window), the gRPC `Stream.Subscribe` with resume and the owner token. `History` and `Control`
-are in the contract but answer `UNIMPLEMENTED`; TLS, metrics, ClickHouse history and the other exchanges are not
-implemented yet. The server needs a Redis instance (`redis.url`) and logs per-type event counts once a minute.
+writer (24-hour hot window), the gRPC `Stream.Subscribe` with resume and the owner token, TLS with certificate hot
+reload, Prometheus metrics, and a Dockerfile with compose, certbot, systemd and Prometheus templates in `deploy/`.
+`History` and `Control` are in the contract but answer `UNIMPLEMENTED`; ClickHouse history and the other
+exchanges are not implemented yet. The server needs a Redis instance (`redis.url`); deployment is described in
+[deploy/README.md](deploy/README.md).
 
 ## Components
 
@@ -42,7 +44,8 @@ added to the repository.
 
 ## Server architecture
 
-`crates/vulture-server` is a library plus a thin binary (`vulture-server run|config check --config <file>`).
+`crates/vulture-server` is a library plus a thin binary (`vulture-server run|config check|token|tls check|healthcheck
+--config <file>`).
 - `config`: TOML plus `VULTURE__SECTION__KEY` environment overrides; the exchange list and symbols are data;
   secrets are wrapped so they never reach logs. `app`: shared context and graceful shutdown on SIGINT/SIGTERM.
 - `store`: Redis Streams hot storage: the `RedisStore` trait (append, range read, stream bounds, a dedicated tail
@@ -50,6 +53,8 @@ added to the repository.
   `RedisWriter` that batches, survives outages and records gaps (see "Redis storage").
 - `auth`: the owner token (file, rotation), the interceptor and the failure limiter; `grpc`: the tonic server with
   `Stream.Subscribe` and the `History`/`Control` stubs (see "gRPC API and token").
+- `tls`: rustls (ring) for the gRPC listener with hot reload of the certificate (see "TLS"); `metrics`: Prometheus
+  exposition, `/healthz` and `/readyz` (see "Metrics").
 - `exchange`: the `Exchange` trait (`name()`, `run(ctx, sink)`); a connector owns its loop and pushes
   `vulture_proto::v1::Event` into a bounded channel until the shutdown token fires.
 - `normalize`: raw symbol to `BASE-QUOTE-PERP` (metadata first, string parsing only as a fallback), base asset
@@ -85,7 +90,7 @@ test overrides `ws_url` / `rest_url`.
   418 ban, and a 429 pause longer than one polling interval, publish a `Gap` (`stream` `open_interest`) from the
   start to the planned end of the pause.
 - **Status:** `BinanceConnector::status()` exposes counters (frames, parse errors, duplicates, retries, ban state,
-  used weight) for the future metrics endpoint.
+  used weight); they are exported by the metrics endpoint (see "Metrics").
 - **Live check:** `cargo test -p vulture-server --test binance -- --ignored binance_live --nocapture` connects to
   the real public endpoints for about 75 seconds (not run in CI).
 
@@ -119,8 +124,8 @@ The Redis entry ID (`<ms>-<seq>`) is the public `Event.id`; readers set it from 
 - **Shutdown:** the writer flushes what it holds within `server.shutdown_timeout_secs` and stops.
 - **Startup check** (best effort, warnings only): `appendonly yes`, `appendfsync everysec`, `maxmemory` set,
   `maxmemory-policy noeviction`. If `CONFIG GET` is not allowed this is logged at debug level.
-- **Status** for the future metrics: written, batches, retries, buffered, dropped, last error, last write time and
-  connection state (`RedisWriter::status()`).
+- **Status:** written, batches, retries, buffered, dropped, last error, last write time and connection state
+  (`RedisWriter::status()`), exported by the metrics endpoint.
 - **Size:** measured on Redis 7, 20 000 entries with realistic values: about 138 bytes per open interest entry, 130
   per liquidation, 152 for the expected mix (`MEMORY USAGE`; the protobuf payload itself is about 80 bytes). At 21
   events/s for 24 hours that is roughly 260 MiB.
@@ -147,9 +152,9 @@ docker stop vulture-test-redis
 
 `vulture-server run` serves three services on `server.listen_addr` (default `127.0.0.1:50051`): `Stream`
 (implemented), `History` and `Control` (registered, every method answers `UNIMPLEMENTED`, so the contract is
-visible to `grpcurl`). Every RPC of every service needs the token; there is no TLS yet (V1-8), so the server **refuses
-a non-loopback `listen_addr`** unless `server.allow_plaintext = true` is set (a warning is logged). Put a TLS
-terminator or an SSH tunnel in front, or wait for V1-8, before exposing it.
+visible to `grpcurl`). Every RPC of every service needs the token. Without `[tls]` the connection is plaintext, so
+the server **refuses a non-loopback `listen_addr`** unless `server.allow_plaintext = true` is set (a warning is
+logged; for an internal network or a TLS-terminating proxy). With `[tls]` any address is accepted (see "TLS").
 
 ### Token
 
@@ -165,9 +170,10 @@ CSPRNG, base64url (43 characters), stored in `<server.data_dir>/token` (file mod
   token with `UNAUTHENTICATED`. `token create` creates the token only if there is none and prints it once to stderr.
   A deleted file is never regenerated silently: only `token create` or the first start of the server do that.
 - Clients send `authorization: Bearer <token>`. The comparison is constant-time. A missing, malformed or wrong
-  token gives `UNAUTHENTICATED`; after 10 failures per minute from one peer address the address gets
-  `RESOURCE_EXHAUSTED` (even for a valid token) until the failures age out. Failures are logged with the peer address
-  and the reason, never with the presented value. The token never appears in logs, errors or panics; the first
+  token gives `UNAUTHENTICATED`; after 10 failures per minute from one peer address, further *failed* attempts from
+  it get `RESOURCE_EXHAUSTED` until the failures age out. The limiter only slows down guessing: **a correct token is
+  never refused**, not even from an address that has failed before (the owner cannot be locked out). Failures are
+  logged with the peer address and the reason, never with the presented value. The token never appears in logs, errors or panics; the first
   creation prints it once to stderr in a banner.
 
 ### `Stream.Subscribe`
@@ -197,9 +203,76 @@ can reconnect with its last id, other clients are not affected. `server.max_clie
 streams, extra ones get `RESOURCE_EXHAUSTED`. If Redis fails while streaming, the stream stays open, retries with
 backoff and continues from the last scanned cursor. HTTP/2 keepalive (`keepalive_interval_secs`,
 `keepalive_timeout_secs`) drops vanished clients. Shutdown ends open streams with `UNAVAILABLE`. A new subscription
-while Redis is down gets `UNAVAILABLE`. Counters for the future metrics endpoint: `GrpcStats` (clients,
-subscriptions, events sent, slow disconnects, resume requests, out-of-range answers, rejected clients, Redis read
-errors) and `AuthStats` (failures, rate-limited requests).
+while Redis is down gets `UNAVAILABLE`. Counters (exported as metrics): `GrpcStats` (clients, subscriptions,
+events sent, slow disconnects, resume requests, out-of-range answers, rejected clients, Redis read errors) and
+`AuthStats` (failures, rate-limited requests).
+
+## TLS
+
+`[tls]` (`cert`, `key`, optional `client_ca`, `reload_interval_secs`) makes the gRPC listener serve TLS: rustls with
+the ring provider, TLS 1.2 and 1.3, HTTP/2 negotiated by ALPN. `cert` is a PEM chain (certbot's `fullchain.pem`),
+`key` a PEM private key (PKCS#8, PKCS#1 or SEC1). With `client_ca` the server also requires a client certificate
+from that CA (mTLS); a client without one is refused at the handshake. The token is still required on every RPC.
+
+- **Hot reload.** tonic's own TLS config cannot change the certificate of a running server, so the handshake uses a
+  rustls certificate resolver backed by an atomically swappable key and tonic is fed through a custom incoming TLS
+  stream. A reload affects **new connections only**; streams that are open keep running on the old certificate.
+  Triggers: `SIGHUP`, a poll of the files' mtime and size every `reload_interval_secs` (default 30, `0` = off), and
+  nothing else (use `tls check` to validate without a server).
+- **Bad replacement.** A reload that fails (unreadable or invalid PEM, key does not match the certificate,
+  certificate expired or not yet valid) keeps the old certificate in use, logs the error (file names and reason,
+  never key material) and counts it in `vulture_tls_reloads_total{result="error"}`; `vulture_tls_last_reload_ok`
+  is `0` until a good pair arrives. A change is evaluated once; a broken pair is not retried until a file changes
+  again or `SIGHUP` arrives.
+- **Expiry.** `not_after` and the days left are logged at start and on every reload (a warning below 14 days) and
+  exported as `vulture_tls_certificate_expiry_seconds`. `client_ca` is read at start only.
+- **Validation.** `vulture-server tls check --config <file>` loads `[tls]` the way the server does and reports the
+  expiry; `config check` does the same when `[tls]` is present (files exist and parse, key matches the certificate,
+  certificate valid now). `vulture-server run` refuses to start with unusable files.
+- **SIGHUP without TLS** is ignored (and logged), so deploy hooks may send it unconditionally.
+- **Client.** `cargo run -p vulture-server --example stream_client -- --endpoint https://vulture.example.com:50051
+  --ca-cert ca.pem [--domain name] [--client-cert c.pem --client-key k.pem]`; a certificate from a public CA needs no
+  `--ca-cert`.
+
+Certificates in tests are generated on the fly (`rcgen`); `tests/tls.rs` covers handshake, reload by poll with an open
+stream, rejected replacements, mTLS and the file validation errors, `tests/tls_sighup.rs` a real `SIGHUP`.
+
+## Metrics
+
+A separate listener, `metrics.listen_addr` (default `127.0.0.1:9100`), serves `/metrics` (Prometheus text format),
+`/healthz` (the process is up) and `/readyz` (Redis answers and the gRPC listener runs; 503 otherwise). **The port is
+not authenticated**: keep it on loopback or an internal network, or put a reverse proxy with authentication in
+front. `vulture-server healthcheck --config <file> [--ready]` calls it (used by the container health check).
+
+The exposition is written by a small hand-made writer (no registry dependency): every component keeps its own
+atomic counters and reports them at scrape time. Labels are low-cardinality on purpose (`exchange`, `type`, `state`,
+`result`, `code`, `version`), never a symbol, peer address or client. Main series:
+
+| prefix | content |
+|---|---|
+| `vulture_build_info`, `vulture_process_*` | version, uptime, start time |
+| `vulture_events_total{exchange,type}`, `vulture_parse_errors_total{exchange,type}` | events published (liquidation, open_interest, gap) and unparsable frames |
+| `vulture_connector_*`, `vulture_symbols`, `vulture_mark_price_age_seconds` | frames, filtered liquidations, symbol count, liveness |
+| `vulture_oi_*`, `vulture_rest_*`, `vulture_exchange_info_loads_total` | open interest polling: requests, retries, failures, used weight, 429/418, pause and ban state, interval |
+| `vulture_ws_*{exchange}` | WebSocket manager: state (`state` label, 1 for the current one), reconnects, gaps, duplicates, overflow drops, bans |
+| `vulture_redis_*` | writer: written, batches, retries, buffered, dropped, gaps written, last write age, connection state; sampled stream length and oldest/newest entry age |
+| `vulture_grpc_*`, `vulture_auth_*` | clients, subscriptions, events sent, slow-client disconnects, resumes, out-of-range, failed and rate-limited authentications |
+| `vulture_tls_*` | enabled, seconds until expiry, reloads by `result`, last reload ok, handshake failures |
+
+The Redis stream length and entry ages are sampled every 15 s (they need round trips to Redis), the rest is read at
+scrape time. `deploy/prometheus/` has a sample scrape configuration and alert rules (writer buffer growing, Redis
+writes stalled, connector disconnected, certificate expiring, Binance ban, stream lag). `tests/metrics.rs` parses
+the exposition with a Prometheus text parser and checks key series, movement after synthetic activity, bounded label
+sets and `/readyz` against a failing store.
+
+## Deployment
+
+See [deploy/README.md](deploy/README.md): `Dockerfile` (multi-stage, distroless, non-root, `HEALTHCHECK` through
+`vulture-server healthcheck`, `data_dir` as a volume, no secrets in the image), `deploy/docker-compose.yml` (vulture,
+Redis with AOF and a password, an optional ClickHouse placeholder profile; ports published to `127.0.0.1`),
+`deploy/certbot/` (DNS-01 and a deploy hook that copies the certificate and sends `SIGHUP`), `deploy/systemd/`, and
+`deploy/prometheus/`. Everything is generic: placeholders instead of hostnames, secrets only in ignored `.env`
+files. CI builds the image (no push) and validates `docker compose config`.
 
 ### Trying it locally
 

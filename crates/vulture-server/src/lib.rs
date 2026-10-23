@@ -10,6 +10,8 @@
 //! - [`normalize`]: symbols, base asset aliases, open interest units, market filter.
 //! - [`store`]: the Redis Streams layout, the writer and its in-memory test double.
 //! - [`ws`]: the reconnecting WebSocket session manager shared by all connectors.
+//! - [`tls`]: rustls for the gRPC listener with certificate hot reload.
+//! - [`metrics`]: Prometheus exposition, `/healthz` and `/readyz`.
 //! - [`logging`]: `tracing` setup.
 
 pub mod app;
@@ -18,6 +20,8 @@ pub mod config;
 pub mod exchange;
 pub mod grpc;
 pub mod logging;
+pub mod metrics;
 pub mod normalize;
 pub mod store;
+pub mod tls;
 pub mod ws;

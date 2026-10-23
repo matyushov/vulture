@@ -22,7 +22,8 @@ fn example_config_is_valid() {
     assert_eq!(cfg.exchanges.len(), 3);
     assert_eq!(cfg.enabled_exchanges().count(), 1);
     assert_eq!(cfg.logging.format, LogFormat::Text);
-    assert!(cfg.tls.is_some());
+    // [tls] is commented out in the example: its paths are placeholders.
+    assert!(cfg.tls.is_none());
 }
 
 #[test]
@@ -127,7 +128,7 @@ fn validation_reports_every_problem() {
 [server]
 listen_addr = "not-an-address"
 [metrics]
-listen = "also bad"
+listen_addr = "also bad"
 [redis]
 window_secs = 0
 batch_size = 0
@@ -153,7 +154,7 @@ name = "okx"
     let joined = problems.join("\n");
     for needle in [
         "server.listen_addr",
-        "metrics.listen",
+        "metrics.listen_addr",
         "redis.window_secs",
         "redis.batch_size",
         "redis.stream_key",
@@ -173,7 +174,7 @@ name = "okx"
 #[test]
 fn same_listen_addresses_are_rejected() {
     let text =
-        "[server]\nlisten_addr = \"127.0.0.1:9000\"\n[metrics]\nlisten = \"127.0.0.1:9000\"\n";
+        "[server]\nlisten_addr = \"127.0.0.1:9000\"\n[metrics]\nlisten_addr = \"127.0.0.1:9000\"\n";
     assert!(matches!(
         parse(text, no_env()).unwrap_err(),
         ConfigError::Invalid(_)
@@ -199,6 +200,39 @@ fn non_loopback_listen_needs_the_plaintext_flag() {
         let text = format!("[server]\nlisten_addr = \"{ok}\"\n");
         assert!(parse(&text, no_env()).is_ok(), "{ok}");
     }
+}
+
+#[test]
+fn tls_defaults_and_non_loopback_bind_with_tls() {
+    let text =
+        "[server]\nlisten_addr = \"0.0.0.0:50051\"\n[tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"\n";
+    let cfg = parse(text, no_env()).expect("a non-loopback bind is fine with TLS");
+    let tls = cfg.tls.unwrap();
+    assert_eq!(tls.reload_interval_secs, 30);
+    assert!(tls.client_ca.is_none());
+    assert!(
+        !cfg.server.allow_plaintext,
+        "the plaintext flag is not needed"
+    );
+    let text = "[tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"\nclient_ca = \"/ca.pem\"\nreload_interval_secs = 0\n";
+    let tls = parse(text, no_env()).unwrap().tls.unwrap();
+    assert_eq!(tls.reload_interval_secs, 0);
+    assert_eq!(tls.client_ca, Some(PathBuf::from("/ca.pem")));
+    for bad in [
+        "[tls]\ncert = \"\"\nkey = \"/k.pem\"\n",
+        "[tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"\nclient_ca = \"\"\n",
+    ] {
+        assert!(matches!(
+            parse(bad, no_env()).unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
+    }
+}
+
+#[test]
+fn metrics_defaults_to_loopback_9100() {
+    let cfg = parse("", no_env()).unwrap();
+    assert_eq!(cfg.metrics.listen_addr, "127.0.0.1:9100");
 }
 
 #[test]

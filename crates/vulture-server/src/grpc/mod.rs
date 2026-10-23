@@ -1,8 +1,9 @@
 //! The gRPC server (V1-6, V1-7): `Stream.Subscribe` with resume, stubs for `History` and `Control`, all behind
 //! the bearer token interceptor.
 //!
-//! No TLS yet (V1-8): the server accepts only a loopback bind unless `server.allow_plaintext` is set, because the
-//! token would travel unencrypted. HTTP/2 keepalive drops clients that vanished without closing the connection.
+//! With `[tls]` the listener serves TLS ([`crate::tls`], certificate hot reload) on any address. Without it the
+//! server accepts only a loopback bind unless `server.allow_plaintext` is set, because the token would travel
+//! unencrypted. HTTP/2 keepalive drops clients that vanished without closing the connection.
 
 mod stats;
 mod stream;
@@ -10,6 +11,7 @@ mod stub;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -33,6 +35,7 @@ use crate::auth::{
 };
 use crate::config::ServerConfig;
 use crate::store::RedisStore;
+use crate::tls::TlsReloader;
 
 /// Why the gRPC server could not start or stopped abnormally.
 #[derive(Debug, thiserror::Error)]
@@ -59,26 +62,40 @@ pub enum GrpcError {
     Transport(#[from] tonic::transport::Error),
 }
 
-/// Refuses a non-loopback bind unless plaintext was allowed explicitly. Until TLS exists (V1-8) the bearer token
-/// would cross the network in clear text.
-pub fn check_bind_policy(addr: SocketAddr, allow_plaintext: bool) -> Result<(), String> {
-    if addr.ip().is_loopback() || allow_plaintext {
+/// Refuses a non-loopback bind unless the connection is encrypted (`tls`) or plaintext was allowed explicitly:
+/// otherwise the bearer token would cross the network in clear text.
+pub fn check_bind_policy(addr: SocketAddr, allow_plaintext: bool, tls: bool) -> Result<(), String> {
+    if addr.ip().is_loopback() || allow_plaintext || tls {
         Ok(())
     } else {
         Err(format!(
-            "{addr} is not a loopback address and TLS is not available yet; bind to 127.0.0.1 \
-             or set server.allow_plaintext = true to accept an unencrypted connection"
+            "{addr} is not a loopback address and [tls] is not configured; bind to 127.0.0.1, \
+             configure [tls], or set server.allow_plaintext = true to accept an unencrypted connection"
         ))
     }
 }
 
-/// Binds the gRPC listener after applying the bind policy; logs a warning for an allowed plaintext bind.
+/// Binds the plaintext gRPC listener after applying the bind policy; logs a warning for an allowed non-loopback
+/// bind.
 pub async fn bind(listen_addr: &str, allow_plaintext: bool) -> Result<TcpListener, GrpcError> {
+    bind_checked(listen_addr, allow_plaintext, false).await
+}
+
+/// Binds the listener of a TLS server: any address is acceptable.
+pub async fn bind_tls(listen_addr: &str) -> Result<TcpListener, GrpcError> {
+    bind_checked(listen_addr, false, true).await
+}
+
+async fn bind_checked(
+    listen_addr: &str,
+    allow_plaintext: bool,
+    tls: bool,
+) -> Result<TcpListener, GrpcError> {
     let addr: SocketAddr = listen_addr
         .parse()
         .map_err(|_| GrpcError::BadAddress(listen_addr.to_string()))?;
-    check_bind_policy(addr, allow_plaintext).map_err(GrpcError::Policy)?;
-    if !addr.ip().is_loopback() {
+    check_bind_policy(addr, allow_plaintext, tls).map_err(GrpcError::Policy)?;
+    if !addr.ip().is_loopback() && !tls {
         tracing::warn!(
             %addr,
             "gRPC listens on a non-loopback address without TLS (server.allow_plaintext = true): \
@@ -115,8 +132,8 @@ impl ServeOptions {
     }
 }
 
-/// Serves `Stream`, `History` and `Control` on `listener` until `shutdown` fires; open streams end with
-/// `UNAVAILABLE` so the graceful shutdown is quick.
+/// Serves `Stream`, `History` and `Control` in plaintext on `listener` until `shutdown` fires; open streams end
+/// with `UNAVAILABLE` so the graceful shutdown is quick.
 pub async fn serve(
     listener: TcpListener,
     store: Arc<dyn RedisStore>,
@@ -126,6 +143,61 @@ pub async fn serve(
     auth_stats: Arc<AuthStats>,
     shutdown: CancellationToken,
 ) -> Result<(), GrpcError> {
+    serve_on(
+        TcpListenerStream::new(listener),
+        store,
+        authority,
+        options,
+        stats,
+        auth_stats,
+        shutdown,
+    )
+    .await
+}
+
+/// Like [`serve`] over TLS: the handshakes use the certificate currently held by `tls`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_tls(
+    listener: TcpListener,
+    tls: Arc<TlsReloader>,
+    store: Arc<dyn RedisStore>,
+    authority: Arc<TokenAuthority>,
+    options: ServeOptions,
+    stats: Arc<GrpcStats>,
+    auth_stats: Arc<AuthStats>,
+    shutdown: CancellationToken,
+) -> Result<(), GrpcError> {
+    serve_on(
+        crate::tls::incoming(listener, tls, shutdown.clone()),
+        store,
+        authority,
+        options,
+        stats,
+        auth_stats,
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_on<I, IO, IE>(
+    incoming: I,
+    store: Arc<dyn RedisStore>,
+    authority: Arc<TokenAuthority>,
+    options: ServeOptions,
+    stats: Arc<GrpcStats>,
+    auth_stats: Arc<AuthStats>,
+    shutdown: CancellationToken,
+) -> Result<(), GrpcError>
+where
+    I: futures_util::Stream<Item = Result<IO, IE>>,
+    IO: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + tonic::transport::server::Connected
+        + Unpin
+        + Send
+        + 'static,
+    IE: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let interceptor = AuthInterceptor::new(
         authority.clone(),
         Arc::new(FailureLimiter::new(options.limiter)),
@@ -140,7 +212,7 @@ pub async fn serve(
         .add_service(StreamServer::new(stream))
         .add_service(HistoryServer::new(HistoryStub))
         .add_service(ControlServer::new(ControlStub))
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown.cancelled_owned())
+        .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
         .await?;
     Ok(())
 }
@@ -155,6 +227,8 @@ pub struct GrpcHandle {
     pub auth_stats: Arc<AuthStats>,
     /// The token authority (rotation).
     pub authority: Arc<TokenAuthority>,
+    /// True while the server task is serving (for `/readyz`).
+    pub running: Arc<AtomicBool>,
     server: JoinHandle<()>,
     watcher: JoinHandle<()>,
 }
@@ -169,14 +243,19 @@ impl GrpcHandle {
     }
 }
 
-/// Binds the listener, opens the token and starts serving in the background.
+/// Binds the listener and starts serving in the background: TLS when `tls` is given, plaintext otherwise.
 pub async fn start(
     server: &ServerConfig,
+    tls: Option<Arc<TlsReloader>>,
     store: Arc<dyn RedisStore>,
     authority: Arc<TokenAuthority>,
     shutdown: CancellationToken,
 ) -> Result<GrpcHandle, GrpcError> {
-    let listener = bind(&server.listen_addr, server.allow_plaintext).await?;
+    let tls_enabled = tls.is_some();
+    let listener = match &tls {
+        Some(_) => bind_tls(&server.listen_addr).await?,
+        None => bind(&server.listen_addr, server.allow_plaintext).await?,
+    };
     let local_addr = listener.local_addr().map_err(|source| GrpcError::Bind {
         addr: SocketAddr::from(([0, 0, 0, 0], 0)),
         source,
@@ -187,30 +266,44 @@ pub async fn start(
         Duration::from_millis(server.token_check_interval_ms),
         shutdown.clone(),
     ));
+    let running = Arc::new(AtomicBool::new(true));
     let task = tokio::spawn({
-        let (stats, auth_stats, authority, shutdown) = (
+        let (stats, auth_stats, authority, shutdown, running) = (
             stats.clone(),
             auth_stats.clone(),
             authority.clone(),
             shutdown.clone(),
+            running.clone(),
         );
         let options = ServeOptions::from_server(server);
         async move {
-            if let Err(e) = serve(
-                listener, store, authority, options, stats, auth_stats, shutdown,
-            )
-            .await
-            {
+            let result = match tls {
+                Some(tls) => {
+                    serve_tls(
+                        listener, tls, store, authority, options, stats, auth_stats, shutdown,
+                    )
+                    .await
+                }
+                None => {
+                    serve(
+                        listener, store, authority, options, stats, auth_stats, shutdown,
+                    )
+                    .await
+                }
+            };
+            running.store(false, Ordering::Relaxed);
+            if let Err(e) = result {
                 tracing::error!(error = %e, "gRPC server failed");
             }
         }
     });
-    tracing::info!(addr = %local_addr, "gRPC server listening");
+    tracing::info!(addr = %local_addr, tls = tls_enabled, "gRPC server listening");
     Ok(GrpcHandle {
         local_addr,
         stats,
         auth_stats,
         authority,
+        running,
         server: task,
         watcher,
     })

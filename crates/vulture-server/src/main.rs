@@ -34,6 +34,32 @@ enum Command {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// TLS utilities.
+    Tls {
+        #[command(subcommand)]
+        command: TlsCommand,
+    },
+    /// Ask the running server's metrics endpoint whether it is alive (`/healthz`) or ready (`/readyz`); exit
+    /// code 0 means yes. Meant for the container health check.
+    Healthcheck {
+        /// Path to the TOML configuration file (for `metrics.listen_addr`).
+        #[arg(long)]
+        config: PathBuf,
+        /// Check `/readyz` (Redis reachable and the gRPC listener running) instead of `/healthz`.
+        #[arg(long)]
+        ready: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TlsCommand {
+    /// Validate the certificate, the key and the client CA named in `[tls]` without starting a server: files
+    /// readable, PEM valid, key matches the certificate, certificate valid now. Prints the expiry.
+    Check {
+        /// Path to the TOML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -77,6 +103,10 @@ async fn main() -> anyhow::Result<()> {
             command: ConfigCommand::Check { config },
         } => check(config),
         Command::Token { command } => token(command),
+        Command::Tls {
+            command: TlsCommand::Check { config },
+        } => tls_check(config),
+        Command::Healthcheck { config, ready } => healthcheck(config, ready).await,
     }
 }
 
@@ -117,12 +147,57 @@ fn check(path: PathBuf) -> anyhow::Result<()> {
     if let Some(file) = &config.normalize.base_aliases_file {
         vulture_server::normalize::BaseAliases::load(file)?;
     }
+    if config.tls.is_some() {
+        tls_report(&config)?;
+    }
     println!(
         "config OK: {} exchange(s), {} enabled",
         config.exchanges.len(),
         config.enabled_exchanges().count()
     );
     Ok(())
+}
+
+/// Checks the files of `[tls]` and prints what is known about the certificate.
+fn tls_report(config: &Config) -> anyhow::Result<()> {
+    let tls = config
+        .tls
+        .as_ref()
+        .context("no [tls] section in the configuration")?;
+    let info = vulture_server::tls::check_files(tls)?;
+    let days = info.expires_in_secs() / 86_400;
+    println!(
+        "tls OK: certificate for {} expires {} (in {days} days){}",
+        info.subject,
+        info.not_after,
+        if tls.client_ca.is_some() {
+            "; client certificates required (mTLS)"
+        } else {
+            ""
+        }
+    );
+    if info.expires_in_secs() < vulture_server::tls::EXPIRY_WARNING.as_secs() as i64 {
+        eprintln!("warning: the certificate expires in less than 14 days");
+    }
+    Ok(())
+}
+
+fn tls_check(path: PathBuf) -> anyhow::Result<()> {
+    tls_report(&Config::load(&path)?)
+}
+
+async fn healthcheck(path: PathBuf, ready: bool) -> anyhow::Result<()> {
+    let config = Config::load(&path)?;
+    let mut addr: std::net::SocketAddr = config.metrics.listen_addr.parse()?;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    let route = if ready { "/readyz" } else { "/healthz" };
+    match vulture_server::metrics::healthcheck(addr, route).await {
+        Ok((200, _)) => Ok(()),
+        Ok((status, body)) => anyhow::bail!("{route} answered {status}: {}", body.trim()),
+        Err(e) => anyhow::bail!("{e}"),
+    }
 }
 
 async fn run(path: PathBuf) -> anyhow::Result<()> {

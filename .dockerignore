@@ -1,0 +1,17 @@
+# Keep the build context small and free of local data.
+.git
+.github
+target
+ui
+research
+deploy
+*.md
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+config.toml
+config.local.toml
+secrets
+.idea
+.vscode

@@ -6,22 +6,16 @@
 #   VULTURE__EXCHANGES__0__ENABLED=false                (array elements are addressed by index)
 
 [server]
-listen_addr = "127.0.0.1:50051"  # gRPC. A non-loopback address is refused unless allow_plaintext = true
-                               # (until TLS lands the bearer token would travel unencrypted)
-allow_plaintext = false
-data_dir = "/var/lib/vulture"  # the token (`token` file, mode 0600) and service state; created with mode 0700
-shutdown_timeout_secs = 4      # upper bound for graceful shutdown
-max_clients = 16               # simultaneous Stream.Subscribe clients
-client_buffer = 1024           # events queued per client; a client whose queue stays full is disconnected
-slow_client_timeout_ms = 10000 # ... after this long (RESOURCE_EXHAUSTED; it can resume with its last id)
-keepalive_interval_secs = 30   # HTTP/2 keepalive ping
-keepalive_timeout_secs = 10
-token_check_interval_ms = 1000 # how often the token file is re-read (picks up `token rotate` from the CLI)
-
-[tls]                          # not applied yet (V1-8); the server logs a warning if this section is present
-cert = "/etc/vulture/tls/fullchain.pem"   # reloaded on SIGHUP
-key = "/etc/vulture/tls/privkey.pem"
-# client_ca = "/etc/vulture/tls/client-ca.pem"   # enables mTLS (optional)
+listen_addr = "127.0.0.1:50051"  # gRPC. A non-loopback address needs # TLS for the gRPC listener. Uncomment to enable; paths are placeholders. The files are PEM; the certificate
+# file may hold the whole chain (certbot's fullchain.pem). Certificate and key are reloaded without dropping open
+# streams on SIGHUP and when the files change (poll below); an invalid replacement is rejected and the old
+# certificate stays in use. Check the files with `vulture-server tls check --config <file>`.
+# [tls]
+# cert = "/etc/vulture/tls/fullchain.pem"
+# key = "/etc/vulture/tls/privkey.pem"
+# client_ca = "/etc/vulture/tls/client-ca.pem"   # enables mTLS: clients must present a certificate from this CA
+#                                                # (read at start; changing it needs a restart)
+# reload_interval_secs = 30      # poll the files' mtime and size; 0 disables polling (SIGHUP still reloads)
 
 [redis]
 # The URL may contain a password: prefer VULTURE__REDIS__URL or url_file over writing it here.
@@ -58,7 +52,9 @@ enabled = false
 oi_poll_interval_secs = 30
 
 [metrics]
-listen = "127.0.0.1:9090"      # Prometheus, separate port
+# /metrics (Prometheus), /healthz (process up), /readyz (Redis reachable and gRPC running). Not authenticated:
+# keep it on loopback or an internal network, or put a reverse proxy in front.
+listen_addr = "127.0.0.1:9100"
 
 [logging]
 level = "info"                 # tracing filter, e.g. "info,vulture_server::ws=debug"

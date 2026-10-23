@@ -58,7 +58,8 @@ pub enum ConfigError {
 pub struct Config {
     /// gRPC listener and state directory.
     pub server: ServerConfig,
-    /// TLS material. Not applied yet (V1-8): the gRPC server serves plaintext and logs a warning if this is set.
+    /// TLS for the gRPC listener. When set, the listener serves TLS (HTTP/2 via ALPN) and any bind address is
+    /// allowed; without it the listener is plaintext and loopback-only unless `server.allow_plaintext` is set.
     pub tls: Option<TlsConfig>,
     /// Redis Streams (hot window).
     pub redis: RedisConfig,
@@ -76,10 +77,11 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
-    /// gRPC listen address. Loopback by default; anything else needs `allow_plaintext` until TLS exists (V1-8).
+    /// gRPC listen address. Loopback by default; a non-loopback address needs `[tls]` (or, for an internal
+    /// network or a TLS-terminating proxy, `allow_plaintext`).
     pub listen_addr: String,
-    /// Allows a non-loopback `listen_addr` while the connection is not encrypted (the bearer token would travel
-    /// in clear text). A warning is logged at start. Off by default.
+    /// Allows a non-loopback `listen_addr` without `[tls]` (the bearer token would travel in clear text). A
+    /// warning is logged at start. Off by default; meaningless when `[tls]` is set.
     pub allow_plaintext: bool,
     /// Directory for the token (`<data_dir>/token`, mode 0600) and service state. Created with mode 0700.
     pub data_dir: PathBuf,
@@ -126,8 +128,17 @@ pub struct TlsConfig {
     pub cert: PathBuf,
     /// Private key (PEM).
     pub key: PathBuf,
-    /// CA for client certificates; enables mTLS.
+    /// CA bundle (PEM) for client certificates; enables mTLS (a client without a valid certificate is refused).
+    /// Read at start only: changing it needs a restart.
     pub client_ca: Option<PathBuf>,
+    /// How often the certificate and key files are checked for a change (mtime and size), seconds. 0 disables
+    /// polling; SIGHUP always reloads.
+    #[serde(default = "default_tls_reload_interval")]
+    pub reload_interval_secs: u64,
+}
+
+fn default_tls_reload_interval() -> u64 {
+    30
 }
 
 /// `[redis]` section.
@@ -213,14 +224,15 @@ fn default_oi_interval() -> u64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
-    /// Prometheus listen address.
-    pub listen: String,
+    /// Listen address of the metrics endpoint (`/metrics`, `/healthz`, `/readyz`). It is not authenticated:
+    /// keep it on loopback or an internal network.
+    pub listen_addr: String,
 }
 
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
-            listen: "127.0.0.1:9090".into(),
+            listen_addr: "127.0.0.1:9100".into(),
         }
     }
 }
@@ -306,7 +318,11 @@ impl Config {
                 self.server.listen_addr
             )),
             Ok(addr) => {
-                if let Err(e) = crate::grpc::check_bind_policy(addr, self.server.allow_plaintext) {
+                if let Err(e) = crate::grpc::check_bind_policy(
+                    addr,
+                    self.server.allow_plaintext,
+                    self.tls.is_some(),
+                ) {
                     problems.push(format!("server.listen_addr: {e}"));
                 }
             }
@@ -335,14 +351,16 @@ impl Config {
                 problems.push(format!("{name} must be greater than 0"));
             }
         }
-        if self.metrics.listen.parse::<SocketAddr>().is_err() {
+        if self.metrics.listen_addr.parse::<SocketAddr>().is_err() {
             problems.push(format!(
-                "metrics.listen: {:?} is not a socket address (host:port)",
-                self.metrics.listen
+                "metrics.listen_addr: {:?} is not a socket address (host:port)",
+                self.metrics.listen_addr
             ));
         }
-        if self.server.listen_addr == self.metrics.listen {
-            problems.push("metrics.listen must differ from server.listen_addr".into());
+        if self.server.listen_addr == self.metrics.listen_addr
+            && !self.metrics.listen_addr.ends_with(":0")
+        {
+            problems.push("metrics.listen_addr must differ from server.listen_addr".into());
         }
         if self.server.shutdown_timeout_secs == 0 {
             problems.push("server.shutdown_timeout_secs must be greater than 0".into());
@@ -373,10 +391,17 @@ impl Config {
         if self.redis.url.is_some() && self.redis.url_file.is_some() {
             problems.push("redis.url and redis.url_file are mutually exclusive".into());
         }
-        if let Some(tls) = &self.tls
-            && (tls.cert.as_os_str().is_empty() || tls.key.as_os_str().is_empty())
-        {
-            problems.push("tls.cert and tls.key must not be empty".into());
+        if let Some(tls) = &self.tls {
+            if tls.cert.as_os_str().is_empty() || tls.key.as_os_str().is_empty() {
+                problems.push("tls.cert and tls.key must not be empty".into());
+            }
+            if tls
+                .client_ca
+                .as_ref()
+                .is_some_and(|p| p.as_os_str().is_empty())
+            {
+                problems.push("tls.client_ca must not be empty when set".into());
+            }
         }
         if tracing_subscriber::EnvFilter::try_new(&self.logging.level).is_err() {
             problems.push(format!(

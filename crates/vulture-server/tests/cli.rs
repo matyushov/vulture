@@ -105,7 +105,7 @@ fn run_without_exchanges_stops_on_sigterm() {
         "empty.toml",
         &format!(
             "[server]\nlisten_addr = \"127.0.0.1:0\"\ndata_dir = {data:?}\n\
-             [logging]\nlevel = \"info\"\nformat = \"json\"\n[redis]\nurl = \"redis://127.0.0.1:1\"\n"
+             [metrics]\nlisten_addr = \"127.0.0.1:0\"\n[logging]\nlevel = \"info\"\nformat = \"json\"\n[redis]\nurl = \"redis://127.0.0.1:1\"\n"
         ),
     );
     let mut child = Command::new(BIN)
@@ -127,6 +127,19 @@ fn run_without_exchanges_stops_on_sigterm() {
             break;
         }
     }
+    // A deploy hook sends SIGHUP even when TLS is off: the server must shrug it off.
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "SIGHUP must not stop the server"
+    );
     let started = Instant::now();
     let status = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
@@ -143,6 +156,8 @@ fn run_without_exchanges_stops_on_sigterm() {
     assert!(stdout.contains("vulture-server running"), "{stdout}");
     assert!(stdout.contains("SIGTERM"), "{stdout}");
     assert!(stdout.contains("gRPC server listening"), "{stdout}");
+    assert!(stdout.contains("metrics endpoint listening"), "{stdout}");
+    assert!(stdout.contains("SIGHUP received"), "{stdout}");
 
     // First start: the token was created, shown once on stderr and never logged.
     let token = std::fs::read_to_string(std::path::Path::new(&data).join("token")).unwrap();
@@ -269,4 +284,104 @@ fn config_check_refuses_a_public_bind_without_the_plaintext_flag() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[path = "common/certs.rs"]
+mod certs;
+
+fn tls_config(files: &certs::Files, name: &str) -> PathBuf {
+    temp_file(
+        name,
+        &format!(
+            "[tls]\ncert = {:?}\nkey = {:?}\n",
+            files.cert.to_str().unwrap(),
+            files.key.to_str().unwrap()
+        ),
+    )
+}
+
+fn run_bin(args: &[&str], config: &std::path::Path) -> std::process::Output {
+    Command::new(BIN)
+        .args(args)
+        .arg("--config")
+        .arg(config)
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn tls_check_validates_the_files_without_a_server() {
+    let ca = certs::Ca::new("cli ca");
+    let good = ca.server("cli");
+    let files = certs::Files::new(&ca, &good);
+    let cfg = tls_config(&files, "tls-ok.toml");
+
+    let out = run_bin(&["tls", "check"], &cfg);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("tls OK") && stdout.contains("expires"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("PRIVATE KEY"));
+    // `config check` validates the same files.
+    let out = run_bin(&["config", "check"], &cfg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A key that does not match: both commands fail with a clear message and no key material.
+    let other = ca.server("other");
+    certs::write_atomic(&files.key, other.key_pem.as_bytes());
+    for args in [["tls", "check"], ["config", "check"]] {
+        let out = run_bin(&args, &cfg);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("does not match"), "{stderr}");
+        assert!(!stderr.contains("PRIVATE KEY"), "{stderr}");
+    }
+
+    // Missing files.
+    std::fs::remove_file(&files.cert).unwrap();
+    let out = run_bin(&["tls", "check"], &cfg);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot read certificate"));
+
+    // No [tls] section at all.
+    let none = temp_file("tls-none.toml", "");
+    let out = run_bin(&["tls", "check"], &none);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no [tls] section"));
+}
+
+#[test]
+fn healthcheck_fails_when_nothing_listens_and_succeeds_against_the_endpoint() {
+    let free = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let cfg = temp_file("hc.toml", &format!("[metrics]\nlisten_addr = \"{free}\"\n"));
+    assert!(!run_bin(&["healthcheck"], &cfg).status.success());
+
+    // A tiny one-shot HTTP server that answers 200.
+    let listener = std::net::TcpListener::bind(free).unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n")
+            .unwrap();
+        request
+    });
+    assert!(run_bin(&["healthcheck"], &cfg).status.success());
+    assert!(server.join().unwrap().starts_with("GET /healthz "));
 }

@@ -2,6 +2,8 @@
 //! ephemeral loopback port and tonic clients that talk to it over the wire.
 #![allow(dead_code)]
 
+pub mod certs;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

@@ -12,6 +12,7 @@
 
 mod http;
 mod info;
+mod metrics;
 mod oi;
 mod rate;
 mod status;
@@ -357,6 +358,7 @@ impl BinanceConnector {
             match marks.apply_frame(text, recv_ts) {
                 Ok((_, rejected)) => {
                     BinanceStatus::inc(&status.mark_frames);
+                    status.last_mark_ms.store(recv_ts, Ordering::Relaxed);
                     if rejected > 0 {
                         status
                             .mark_parse_errors
@@ -409,5 +411,9 @@ impl Exchange for BinanceConnector {
         sink: EventSink,
     ) -> BoxFuture<'a, Result<(), ExchangeError>> {
         Box::pin(self.run_inner(ctx, sink))
+    }
+
+    fn collect_metrics(&self, out: &mut crate::metrics::Families) {
+        self.status.collect_metrics(out);
     }
 }

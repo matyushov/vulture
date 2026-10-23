@@ -6,6 +6,8 @@
 
 pub mod binance;
 
+use std::sync::Arc;
+
 use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
 use vulture_proto::v1::Event;
@@ -56,6 +58,19 @@ pub trait Exchange: Send + Sync {
         ctx: AppContext,
         sink: EventSink,
     ) -> BoxFuture<'a, Result<(), ExchangeError>>;
+
+    /// Adds the connector's counters and state to a metrics scrape. Labels must stay low-cardinality
+    /// (`exchange`, `type`, `state`; never symbols). The default reports nothing.
+    fn collect_metrics(&self, _out: &mut crate::metrics::Families) {}
+}
+
+/// Reports a running connector to the metrics hub.
+pub struct ExchangeMetrics(pub Arc<dyn Exchange>);
+
+impl crate::metrics::MetricSource for ExchangeMetrics {
+    fn collect(&self, out: &mut crate::metrics::Families) {
+        self.0.collect_metrics(out);
+    }
 }
 
 /// Builds the connectors for the enabled exchanges of the configuration.

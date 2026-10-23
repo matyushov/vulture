@@ -6,6 +6,10 @@
 //!     --token "$TOKEN" --resume-from 0 --exchange binance --max-events 20
 //! ```
 //!
+//! Over TLS use an `https://` endpoint. A server certificate that chains to a public CA just works; for a private
+//! or test CA pass `--ca-cert ca.pem`, and `--domain` when the name in the certificate differs from the host in
+//! the endpoint. For mTLS add `--client-cert` and `--client-key`.
+//!
 //! The token can also come from the `VULTURE_TOKEN` environment variable (preferred: it stays out of the
 //! process list). Every event is printed as one line; the last printed id is what to pass to `--resume-from`
 //! after a disconnect. With `--reconnect` the client reconnects by itself with the last id it received.
@@ -14,7 +18,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use vulture_proto::v1::event::Payload;
 use vulture_proto::v1::stream_client::StreamClient;
 use vulture_proto::v1::{Event, EventType, SubscribeRequest};
@@ -46,6 +50,40 @@ struct Args {
     /// Reconnect after an error, resuming from the last received id.
     #[arg(long)]
     reconnect: bool,
+    /// PEM file with the CA that signed the server certificate (https endpoints; default: public web roots).
+    #[arg(long)]
+    ca_cert: Option<std::path::PathBuf>,
+    /// Name to verify in the server certificate when it differs from the host of the endpoint.
+    #[arg(long)]
+    domain: Option<String>,
+    /// PEM client certificate for mTLS (with --client-key).
+    #[arg(long, requires = "client_key")]
+    client_cert: Option<std::path::PathBuf>,
+    /// PEM client private key for mTLS (with --client-cert).
+    #[arg(long, requires = "client_cert")]
+    client_key: Option<std::path::PathBuf>,
+}
+
+fn endpoint(args: &Args) -> anyhow::Result<Endpoint> {
+    let mut endpoint = Endpoint::from_shared(args.endpoint.clone())?;
+    if args.endpoint.starts_with("https://") {
+        let mut tls = ClientTlsConfig::new();
+        tls = match &args.ca_cert {
+            Some(path) => tls.ca_certificate(Certificate::from_pem(std::fs::read(path)?)),
+            None => tls.with_webpki_roots(),
+        };
+        if let Some(domain) = &args.domain {
+            tls = tls.domain_name(domain.clone());
+        }
+        if let (Some(cert), Some(key)) = (&args.client_cert, &args.client_key) {
+            tls = tls.identity(Identity::from_pem(
+                std::fs::read(cert)?,
+                std::fs::read(key)?,
+            ));
+        }
+        endpoint = endpoint.tls_config(tls)?;
+    }
+    Ok(endpoint)
 }
 
 fn event_type(name: &str) -> anyhow::Result<EventType> {
@@ -97,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
     let mut cursor = args.resume_from.clone();
     let mut received = 0u64;
     loop {
-        let channel = Channel::from_shared(args.endpoint.clone())?.connect().await;
+        let channel: Result<Channel, _> = endpoint(&args)?.connect().await;
         let channel = match channel {
             Ok(c) => c,
             Err(e) if args.reconnect => {

@@ -1,0 +1,84 @@
+# vulture: server + Redis (+ an optional ClickHouse placeholder).
+#
+#   cd deploy
+#   cp .env.example .env            # set REDIS_PASSWORD
+#   docker compose build
+#   docker compose up -d
+#   docker compose exec vulture vulture-server token show --config /etc/vulture/config.toml   # no shell needed
+#
+# Ports are published to 127.0.0.1 of the host unless you change VULTURE_*_BIND in .env. Redis is never published.
+name: vulture
+
+services:
+  vulture:
+    image: ${VULTURE_IMAGE:-vulture-server:local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # The password is part of the URL; the URL never reaches the logs. Letters and digits only in the password.
+      VULTURE__REDIS__URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+    volumes:
+      - vulture-data:/var/lib/vulture
+      - ./config.docker.toml:/etc/vulture/config.toml:ro
+      - ${VULTURE_TLS_DIR:-./tls}:/etc/vulture/tls:ro
+    ports:
+      # gRPC. With plaintext (the default config) keep it on loopback. With [tls] you may publish it wider.
+      - "${VULTURE_GRPC_BIND:-127.0.0.1}:${VULTURE_GRPC_PORT:-50051}:50051"
+      # Metrics (/metrics, /healthz, /readyz): unauthenticated.
+      - "${VULTURE_METRICS_BIND:-127.0.0.1}:${VULTURE_METRICS_PORT:-9100}:9100"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+
+  redis:
+    image: redis:7.4
+    restart: unless-stopped
+    # AOF with everysec fsync; a full Redis refuses writes (the writer buffers) instead of evicting history.
+    # The password comes from the environment at run time, not from the command line.
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server
+        --appendonly yes --appendfsync everysec
+        --maxmemory 3gb --maxmemory-policy noeviction
+        --requirepass "$$REDIS_PASSWORD"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No "ports": only the vulture container reaches Redis, over the compose network.
+
+  # Placeholder for the history store (task V3a). Off by default: `docker compose --profile clickhouse up -d`.
+  clickhouse:
+    profiles: ["clickhouse"]
+    image: clickhouse/clickhouse-server:25.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: vulture
+      CLICKHOUSE_USER: vulture
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    # Not published; nothing in vulture uses it yet.
+
+volumes:
+  vulture-data:
+  redis-data:
+  clickhouse-data:

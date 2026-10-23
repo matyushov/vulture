@@ -1,0 +1,92 @@
+# Example alert rules for vulture-server. Thresholds are starting points; tune them to your deployment.
+groups:
+  - name: vulture
+    rules:
+      - alert: VultureDown
+        expr: up{job="vulture"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "vulture-server is not scraped"
+
+      - alert: VultureWriterBufferGrowing
+        # Events pile up in memory because Redis does not accept them; above redis.buffer_limit the oldest are dropped.
+        expr: vulture_redis_buffered_events > 1000 and deriv(vulture_redis_buffered_events[5m]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Redis writer buffer is growing ({{ $value }} events)"
+
+      - alert: VultureEventsDropped
+        expr: increase(vulture_redis_dropped_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Events were dropped because the Redis buffer overflowed"
+
+      - alert: VultureRedisWritesStalled
+        # Connectors are healthy but nothing has reached Redis for a while.
+        expr: vulture_redis_last_write_age_seconds > 300
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "No successful Redis write for {{ $value | humanizeDuration }}"
+
+      - alert: VultureConnectorDisconnected
+        expr: vulture_ws_state{state="healthy"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.exchange }} WebSocket has not been healthy for 10 minutes"
+
+      - alert: VultureMarkPriceStale
+        expr: vulture_mark_price_age_seconds > 120
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.exchange }}: no mark price frames for {{ $value | humanizeDuration }}"
+
+      - alert: VultureCertificateExpiring
+        expr: vulture_tls_certificate_expiry_seconds < 14 * 24 * 3600
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "TLS certificate expires in {{ $value | humanizeDuration }}; check the renewal"
+
+      - alert: VultureCertificateReloadFailing
+        expr: vulture_tls_last_reload_ok == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The last TLS certificate reload failed; the old certificate is still in use"
+
+      - alert: VultureBinanceBanActive
+        expr: vulture_rest_banned{exchange="binance"} == 1
+        labels: {severity: critical}
+        annotations:
+          summary: "Binance REST is paused after an IP ban (HTTP 418); open interest has a gap"
+
+      - alert: VultureBinanceThrottled
+        expr: increase(vulture_rest_throttled_total{code="429"}[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Binance answered HTTP 429; the poller is slowing down"
+
+      - alert: VultureStreamLag
+        # The newest entry of the Redis stream is old although the writer is connected: no events are arriving.
+        expr: vulture_redis_stream_newest_age_seconds > 120 and on() vulture_redis_connection_state{state="connected"} == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The newest event in Redis is {{ $value | humanizeDuration }} old"
+
+      - alert: VultureRedisStreamSamplingFailing
+        expr: increase(vulture_redis_stream_sample_errors_total[10m]) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: "Cannot sample the Redis stream length (Redis unreachable?)"
+
+      - alert: VultureAuthFailures
+        expr: increase(vulture_auth_failures_total[10m]) > 20
+        labels: {severity: warning}
+        annotations:
+          summary: "Many failed authentication attempts ({{ $value }} in 10 minutes)"

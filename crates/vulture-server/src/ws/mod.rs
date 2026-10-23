@@ -19,6 +19,7 @@ mod connector;
 mod dedup;
 mod handler;
 mod manager;
+pub mod metrics;
 mod profile;
 mod session;
 mod status;

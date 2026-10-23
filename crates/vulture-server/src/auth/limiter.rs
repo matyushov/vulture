@@ -24,8 +24,10 @@ impl Default for LimiterConfig {
 }
 
 /// Counts failed authentications per peer IP address (ports differ between connections). Once an address has
-/// `max_failures` failures inside the window, every request from it is refused with `RESOURCE_EXHAUSTED`
-/// without looking at the token, until old failures leave the window. Time is passed in, so tests need no sleeping.
+/// `max_failures` failures inside the window, further *failed* attempts from it are refused with
+/// `RESOURCE_EXHAUSTED` until old failures leave the window. The limiter only answers "is this address blocked";
+/// the interceptor consults it after the token check failed, so a correct token is never refused.
+/// Time is passed in, so tests need no sleeping.
 pub struct FailureLimiter {
     cfg: LimiterConfig,
     failures: Mutex<HashMap<Option<IpAddr>, VecDeque<Instant>>>,
