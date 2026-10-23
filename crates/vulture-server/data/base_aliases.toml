@@ -1,0 +1,87 @@
+# Base asset aliases: exchange-side base name -> real base asset and multiplier.
+#
+# Structure: [<exchange>."<name on the exchange>"] with
+#   base       real base asset used in the normalized symbol (BASE-QUOTE-PERP)
+#   multiplier how many real coins one unit of the exchange-side name stands for
+#
+# Binance and Bybit quote "1000PEPE" as a pseudo coin: one unit is 1000 PEPE, the price is per unit and open
+# interest is counted in units. OKX lists plain PEPE and reports open interest in real coins (oiCcy).
+# Names that are not listed here are taken as they are with multiplier 1: the table never guesses.
+# A custom table (config: normalize.base_aliases_file) replaces this one entirely.
+
+[binance."1000PEPE"]
+base = "PEPE"
+multiplier = 1000
+
+[binance."1000SHIB"]
+base = "SHIB"
+multiplier = 1000
+
+[binance."1000FLOKI"]
+base = "FLOKI"
+multiplier = 1000
+
+[binance."1000BONK"]
+base = "BONK"
+multiplier = 1000
+
+[binance."1000LUNC"]
+base = "LUNC"
+multiplier = 1000
+
+[binance."1000XEC"]
+base = "XEC"
+multiplier = 1000
+
+[binance."1000SATS"]
+base = "SATS"
+multiplier = 1000
+
+[binance."1000RATS"]
+base = "RATS"
+multiplier = 1000
+
+[binance."1000CAT"]
+base = "CAT"
+multiplier = 1000
+
+[binance."1000CHEEMS"]
+base = "CHEEMS"
+multiplier = 1000
+
+[binance."1MBABYDOGE"]
+base = "BABYDOGE"
+multiplier = 1000000
+
+[bybit."1000PEPE"]
+base = "PEPE"
+multiplier = 1000
+
+[bybit."1000SHIB"]
+base = "SHIB"
+multiplier = 1000
+
+[bybit."1000FLOKI"]
+base = "FLOKI"
+multiplier = 1000
+
+[bybit."1000BONK"]
+base = "BONK"
+multiplier = 1000
+
+[bybit."1000LUNC"]
+base = "LUNC"
+multiplier = 1000
+
+[bybit."1000XEC"]
+base = "XEC"
+multiplier = 1000
+
+[bybit."1000000BABYDOGE"]
+base = "BABYDOGE"
+multiplier = 1000000
+
+# BitMEX calls bitcoin XBT.
+[bitmex."XBT"]
+base = "BTC"
+multiplier = 1

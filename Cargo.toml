@@ -12,16 +12,25 @@ repository = "https://github.com/matyushov/vulture"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 prost = "0.14"
 prost-build = "0.14"
 protoc-bin-vendored = "3.3"
+rand = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "0.7"
+toml = "1.1"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+vulture-proto = { path = "crates/vulture-proto", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

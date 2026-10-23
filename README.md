@@ -3,7 +3,8 @@
 Open source service that collects **liquidations** and **open interest** from crypto exchanges: a Rust server,
 gRPC API, Redis Streams hot storage and ClickHouse history, plus a Qt6 client.
 
-Status: scaffold, proto v0 contract and CI; no business logic yet.
+Status: scaffold, proto v0 contract, CI, and the server foundation (configuration, exchange trait, symbol and
+open interest normalization, reconnecting WebSocket manager). No exchange connectors yet.
 
 ## Components
 
@@ -21,7 +22,8 @@ Rust (only the vendored `protoc` is needed; a system one is not required):
 ```sh
 cargo build --workspace
 cargo test --workspace
-cargo run -p vulture-server
+cargo run -p vulture-server -- config check --config config.example.toml
+cargo run -p vulture-server -- run --config config.example.toml
 cargo run -p vulture-cli -- --help
 ```
 
@@ -34,6 +36,22 @@ cmake --build ui/build
 
 Example configuration: [config.example.toml](config.example.toml). Secrets are not
 added to the repository.
+
+## Server architecture
+
+`crates/vulture-server` is a library plus a thin binary (`vulture-server run|config check --config <file>`).
+- `config`: TOML plus `VULTURE__SECTION__KEY` environment overrides; the exchange list and symbols are data;
+  secrets are wrapped so they never reach logs. `app`: shared context and graceful shutdown on SIGINT/SIGTERM.
+- `exchange`: the `Exchange` trait (`name()`, `run(ctx, sink)`); a connector owns its loop and pushes
+  `vulture_proto::v1::Event` into a bounded channel until the shutdown token fires.
+- `normalize`: raw symbol to `BASE-QUOTE-PERP` (metadata first, string parsing only as a fallback), base asset
+  aliases with multipliers (`data/base_aliases.toml`: `1000PEPE` to `PEPE` x 1000, `XBT` to `BTC`), open interest
+  to `oi_base`/`oi_usd`, and the market filter (linear USDT/USDC perpetuals in trading state only).
+- `ws`: the WebSocket manager shared by all connectors. One supervisor task per logical connection with a session
+  task per socket; exponential backoff with jitter, silence and zombie detection on a liveness stream, keepalive,
+  `Gap` events after a loss, make-before-break planned reconnect with deduplication, observable state
+  (`Connecting`, `Healthy`, `Degraded`, `Stopped`). Timers run on the monotonic clock and tests drive them with
+  `tokio::time::pause`. Defaults are documented in `research/ws-reconnect.md`.
 
 ## Contract (proto)
 

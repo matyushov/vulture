@@ -1,8 +1,14 @@
 # Example vulture-server configuration. A copy without secrets; do not commit the real config.
+#
+# Any value can be overridden from the environment: VULTURE__<SECTION>__<KEY>=value, for example
+#   VULTURE__LOGGING__LEVEL=debug
+#   VULTURE__REDIS__URL=redis://:password@host:6379     (secrets belong in the environment or a file)
+#   VULTURE__EXCHANGES__0__ENABLED=false                (array elements are addressed by index)
 
 [server]
-listen = "0.0.0.0:8443"        # gRPC (TLS is mandatory)
+listen = "0.0.0.0:8443"        # gRPC (TLS is mandatory once the gRPC server lands)
 data_dir = "/var/lib/vulture"  # token (hash) and service state
+shutdown_timeout_secs = 4      # upper bound for graceful shutdown
 
 [tls]
 cert = "/etc/vulture/tls/fullchain.pem"   # reloaded on SIGHUP
@@ -10,13 +16,35 @@ key = "/etc/vulture/tls/privkey.pem"
 # client_ca = "/etc/vulture/tls/client-ca.pem"   # enables mTLS (optional)
 
 [redis]
-url = "redis://127.0.0.1:6379"
+# The URL may contain a password: prefer VULTURE__REDIS__URL or url_file over writing it here.
+# url = "redis://127.0.0.1:6379"
+# url_file = "/run/secrets/redis_url"
 window_hours = 24
 
-[exchanges]
-# The set of exchanges is given as a list rather than hardcoded.
-enabled = ["binance", "bybit", "okx"]
-oi_poll_interval_secs = 15
+# The set of exchanges and symbols is data, not code. Symbols are normalized (BASE-QUOTE-PERP);
+# an empty list means every linear USDT/USDC perpetual the exchange offers.
+[[exchanges]]
+name = "binance"
+enabled = true
+symbols = []
+oi_poll_interval_secs = 30
+
+[[exchanges]]
+name = "bybit"
+enabled = false
+oi_poll_interval_secs = 30
+
+[[exchanges]]
+name = "okx"
+enabled = false
+oi_poll_interval_secs = 30
 
 [metrics]
 listen = "127.0.0.1:9090"      # Prometheus, separate port
+
+[logging]
+level = "info"                 # tracing filter, e.g. "info,vulture_server::ws=debug"
+format = "text"                # "text" or "json"
+
+[normalize]
+# base_aliases_file = "/etc/vulture/base_aliases.toml"   # replaces the built-in alias table
