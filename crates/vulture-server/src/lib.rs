@@ -4,6 +4,8 @@
 //!
 //! - [`config`]: TOML file plus environment overrides, secrets kept out of logs.
 //! - [`app`]: shared application context, signal handling, the run loop.
+//! - [`auth`]: the owner token (file, rotation), the interceptor and the failure limiter.
+//! - [`grpc`]: the tonic server: `Stream.Subscribe` with resume, stubs for `History` and `Control`.
 //! - [`exchange`]: the [`exchange::Exchange`] trait implemented by every connector.
 //! - [`normalize`]: symbols, base asset aliases, open interest units, market filter.
 //! - [`store`]: the Redis Streams layout, the writer and its in-memory test double.
@@ -11,8 +13,10 @@
 //! - [`logging`]: `tracing` setup.
 
 pub mod app;
+pub mod auth;
 pub mod config;
 pub mod exchange;
+pub mod grpc;
 pub mod logging;
 pub mod normalize;
 pub mod store;

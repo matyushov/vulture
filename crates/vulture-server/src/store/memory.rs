@@ -1,12 +1,14 @@
 //! In-memory [`RedisStore`] for unit tests: same entry semantics, exact trimming, failure injection.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::future::BoxFuture;
+use tokio::sync::Notify;
 
-use super::{EntryFields, RedisStore, StoreError, StoredEntry, Trim};
+use super::{EntryFields, RedisStore, StoreError, StoredEntry, StreamBounds, StreamReader, Trim};
 use crate::ws::{Clock, SystemClock};
 
 #[derive(Default)]
@@ -20,11 +22,20 @@ struct Inner {
 
 /// A stream kept in memory. IDs are `<ms>-<seq>` from the injected clock, strictly increasing.
 pub struct MemoryStore {
+    core: Arc<Core>,
+}
+
+struct Core {
     inner: Mutex<Inner>,
     clock: Box<dyn Clock>,
     failing: AtomicBool,
     attempts: AtomicUsize,
     settings: Mutex<Option<Vec<(String, String)>>>,
+    /// Wakes blocked readers when entries are appended or connections are killed.
+    notify: Notify,
+    /// Bumped by [`MemoryStore::kill_readers`]; readers opened earlier fail afterwards.
+    reader_epoch: AtomicU64,
+    open_readers: AtomicUsize,
 }
 
 impl Default for MemoryStore {
@@ -42,39 +53,70 @@ impl MemoryStore {
     /// Empty store with an injected clock.
     pub fn with_clock(clock: Box<dyn Clock>) -> Self {
         Self {
-            inner: Mutex::new(Inner::default()),
-            clock,
-            failing: AtomicBool::new(false),
-            attempts: AtomicUsize::new(0),
-            settings: Mutex::new(None),
+            core: Arc::new(Core {
+                inner: Mutex::new(Inner::default()),
+                clock,
+                failing: AtomicBool::new(false),
+                attempts: AtomicUsize::new(0),
+                settings: Mutex::new(None),
+                notify: Notify::new(),
+                reader_epoch: AtomicU64::new(0),
+                open_readers: AtomicUsize::new(0),
+            }),
         }
+    }
+
+    /// Number of [`StreamReader`]s that are open (not yet dropped).
+    pub fn open_readers(&self) -> usize {
+        self.core.open_readers.load(Ordering::SeqCst)
+    }
+
+    /// Simulates `CLIENT KILL` of every reader connection: readers opened so far fail from now on (also while
+    /// blocked); new ones can be opened.
+    pub fn kill_readers(&self) {
+        self.core.reader_epoch.fetch_add(1, Ordering::SeqCst);
+        self.core.notify.notify_waiters();
     }
 
     /// While `true`, every operation fails with a connection error.
     pub fn set_failing(&self, failing: bool) {
-        self.failing.store(failing, Ordering::SeqCst);
+        self.core.failing.store(failing, Ordering::SeqCst);
+        self.core.notify.notify_waiters();
     }
 
     /// Number of `append` calls so far, failed ones included.
     pub fn append_attempts(&self) -> usize {
-        self.attempts.load(Ordering::SeqCst)
+        self.core.attempts.load(Ordering::SeqCst)
     }
 
     /// Sizes of the successful batches, in order.
     pub fn batch_sizes(&self) -> Vec<usize> {
-        self.lock().batches.clone()
+        self.core.lock().batches.clone()
+    }
+
+    /// Removes every entry with an ID smaller than `first_kept` (exact trimming, like `XTRIM MINID` without `~`).
+    pub fn trim_to(&self, first_kept: &str) {
+        let Some(limit) = super::parse_id(first_kept) else {
+            return;
+        };
+        self.core
+            .lock()
+            .entries
+            .retain(|e| super::parse_id(&e.id).is_none_or(|k| k >= limit));
     }
 
     /// Everything stored, in order.
     pub fn entries(&self) -> Vec<StoredEntry> {
-        self.lock().entries.iter().cloned().collect()
+        self.core.lock().entries.iter().cloned().collect()
     }
 
     /// What `CONFIG GET` returns; `None` (default) makes it fail like a server that forbids `CONFIG`.
     pub fn set_settings(&self, settings: Option<Vec<(String, String)>>) {
-        *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings;
+        *self.core.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings;
     }
+}
 
+impl Core {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -109,12 +151,12 @@ impl RedisStore for MemoryStore {
         trim: Trim,
     ) -> BoxFuture<'a, Result<Vec<String>, StoreError>> {
         Box::pin(async move {
-            self.attempts.fetch_add(1, Ordering::SeqCst);
-            self.check()?;
-            let mut inner = self.lock();
+            self.core.attempts.fetch_add(1, Ordering::SeqCst);
+            self.core.check()?;
+            let mut inner = self.core.lock();
             let mut ids = Vec::with_capacity(entries.len());
             for e in entries {
-                let now = self.clock.now_ms();
+                let now = self.core.clock.now_ms();
                 if now > inner.last_ms {
                     inner.last_ms = now;
                     inner.last_seq = 0;
@@ -142,6 +184,8 @@ impl RedisStore for MemoryStore {
             while inner.entries.len() as u64 > trim.maxlen {
                 inner.entries.pop_front();
             }
+            drop(inner);
+            self.core.notify.notify_waiters();
             Ok(ids)
         })
     }
@@ -153,7 +197,7 @@ impl RedisStore for MemoryStore {
         count: Option<usize>,
     ) -> BoxFuture<'a, Result<Vec<StoredEntry>, StoreError>> {
         Box::pin(async move {
-            self.check()?;
+            self.core.check()?;
             let lo = if start == "-" {
                 (i64::MIN, 0)
             } else {
@@ -164,7 +208,7 @@ impl RedisStore for MemoryStore {
             } else {
                 id_key(end)
             };
-            let inner = self.lock();
+            let inner = self.core.lock();
             Ok(inner
                 .entries
                 .iter()
@@ -178,15 +222,37 @@ impl RedisStore for MemoryStore {
         })
     }
 
+    fn bounds(&self) -> BoxFuture<'_, Result<StreamBounds, StoreError>> {
+        Box::pin(async move {
+            self.core.check()?;
+            let inner = self.core.lock();
+            Ok(StreamBounds {
+                first: inner.entries.front().map(|e| e.id.clone()),
+                last: inner.entries.back().map(|e| e.id.clone()),
+            })
+        })
+    }
+
+    fn open_reader(&self) -> BoxFuture<'_, Result<Box<dyn StreamReader>, StoreError>> {
+        Box::pin(async move {
+            self.core.check()?;
+            self.core.open_readers.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(MemoryReader {
+                core: self.core.clone(),
+                epoch: self.core.reader_epoch.load(Ordering::SeqCst),
+            }) as Box<dyn StreamReader>)
+        })
+    }
+
     fn stream_len(&self) -> BoxFuture<'_, Result<u64, StoreError>> {
         Box::pin(async move {
-            self.check()?;
-            Ok(self.lock().entries.len() as u64)
+            self.core.check()?;
+            Ok(self.core.lock().entries.len() as u64)
         })
     }
 
     fn health(&self) -> BoxFuture<'_, Result<(), StoreError>> {
-        Box::pin(async move { self.check() })
+        Box::pin(async move { self.core.check() })
     }
 
     fn settings<'a>(
@@ -194,8 +260,9 @@ impl RedisStore for MemoryStore {
         names: &'a [&'a str],
     ) -> BoxFuture<'a, Result<Vec<(String, String)>, StoreError>> {
         Box::pin(async move {
-            self.check()?;
+            self.core.check()?;
             match self
+                .core
                 .settings
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -206,6 +273,66 @@ impl RedisStore for MemoryStore {
                     .filter(|(k, _)| names.contains(&k.as_str()))
                     .collect()),
                 None => Err(StoreError::Command("CONFIG is not allowed".into())),
+            }
+        })
+    }
+}
+
+/// Reader on a [`MemoryStore`]; mimics a dedicated Redis connection.
+struct MemoryReader {
+    core: Arc<Core>,
+    epoch: u64,
+}
+
+impl Drop for MemoryReader {
+    fn drop(&mut self) {
+        self.core.open_readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl MemoryReader {
+    fn collect(&self, after: (u64, u64), count: usize) -> Result<Vec<StoredEntry>, StoreError> {
+        self.core.check()?;
+        if self.core.reader_epoch.load(Ordering::SeqCst) != self.epoch {
+            return Err(StoreError::Connection("connection killed".into()));
+        }
+        let inner = self.core.lock();
+        Ok(inner
+            .entries
+            .iter()
+            .filter(|e| super::parse_id(&e.id).is_some_and(|k| k > after))
+            .take(count)
+            .cloned()
+            .collect())
+    }
+}
+
+impl StreamReader for MemoryReader {
+    fn read_after<'a>(
+        &'a mut self,
+        after: &'a str,
+        count: usize,
+        block: Option<Duration>,
+    ) -> BoxFuture<'a, Result<Vec<StoredEntry>, StoreError>> {
+        Box::pin(async move {
+            let after = super::parse_id(after)
+                .ok_or_else(|| StoreError::Command("invalid stream ID".into()))?;
+            let deadline = block.map(|d| tokio::time::Instant::now() + d);
+            loop {
+                // Register for wake-ups before looking, so an append in between is not missed.
+                let notified = self.core.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let found = self.collect(after, count)?;
+                if !found.is_empty() {
+                    return Ok(found);
+                }
+                let Some(deadline) = deadline else {
+                    return Ok(found);
+                };
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    return Ok(Vec::new());
+                }
             }
         })
     }

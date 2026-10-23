@@ -3,10 +3,11 @@
 Open source service that collects **liquidations** and **open interest** from crypto exchanges: a Rust server,
 gRPC API, Redis Streams hot storage and ClickHouse history, plus a Qt6 client.
 
-Status: scaffold, proto v0 contract, CI, the server foundation (configuration, exchange trait, symbol and
-open interest normalization, reconnecting WebSocket manager), the Binance USDT-M connector and the Redis Streams
-writer (24-hour hot window). gRPC, ClickHouse history and the other exchanges are not implemented yet; the server
-needs a Redis instance (`redis.url`) and logs per-type event counts once a minute.
+Status: scaffold, proto v0.2 contract, CI, the server foundation (configuration, exchange trait, symbol and
+open interest normalization, reconnecting WebSocket manager), the Binance USDT-M connector, the Redis Streams
+writer (24-hour hot window), the gRPC `Stream.Subscribe` with resume and the owner token. `History` and `Control`
+are in the contract but answer `UNIMPLEMENTED`; TLS, metrics, ClickHouse history and the other exchanges are not
+implemented yet. The server needs a Redis instance (`redis.url`) and logs per-type event counts once a minute.
 
 ## Components
 
@@ -44,9 +45,11 @@ added to the repository.
 `crates/vulture-server` is a library plus a thin binary (`vulture-server run|config check --config <file>`).
 - `config`: TOML plus `VULTURE__SECTION__KEY` environment overrides; the exchange list and symbols are data;
   secrets are wrapped so they never reach logs. `app`: shared context and graceful shutdown on SIGINT/SIGTERM.
-- `store`: Redis Streams hot storage: the `RedisStore` trait (append, range read, health, server settings) with a
-  `redis`-crate implementation and an in-memory double, and the `RedisWriter` that batches, survives outages and
-  records gaps (see "Redis storage").
+- `store`: Redis Streams hot storage: the `RedisStore` trait (append, range read, stream bounds, a dedicated tail
+  reader per client, health, server settings) with a `redis`-crate implementation and an in-memory double, and the
+  `RedisWriter` that batches, survives outages and records gaps (see "Redis storage").
+- `auth`: the owner token (file, rotation), the interceptor and the failure limiter; `grpc`: the tonic server with
+  `Stream.Subscribe` and the `History`/`Control` stubs (see "gRPC API and token").
 - `exchange`: the `Exchange` trait (`name()`, `run(ctx, sink)`); a connector owns its loop and pushes
   `vulture_proto::v1::Event` into a bounded channel until the shutdown token fires.
 - `normalize`: raw symbol to `BASE-QUOTE-PERP` (metadata first, string parsing only as a fallback), base asset
@@ -94,7 +97,7 @@ about 1 liquidation/s), so filtering on read is cheap. Each entry has four field
 
 | field | value |
 |---|---|
-| `t` | event type: `liq`, `oi` or `gap` |
+| `t` | event type: `liq`, `oi`, `gap` or `sig` (signal, proto v0.2) |
 | `x` | exchange (`binance`; `*` for gaps written by the writer itself) |
 | `s` | normalized symbol (`BTC-USDT-PERP`); empty for gaps |
 | `d` | the protobuf-encoded `Event` **without** `id` |
@@ -140,13 +143,119 @@ docker stop vulture-test-redis
 `--nocapture` shows the stored size per entry. The tests kill all other client connections of the server
 (`CLIENT KILL`) to check reconnection, so never point them at a shared Redis. CI runs them against a Redis service.
 
+## gRPC API and token
+
+`vulture-server run` serves three services on `server.listen_addr` (default `127.0.0.1:50051`): `Stream`
+(implemented), `History` and `Control` (registered, every method answers `UNIMPLEMENTED`, so the contract is
+visible to `grpcurl`). Every RPC of every service needs the token; there is no TLS yet (V1-8), so the server **refuses
+a non-loopback `listen_addr`** unless `server.allow_plaintext = true` is set (a warning is logged). Put a TLS
+terminator or an SSH tunnel in front, or wait for V1-8, before exposing it.
+
+### Token
+
+One owner, one token, role admin implied. Generated on the first start if missing: 32 random bytes from the OS
+CSPRNG, base64url (43 characters), stored in `<server.data_dir>/token` (file mode `0600`, directory `0700`).
+
+- **The token itself is stored, not a hash.** The owner wants `token show` to print it again, which a hash cannot do.
+  The trade-off: anyone who can read the file (or a backup or image containing `data_dir`) can use the service, so the
+  file is protected like a TLS private key. If it leaks, run `token rotate`.
+- `vulture-server token show --config <file>` prints the token to stdout (only the token, so `$(...)` is safe).
+  `token rotate` writes a new one and prints it; the old one stops working at once. A running server notices a
+  rotation done by the CLI within `server.token_check_interval_ms` (1 s) and ends the open streams that used the old
+  token with `UNAUTHENTICATED`. `token create` creates the token only if there is none and prints it once to stderr.
+  A deleted file is never regenerated silently: only `token create` or the first start of the server do that.
+- Clients send `authorization: Bearer <token>`. The comparison is constant-time. A missing, malformed or wrong
+  token gives `UNAUTHENTICATED`; after 10 failures per minute from one peer address the address gets
+  `RESOURCE_EXHAUSTED` (even for a valid token) until the failures age out. Failures are logged with the peer address
+  and the reason, never with the presented value. The token never appears in logs, errors or panics; the first
+  creation prints it once to stderr in a banner.
+
+### `Stream.Subscribe`
+
+`SubscribeRequest{exchanges, symbols, types, resume_from}`; empty filters mean "everything". Filtering uses the
+cheap entry fields `t`, `x`, `s` without decoding; `d` is decoded only for matches and `Event.id` is the Redis entry
+ID. A `Gap` has no symbol, so a symbol filter never excludes it; a server-wide gap (exchange `*`) also passes an
+exchange filter; the `types` filter is exact.
+
+| `resume_from` | behaviour |
+|---|---|
+| empty | live only, from the current tail |
+| `0` | replay the whole hot window, then live |
+| an `Event.id` | exclusive cursor: only strictly later entries, no duplicates, no gaps, then live |
+
+Cursor rule: let `F` be the oldest entry still in the stream. A cursor older than `F` is answered `OUT_OF_RANGE`
+("use History"), because entries between the cursor and `F` may have been trimmed. A cursor equal to `F`, inside
+the stream, or beyond the tail (also on an empty stream) is accepted. The check is repeated between replay pages: if
+trimming overtakes a slow replay the stream ends with `OUT_OF_RANGE`. The rule is conservative: after more than a
+window of silence a cursor can be refused although nothing was lost. A malformed cursor is `INVALID_ARGUMENT`.
+
+Data path: pages of 1000 entries are replayed first, then the stream switches to `XREAD BLOCK` on a **dedicated
+Redis connection per client** (named `vulture-stream-reader` in `CLIENT LIST`, never the writer's connection;
+dropped as soon as the client cancels). Each client has a bounded queue (`server.client_buffer`, 1024 events); if it
+stays full for `server.slow_client_timeout_ms` (10 s) the client is disconnected with `RESOURCE_EXHAUSTED` and
+can reconnect with its last id, other clients are not affected. `server.max_clients` (16) limits concurrent
+streams, extra ones get `RESOURCE_EXHAUSTED`. If Redis fails while streaming, the stream stays open, retries with
+backoff and continues from the last scanned cursor. HTTP/2 keepalive (`keepalive_interval_secs`,
+`keepalive_timeout_secs`) drops vanished clients. Shutdown ends open streams with `UNAVAILABLE`. A new subscription
+while Redis is down gets `UNAVAILABLE`. Counters for the future metrics endpoint: `GrpcStats` (clients,
+subscriptions, events sent, slow disconnects, resume requests, out-of-range answers, rejected clients, Redis read
+errors) and `AuthStats` (failures, rate-limited requests).
+
+### Trying it locally
+
+```sh
+docker run -d --rm --name vulture-dev-redis -p 127.0.0.1:6379:6379 redis:7
+cat > /tmp/vulture-dev.toml <<'CONFIG'
+[server]
+data_dir = "/tmp/vulture-dev-data"        # the token lands in /tmp/vulture-dev-data/token
+[redis]
+url = "redis://127.0.0.1:6379"
+[[exchanges]]
+name = "binance"                          # for a fully local run, point it at the mock below
+ws_url = "ws://127.0.0.1:18081"
+rest_url = "http://127.0.0.1:18080"
+oi_poll_interval_secs = 2
+symbols = ["BTC-USDT-PERP", "ETH-USDT-PERP"]
+CONFIG
+cargo run -p vulture-server --example mock_binance &          # no exchange traffic: a loopback stand-in
+cargo run -p vulture-server -- run --config /tmp/vulture-dev.toml &   # prints the token once on the first start
+export VULTURE_TOKEN=$(cargo run -q -p vulture-server -- token show --config /tmp/vulture-dev.toml)
+cargo run -p vulture-server --example stream_client -- --resume-from 0 --max-events 20   # replay, then live
+cargo run -p vulture-server --example stream_client -- --reconnect --exchange binance --type liquidation
+```
+
+`stream_client` prints one line per event, starting with its id; pass the last id to `--resume-from` after a
+disconnect (`--reconnect` does that by itself). With [grpcurl](https://github.com/fullstorydev/grpcurl) (the server
+has no reflection; give it the proto files), the contract is also visible:
+
+```sh
+grpcurl -plaintext -import-path proto -proto vulture/v1/stream.proto \
+  -H "authorization: Bearer $VULTURE_TOKEN" -d '{"resume_from": "0", "exchanges": ["binance"]}' \
+  127.0.0.1:50051 vulture.v1.Stream/Subscribe
+grpcurl -plaintext -import-path proto -proto vulture/v1/control.proto \
+  -H "authorization: Bearer $VULTURE_TOKEN" 127.0.0.1:50051 vulture.v1.Control/GetConnectorStatus
+# -> UNIMPLEMENTED with a valid token, UNAUTHENTICATED without one
+```
+
+Tests: `crates/vulture-server/tests/grpc_stream.rs` (filters, resume, cursor rules, slow client, limits, outages, run
+on the in-memory store and, with `VULTURE_TEST_REDIS_URL`, on a real Redis) and `tests/grpc_auth.rs` (every RPC,
+rotation, limiter, no token in logs).
+
 ## Contract (proto)
 
 `proto/vulture/v1/`: `common.proto` (Exchange as a string, `Side`, `Liquidation`, `OpenInterest`,
-`Gap`, `Event`), `stream.proto` (`Stream.Subscribe`), `history.proto` (`History.Query`,
-`History.Aggregate`), `control.proto` (`Control`). Timestamps are int64, Unix epoch milliseconds;
+`Gap`, `Signal`, `Event`), `stream.proto` (`Stream.Subscribe`), `history.proto` (`History.Query`,
+`History.Aggregate`), `control.proto` (`Control`).
+
+v0.2 (additive, `buf breaking` green): the `Signal` message (`OI_SPIKE_UP`, `OI_SPIKE_DOWN`, `LIQ_CASCADE`, window,
+`change_pct`, `change_abs` in base units, `threshold`, `ts`, a free-form `details` map) as `Event.signal = 13` with
+`EVENT_TYPE_SIGNAL`; `Control.ListSymbolPolicies` / `SetSymbolPolicy` (mode `ALL` / `WHITELIST` / `BLACKLIST`, symbols,
+per-symbol OI interval overrides; the older `ListSubscriptions` / `SetSubscription` stay but are documented as
+superseded); and the OI movers ranking in `History.Aggregate` (`AggregateRequest.oi_movers` selects it, the answer is
+`AggregateResponse.oi_movers` with top growth and top decline by `oi_base`, absolute and percent change and a
+`partial` flag). Contract only: no server logic for these yet. Timestamps are int64, Unix epoch milliseconds;
 numbers are `double`. Evolution rules: fields may only be added, numbers are not reused,
-removed fields are marked `reserved`. Checks: `cd proto && buf lint`. Rust code is generated in
+removed fields are marked `reserved`. Checks: `cd proto && buf lint`, and `buf breaking --against "../.git#ref=<base>,subdir=proto"` against the previous revision. Rust code is generated in
 `build.rs` (vendored protoc, tonic server+client); C++ for the UI uses `protoc` and `grpc_cpp_plugin` from
 conan (`ui/CMakeLists.txt`, target `vulture-proto-cpp`).
 

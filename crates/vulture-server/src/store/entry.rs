@@ -9,11 +9,13 @@ pub const TYPE_LIQUIDATION: &str = "liq";
 pub const TYPE_OI: &str = "oi";
 /// Value of field `t` for gaps.
 pub const TYPE_GAP: &str = "gap";
+/// Value of field `t` for signals (proto v0.2).
+pub const TYPE_SIGNAL: &str = "sig";
 
 /// Fields of one stream entry (without the ID, which Redis assigns).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryFields {
-    /// Field `t`: [`TYPE_LIQUIDATION`], [`TYPE_OI`] or [`TYPE_GAP`].
+    /// Field `t`: [`TYPE_LIQUIDATION`], [`TYPE_OI`], [`TYPE_GAP`] or [`TYPE_SIGNAL`].
     pub kind: &'static str,
     /// Field `x`: exchange.
     pub exchange: String,
@@ -51,6 +53,15 @@ pub enum DecodeError {
     },
 }
 
+/// Parses a Redis stream ID `<ms>-<seq>` (a bare `<ms>` means `<ms>-0`).
+pub fn parse_id(id: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = match id.split_once('-') {
+        Some((ms, seq)) => (ms, seq),
+        None => (id, "0"),
+    };
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
 impl EntryFields {
     /// Builds the entry for `event`. Returns `None` for an event without payload (nothing to store).
     pub fn from_event(event: &Event) -> Option<Self> {
@@ -58,6 +69,7 @@ impl EntryFields {
             Payload::Liquidation(l) => (TYPE_LIQUIDATION, &l.exchange, l.symbol.as_str()),
             Payload::OpenInterest(o) => (TYPE_OI, &o.exchange, o.symbol.as_str()),
             Payload::Gap(g) => (TYPE_GAP, &g.exchange, ""),
+            Payload::Signal(sig) => (TYPE_SIGNAL, &sig.exchange, sig.symbol.as_str()),
         };
         // The ID belongs to the stream, not to the stored bytes.
         let stripped = Event {
@@ -142,6 +154,35 @@ mod tests {
             ("gap", "*", "")
         );
         assert!(EntryFields::from_event(&Event::default()).is_none());
+    }
+
+    #[test]
+    fn signal_entries_carry_exchange_and_symbol() {
+        let ev = Event {
+            id: String::new(),
+            payload: Some(Payload::Signal(vulture_proto::v1::Signal {
+                exchange: "binance".into(),
+                symbol: "BTC-USDT-PERP".into(),
+                ..Default::default()
+            })),
+        };
+        let f = EntryFields::from_event(&ev).unwrap();
+        assert_eq!(
+            (f.kind, f.exchange.as_str(), f.symbol.as_str()),
+            ("sig", "binance", "BTC-USDT-PERP")
+        );
+    }
+
+    #[test]
+    fn ids_parse() {
+        assert_eq!(parse_id("12-3"), Some((12, 3)));
+        assert_eq!(parse_id("12"), Some((12, 0)));
+        assert_eq!(parse_id("0-0"), Some((0, 0)));
+        assert_eq!(parse_id(""), None);
+        assert_eq!(parse_id("a-1"), None);
+        assert_eq!(parse_id("1-b"), None);
+        assert_eq!(parse_id("1-2-3"), None);
+        assert_eq!(parse_id("-1"), None);
     }
 
     #[test]

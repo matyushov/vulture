@@ -5,14 +5,22 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-use redis::streams::StreamRangeReply;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig, MultiplexedConnection};
+use redis::streams::{StreamId, StreamRangeReply, StreamReadReply};
 
-use super::{EntryFields, RedisStore, StoreError, StoredEntry, Trim};
+use super::{EntryFields, RedisStore, StoreError, StoredEntry, StreamBounds, StreamReader, Trim};
 use crate::config::Secret;
 
 /// Deadline of one command and of one connection attempt.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline of one command on a client's dedicated reader connection. It exceeds the longest `BLOCK`, so a
+/// healthy blocked read never times out while a half-dead connection is noticed.
+const READER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// `CLIENT SETNAME` of the dedicated reader connections.
+pub const READER_CLIENT_NAME: &str = "vulture-stream-reader";
+/// Longest `XREAD BLOCK` a reader issues.
+const MAX_BLOCK: Duration = Duration::from_secs(20);
 
 /// Checks that `url` is a well-formed Redis URL (`redis://`, `redis+unix://` or `unix://`). The error never
 /// repeats the URL because it may contain a password.
@@ -24,6 +32,7 @@ pub fn validate_url(url: &str) -> Result<(), String> {
 
 /// Stream storage on a real Redis server.
 pub struct RedisClientStore {
+    client: redis::Client,
     conn: ConnectionManager,
     key: String,
     /// Substring to hide from error messages.
@@ -41,9 +50,10 @@ impl RedisClientStore {
             .set_number_of_retries(1)
             .set_connection_timeout(Some(IO_TIMEOUT))
             .set_response_timeout(Some(IO_TIMEOUT));
-        let conn = ConnectionManager::new_lazy_with_config(client, config)
+        let conn = ConnectionManager::new_lazy_with_config(client.clone(), config)
             .map_err(|e| convert(&e, &secret))?;
         Ok(Self {
+            client,
             conn,
             key: stream_key.to_string(),
             secret,
@@ -52,6 +62,59 @@ impl RedisClientStore {
 
     fn err(&self, e: &redis::RedisError) -> StoreError {
         convert(e, &self.secret)
+    }
+}
+
+fn to_entry(item: StreamId) -> StoredEntry {
+    let text = |name: &str| -> String {
+        item.get::<Vec<u8>>(name)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    StoredEntry {
+        kind: text("t"),
+        exchange: text("x"),
+        symbol: text("s"),
+        data: item.get::<Vec<u8>>("d").unwrap_or_default(),
+        id: item.id,
+    }
+}
+
+/// A connection owned by one gRPC client. Dropping it closes the socket (the connection task ends with the
+/// last handle), which also aborts a pending `XREAD BLOCK`.
+struct RedisReader {
+    conn: MultiplexedConnection,
+    key: String,
+    secret: String,
+}
+
+impl StreamReader for RedisReader {
+    fn read_after<'a>(
+        &'a mut self,
+        after: &'a str,
+        count: usize,
+        block: Option<Duration>,
+    ) -> BoxFuture<'a, Result<Vec<StoredEntry>, StoreError>> {
+        Box::pin(async move {
+            let mut cmd = redis::cmd("XREAD");
+            cmd.arg("COUNT").arg(count.max(1));
+            if let Some(d) = block {
+                // BLOCK 0 would wait forever.
+                let ms = d.min(MAX_BLOCK).as_millis().max(1) as u64;
+                cmd.arg("BLOCK").arg(ms);
+            }
+            cmd.arg("STREAMS").arg(&self.key).arg(after);
+            let reply: Option<StreamReadReply> = cmd
+                .query_async(&mut self.conn)
+                .await
+                .map_err(|e| convert(&e, &self.secret))?;
+            Ok(reply
+                .into_iter()
+                .flat_map(|r| r.keys)
+                .flat_map(|k| k.ids)
+                .map(to_entry)
+                .collect())
+        })
     }
 }
 
@@ -132,22 +195,60 @@ impl RedisStore for RedisClientStore {
             let mut conn = self.conn.clone();
             let reply: StreamRangeReply =
                 cmd.query_async(&mut conn).await.map_err(|e| self.err(&e))?;
-            let mut out = Vec::with_capacity(reply.ids.len());
-            for item in reply.ids {
-                let text = |name: &str| -> String {
-                    item.get::<Vec<u8>>(name)
-                        .map(|b| String::from_utf8_lossy(&b).into_owned())
-                        .unwrap_or_default()
-                };
-                out.push(StoredEntry {
-                    kind: text("t"),
-                    exchange: text("x"),
-                    symbol: text("s"),
-                    data: item.get::<Vec<u8>>("d").unwrap_or_default(),
-                    id: item.id,
-                });
+            Ok(reply.ids.into_iter().map(to_entry).collect())
+        })
+    }
+
+    fn bounds(&self) -> BoxFuture<'_, Result<StreamBounds, StoreError>> {
+        Box::pin(async move {
+            let mut conn = self.conn.clone();
+            let (first, last): (StreamRangeReply, StreamRangeReply) = redis::pipe()
+                .cmd("XRANGE")
+                .arg(&self.key)
+                .arg("-")
+                .arg("+")
+                .arg("COUNT")
+                .arg(1)
+                .cmd("XREVRANGE")
+                .arg(&self.key)
+                .arg("+")
+                .arg("-")
+                .arg("COUNT")
+                .arg(1)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.err(&e))?;
+            Ok(StreamBounds {
+                first: first.ids.into_iter().next().map(|i| i.id),
+                last: last.ids.into_iter().next().map(|i| i.id),
+            })
+        })
+    }
+
+    fn open_reader(&self) -> BoxFuture<'_, Result<Box<dyn StreamReader>, StoreError>> {
+        Box::pin(async move {
+            let config = redis::AsyncConnectionConfig::new()
+                .set_connection_timeout(Some(IO_TIMEOUT))
+                .set_response_timeout(Some(READER_RESPONSE_TIMEOUT));
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection_with_config(&config)
+                .await
+                .map_err(|e| self.err(&e))?;
+            // A name makes the reader connections recognizable in `CLIENT LIST`. Best effort: an ACL may forbid it.
+            let named: redis::RedisResult<()> = redis::cmd("CLIENT")
+                .arg("SETNAME")
+                .arg(READER_CLIENT_NAME)
+                .query_async(&mut conn)
+                .await;
+            if let Err(e) = named {
+                tracing::debug!(error = %convert(&e, &self.secret), "cannot name the reader connection");
             }
-            Ok(out)
+            Ok(Box::new(RedisReader {
+                conn,
+                key: self.key.clone(),
+                secret: self.secret.clone(),
+            }) as Box<dyn StreamReader>)
         })
     }
 

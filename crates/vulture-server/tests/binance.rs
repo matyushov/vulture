@@ -1578,7 +1578,7 @@ async fn binance_live() {
                 Some(Payload::OpenInterest(o)) => oi.push(o),
                 Some(Payload::Liquidation(_)) => liquidations += 1,
                 Some(Payload::Gap(_)) => gaps += 1,
-                None => {}
+                Some(Payload::Signal(_)) | None => {}
             }
         }
     }

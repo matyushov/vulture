@@ -9,7 +9,8 @@ service History {
   // Events for a period (recent from Redis, older from ClickHouse, transparently). Pagination:
   // cursor = Event.id of the last received event, passed in HistoryRequest.cursor.
   rpc Query(HistoryRequest) returns (stream Event);
-  // Aggregates by exchange, symbol or base asset with an hour/day/week/month step.
+  // Aggregates by exchange, symbol or base asset with an hour/day/week/month step. With
+  // AggregateRequest.oi_movers set it returns the open interest movers ranking instead (v0.2).
   rpc Aggregate(AggregateRequest) returns (AggregateResponse);
 }
 
@@ -71,7 +72,61 @@ message AggregateRequest {
   repeated string symbols = 6;
   repeated string base_assets = 7;
   repeated Metric metrics = 8;
+  // v0.2: when set, the call returns the OI movers ranking in AggregateResponse.oi_movers and no
+  // rows. group_by, step and metrics are ignored; from_ts is ignored; to_ts is the end of the
+  // window (0 = now); exchanges and symbols filter the candidates.
+  // (Numbers 9 to 15 stay reserved: shrinking a reserved range is a breaking change.)
+  optional OiMoversQuery oi_movers = 16;
   reserved 9 to 15;
+}
+
+enum OiMoverSort {
+  OI_MOVER_SORT_UNSPECIFIED = 0;
+  // By change in percent (default).
+  OI_MOVER_SORT_PCT = 1;
+  // By absolute change of oi_base.
+  OI_MOVER_SORT_ABS_BASE = 2;
+}
+
+// Ranking of open interest changes (oi_base, never oi_usd, so price moves do not show as spikes).
+message OiMoversQuery {
+  // Window length, seconds: oi_base at (to_ts - window) is compared with oi_base at to_ts.
+  uint32 window_secs = 1;
+  // Entries per list; 0 = the server default.
+  uint32 limit = 2;
+  OiMoverSort sort_by = 3;
+  // Ignore symbols whose current OI is below this many USD (noise filter); 0 = no filter.
+  double min_oi_usd = 4;
+  reserved 5 to 9;
+}
+
+message OiMover {
+  string exchange = 1;
+  // Normalized symbol.
+  string symbol = 2;
+  // oi_base at the start and at the end of the window.
+  double oi_base_start = 3;
+  double oi_base_end = 4;
+  // oi_base_end - oi_base_start, base units.
+  double change_abs = 5;
+  // Percent of oi_base_start.
+  double change_pct = 6;
+  // Current OI in USD, if known.
+  optional double oi_usd_end = 7;
+  // The window overlaps a Gap or has too few samples: the change is an estimate.
+  bool partial = 8;
+  reserved 9 to 15;
+}
+
+message OiMovers {
+  // Largest growth first.
+  repeated OiMover top_growth = 1;
+  // Largest decline first (most negative change first).
+  repeated OiMover top_decline = 2;
+  // Resolved window, ms.
+  int64 window_start_ts = 3;
+  int64 window_end_ts = 4;
+  reserved 5 to 9;
 }
 
 message MetricValue {
@@ -95,5 +150,7 @@ message AggregateResponse {
   repeated AggregateRow rows = 1;
   // At least one row is partial: the sums are a lower bound.
   bool partial = 2;
+  // v0.2: set instead of rows when the request asked for the OI movers ranking.
+  OiMovers oi_movers = 10;
   reserved 3 to 9;
 }

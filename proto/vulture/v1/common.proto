@@ -24,6 +24,19 @@ enum EventType {
   EVENT_TYPE_LIQUIDATION = 1;
   EVENT_TYPE_OPEN_INTEREST = 2;
   EVENT_TYPE_GAP = 3;
+  // Added in v0.2.
+  EVENT_TYPE_SIGNAL = 4;
+}
+
+// Kind of a server-side signal (see Signal).
+enum SignalType {
+  SIGNAL_TYPE_UNSPECIFIED = 0;
+  // Open interest (oi_base) rose by more than the threshold within the window.
+  SIGNAL_TYPE_OI_SPIKE_UP = 1;
+  // Open interest (oi_base) fell by more than the threshold within the window.
+  SIGNAL_TYPE_OI_SPIKE_DOWN = 2;
+  // A liquidation cascade: liquidation intensity far above the baseline.
+  SIGNAL_TYPE_LIQ_CASCADE = 3;
 }
 
 // Liquidation. The exchange is a string from the server configuration (for example "binance"), not an enum.
@@ -74,6 +87,32 @@ message Gap {
   reserved 5 to 9;
 }
 
+// A signal produced by the server (alert engine), published into the same stream as raw events.
+// Added in v0.2.
+message Signal {
+  SignalType type = 1;
+  // Exchange name; "*" when the signal spans several exchanges (for example a cascade).
+  string exchange = 2;
+  // Normalized symbol; empty when the signal is not tied to one symbol (cascades).
+  string symbol = 3;
+  // Length of the observation window, seconds.
+  uint32 window_secs = 4;
+  // Change of oi_base over the window, percent (negative for a fall). For LIQ_CASCADE: intensity
+  // relative to the baseline, percent.
+  double change_pct = 5;
+  // Change of oi_base over the window in base units (negative for a fall). For LIQ_CASCADE: the
+  // liquidated notional in USD.
+  double change_abs = 6;
+  // The threshold that was crossed, in the unit of change_pct.
+  double threshold = 7;
+  // Time the signal fired, ms.
+  int64 ts = 8;
+  // Free-form details, mainly for cascades (for example "symbols", "peak_usd_per_min", "price_low",
+  // "price_high"). Keys and values are informational and may grow; clients must ignore unknown keys.
+  map<string, string> details = 9;
+  reserved 10 to 15;
+}
+
 // Event wrapper.
 message Event {
   // Redis Stream entry identifier assigned by the server; for resume (Stream.Subscribe)
@@ -83,6 +122,8 @@ message Event {
     Liquidation liquidation = 10;
     OpenInterest open_interest = 11;
     Gap gap = 12;
+    // Added in v0.2.
+    Signal signal = 13;
   }
   reserved 2 to 9;
 }

@@ -137,6 +137,7 @@ struct Counts {
     liquidations: u64,
     open_interest: u64,
     gaps: u64,
+    signals: u64,
 }
 
 impl Counts {
@@ -145,6 +146,7 @@ impl Counts {
             Some(Payload::Liquidation(_)) => self.liquidations += 1,
             Some(Payload::OpenInterest(_)) => self.open_interest += 1,
             Some(Payload::Gap(_)) => self.gaps += 1,
+            Some(Payload::Signal(_)) => self.signals += 1,
             None => {}
         }
     }
@@ -164,6 +166,7 @@ fn event_span(event: &Event) -> (i64, i64) {
         Some(Payload::Liquidation(l)) => (l.recv_ts, l.recv_ts),
         Some(Payload::OpenInterest(o)) => (o.recv_ts, o.recv_ts),
         Some(Payload::Gap(g)) => (g.from_ts, g.to_ts),
+        Some(Payload::Signal(s)) => (s.ts, s.ts),
         None => (0, 0),
     }
 }
@@ -298,6 +301,7 @@ impl RedisWriter {
                         liquidations = window.liquidations,
                         open_interest = window.open_interest,
                         gaps = window.gaps,
+                        signals = window.signals,
                         written = s.written,
                         buffered = s.buffered,
                         dropped = s.dropped,
@@ -323,6 +327,7 @@ impl RedisWriter {
             liquidations = total.liquidations,
             open_interest = total.open_interest,
             gaps = total.gaps,
+            signals = total.signals,
             written = s.written,
             batches = s.batches,
             dropped = s.dropped,

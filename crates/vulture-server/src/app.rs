@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::TokenStore;
 use crate::config::Config;
 use crate::exchange::{EVENT_CHANNEL_CAPACITY, Exchange, build_connectors};
 use crate::normalize::{AliasError, BaseAliases};
@@ -83,6 +84,12 @@ pub enum AppError {
     /// The Redis URL could not be read or is malformed. The message never contains the URL.
     #[error("redis: {0}")]
     Redis(String),
+    /// The token file could not be created or read.
+    #[error(transparent)]
+    Token(#[from] crate::auth::TokenError),
+    /// The gRPC server could not start.
+    #[error(transparent)]
+    Grpc(#[from] crate::grpc::GrpcError),
 }
 
 /// Runs the server with the Redis store described by the configuration until `ctx.shutdown` is cancelled.
@@ -93,9 +100,36 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
         .resolve_url()
         .map_err(|e| AppError::Redis(e.to_string()))?
         .ok_or(AppError::RedisUrlMissing)?;
-    let store = RedisClientStore::new(&url, &ctx.config.redis.stream_key)
-        .map_err(|e| AppError::Redis(e.to_string()))?;
-    run_with_store(ctx, Arc::new(store)).await;
+    let store: Arc<dyn RedisStore> = Arc::new(
+        RedisClientStore::new(&url, &ctx.config.redis.stream_key)
+            .map_err(|e| AppError::Redis(e.to_string()))?,
+    );
+
+    // Token first (a broken data_dir should stop the start), then the listener (a refused bind as well).
+    let (authority, created) = crate::grpc::open_token(&ctx.config.server)?;
+    if let Some(token) = created {
+        tracing::info!(path = %TokenStore::new(&ctx.config.server.data_dir).path().display(), "access token created on first start");
+        crate::auth::print_created_banner(
+            &token,
+            TokenStore::new(&ctx.config.server.data_dir).path(),
+        );
+    }
+    if ctx.config.tls.is_some() {
+        tracing::warn!(
+            "[tls] is configured but TLS is not implemented yet (V1-8): serving plaintext"
+        );
+    }
+    let grpc = crate::grpc::start(
+        &ctx.config.server,
+        store.clone(),
+        authority,
+        ctx.shutdown.clone(),
+    )
+    .await?;
+
+    let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
+    run_with_store(ctx, store).await;
+    grpc.wait(deadline * 2).await;
     Ok(())
 }
 

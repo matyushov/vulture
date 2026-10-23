@@ -11,7 +11,7 @@
 //!
 //! | field | value |
 //! |---|---|
-//! | `t` | event type: `liq`, `oi` or `gap` |
+//! | `t` | event type: `liq`, `oi`, `gap` or `sig` (signal) |
 //! | `x` | exchange name (`binance`; `*` for gaps produced by the writer itself) |
 //! | `s` | normalized symbol (`BTC-USDT-PERP`), empty for gaps |
 //! | `d` | the protobuf-encoded `vulture.v1.Event` **without** `id` |
@@ -27,7 +27,8 @@
 //!
 //! # Components
 //!
-//! - [`RedisStore`]: the storage trait (append a batch, read a range, health, server settings), implemented
+//! - [`RedisStore`]: the storage trait (append a batch, read a range, bounds, a dedicated tail reader per client,
+//!   health, server settings), implemented
 //!   by [`RedisClientStore`] on the `redis` crate and by [`MemoryStore`] for tests.
 //! - [`RedisWriter`]: consumes the connector channel, batches, survives Redis outages with a bounded
 //!   in-memory buffer and writes a `Gap` for events it had to drop. See [`writer`].
@@ -38,11 +39,16 @@ mod redis_store;
 mod status;
 mod writer;
 
+use std::time::Duration;
+
 use futures_util::future::BoxFuture;
 
-pub use entry::{DecodeError, EntryFields, StoredEntry, TYPE_GAP, TYPE_LIQUIDATION, TYPE_OI};
+pub use entry::{
+    DecodeError, EntryFields, StoredEntry, TYPE_GAP, TYPE_LIQUIDATION, TYPE_OI, TYPE_SIGNAL,
+    parse_id,
+};
 pub use memory::MemoryStore;
-pub use redis_store::{RedisClientStore, validate_url};
+pub use redis_store::{READER_CLIENT_NAME, RedisClientStore, validate_url};
 pub use status::{StoreState, WriterSnapshot, WriterStatus};
 pub use writer::{
     GAP_EXCHANGE, GAP_STREAM, RECOMMENDED_SETTINGS, RedisWriter, SettingsReport, WriterConfig,
@@ -69,6 +75,30 @@ pub struct Trim {
     pub maxlen: u64,
 }
 
+/// First and last entry IDs currently in the stream (both `None` when it is empty).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamBounds {
+    /// ID of the oldest retained entry.
+    pub first: Option<String>,
+    /// ID of the newest entry.
+    pub last: Option<String>,
+}
+
+/// A dedicated read connection of one gRPC client (V1-6). It is never shared with the writer, so a blocking
+/// read cannot delay writes. Dropping the reader closes its connection.
+pub trait StreamReader: Send {
+    /// `XREAD`: up to `count` entries with an ID strictly greater than `after`, oldest first. With
+    /// `block = Some(d)` and nothing available it waits up to `d` for new entries and returns an empty list on
+    /// timeout (`XREAD BLOCK`); with `None` it returns at once. After an error the reader must be dropped and
+    /// a new one opened.
+    fn read_after<'a>(
+        &'a mut self,
+        after: &'a str,
+        count: usize,
+        block: Option<Duration>,
+    ) -> BoxFuture<'a, Result<Vec<StoredEntry>, StoreError>>;
+}
+
 /// The storage the writer and the future gRPC reader talk to.
 pub trait RedisStore: Send + Sync {
     /// Appends `entries` in order as one pipeline (a single `MULTI`/`EXEC`) and applies `trim`. Returns the
@@ -89,6 +119,12 @@ pub trait RedisStore: Send + Sync {
 
     /// Number of entries in the stream (`XLEN`).
     fn stream_len(&self) -> BoxFuture<'_, Result<u64, StoreError>>;
+
+    /// IDs of the oldest and the newest entry (`XRANGE`/`XREVRANGE` with `COUNT 1`).
+    fn bounds(&self) -> BoxFuture<'_, Result<StreamBounds, StoreError>>;
+
+    /// Opens a dedicated connection for tailing the stream (see [`StreamReader`]).
+    fn open_reader(&self) -> BoxFuture<'_, Result<Box<dyn StreamReader>, StoreError>>;
 
     /// Cheap liveness check (`PING`).
     fn health(&self) -> BoxFuture<'_, Result<(), StoreError>>;

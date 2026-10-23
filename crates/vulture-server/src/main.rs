@@ -29,6 +29,34 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Access token management (the token file lives in `server.data_dir`).
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Print the token to stdout (nothing else is printed there).
+    Show {
+        /// Path to the TOML configuration file (for `server.data_dir`).
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Create a new token and print it to stdout. The old one stops working; a running server notices within
+    /// `server.token_check_interval_ms` and ends the streams that used it.
+    Rotate {
+        /// Path to the TOML configuration file (for `server.data_dir`).
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Create the token if it does not exist yet (and print it once, to stderr). Does nothing if it exists.
+    Create {
+        /// Path to the TOML configuration file (for `server.data_dir`).
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -48,7 +76,35 @@ async fn main() -> anyhow::Result<()> {
         Command::Config {
             command: ConfigCommand::Check { config },
         } => check(config),
+        Command::Token { command } => token(command),
     }
+}
+
+fn token(command: TokenCommand) -> anyhow::Result<()> {
+    use vulture_server::auth::{Created, TokenStore, print_created_banner};
+    let (TokenCommand::Show { config }
+    | TokenCommand::Rotate { config }
+    | TokenCommand::Create { config }) = &command;
+    let config = Config::load(config)?;
+    let store = TokenStore::new(&config.server.data_dir);
+    match command {
+        TokenCommand::Show { .. } => {
+            // Only the token goes to stdout, so `$(vulture-server token show ...)` is safe to use.
+            println!("{}", store.read_required()?.expose());
+        }
+        TokenCommand::Rotate { .. } => {
+            println!("{}", store.rotate()?.expose());
+            eprintln!("token rotated; the previous token no longer works");
+        }
+        TokenCommand::Create { .. } => match store.create_if_missing()? {
+            Created::New(token) => print_created_banner(&token, store.path()),
+            Created::Existing(_) => eprintln!(
+                "a token already exists at {}; use `token show` to read it or `token rotate` to replace it",
+                store.path().display()
+            ),
+        },
+    }
+    Ok(())
 }
 
 fn check(path: PathBuf) -> anyhow::Result<()> {

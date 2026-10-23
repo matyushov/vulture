@@ -6,9 +6,26 @@ package vulture.v1;
 import "vulture/v1/common.proto";
 
 service Stream {
-  // Live stream of liquidations, OI and Gap. If resume_from is set, the missed events are sent first
-  // (from Redis), then live. A resume_from that is too old -> FAILED_PRECONDITION (use
-  // History). A slow client is disconnected with RESOURCE_EXHAUSTED.
+  // Live stream of liquidations, OI, Gap and Signal events. Every RPC needs the bearer token
+  // (`authorization: Bearer <token>`); a missing or wrong token gives UNAUTHENTICATED.
+  //
+  // resume_from:
+  //  - empty: live only, starting at the current tail of the stream;
+  //  - "0": replay from the start of the hot window (the oldest retained entry), then live;
+  //  - an Event.id: exclusive cursor, only entries strictly after it are delivered, with no
+  //    duplicates and no gaps, then live.
+  // A cursor older than the oldest retained entry (its successors may have been trimmed) is
+  // answered with OUT_OF_RANGE: read the missed period with History instead. A cursor equal to
+  // the oldest entry, inside the stream, or beyond the tail is accepted. A malformed cursor is
+  // INVALID_ARGUMENT.
+  //
+  // Filters: exchanges and symbols match the event's exchange and normalized symbol. Gap events
+  // carry no symbol and are never excluded by the symbols filter; a Gap whose exchange is "*"
+  // (written by the server itself) also passes the exchanges filter. The types filter is exact.
+  //
+  // A client that does not keep up (its send buffer stays full) is disconnected with
+  // RESOURCE_EXHAUSTED and can reconnect with the last Event.id. Too many clients also give
+  // RESOURCE_EXHAUSTED. A rotated token ends open streams with UNAUTHENTICATED.
   rpc Subscribe(SubscribeRequest) returns (stream Event);
 }
 
@@ -18,7 +35,7 @@ message SubscribeRequest {
   // Normalized symbols (BTC-USDT-PERP).
   repeated string symbols = 2;
   repeated EventType types = 3;
-  // Event.id of the last received event.
+  // Event.id of the last received event, or "0" for a full replay of the hot window; empty = live only.
   string resume_from = 4;
   reserved 5 to 15;
 }

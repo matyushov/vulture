@@ -105,8 +105,8 @@ fn env_unknown_key_is_rejected() {
 
 #[test]
 fn unknown_file_key_is_rejected() {
-    let err = parse("[server]\nlisten_addr = \"1.2.3.4:1\"\n", no_env()).unwrap_err();
-    assert!(err.to_string().contains("listen_addr"), "{err}");
+    let err = parse("[server]\nlisten_address = \"1.2.3.4:1\"\n", no_env()).unwrap_err();
+    assert!(err.to_string().contains("listen_address"), "{err}");
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn wrong_type_is_a_parse_error() {
 fn validation_reports_every_problem() {
     let text = r#"
 [server]
-listen = "not-an-address"
+listen_addr = "not-an-address"
 [metrics]
 listen = "also bad"
 [redis]
@@ -152,7 +152,7 @@ name = "okx"
     };
     let joined = problems.join("\n");
     for needle in [
-        "server.listen",
+        "server.listen_addr",
         "metrics.listen",
         "redis.window_secs",
         "redis.batch_size",
@@ -172,11 +172,33 @@ name = "okx"
 
 #[test]
 fn same_listen_addresses_are_rejected() {
-    let text = "[server]\nlisten = \"127.0.0.1:9000\"\n[metrics]\nlisten = \"127.0.0.1:9000\"\n";
+    let text =
+        "[server]\nlisten_addr = \"127.0.0.1:9000\"\n[metrics]\nlisten = \"127.0.0.1:9000\"\n";
     assert!(matches!(
         parse(text, no_env()).unwrap_err(),
         ConfigError::Invalid(_)
     ));
+}
+
+#[test]
+fn grpc_defaults_are_safe() {
+    let cfg = parse("", no_env()).unwrap();
+    assert_eq!(cfg.server.listen_addr, "127.0.0.1:50051");
+    assert!(!cfg.server.allow_plaintext);
+    assert_eq!(cfg.server.max_clients, 16);
+}
+
+#[test]
+fn non_loopback_listen_needs_the_plaintext_flag() {
+    let public = "[server]\nlisten_addr = \"0.0.0.0:50051\"\n";
+    let err = parse(public, no_env()).unwrap_err();
+    assert!(err.to_string().contains("allow_plaintext"), "{err}");
+    let allowed = format!("{public}allow_plaintext = true\n");
+    assert!(parse(&allowed, no_env()).is_ok());
+    for ok in ["127.0.0.1:1", "[::1]:1"] {
+        let text = format!("[server]\nlisten_addr = \"{ok}\"\n");
+        assert!(parse(&text, no_env()).is_ok(), "{ok}");
+    }
 }
 
 #[test]

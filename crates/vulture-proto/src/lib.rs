@@ -52,6 +52,20 @@ mod tests {
         }
     }
 
+    fn signal() -> Signal {
+        Signal {
+            r#type: SignalType::OiSpikeUp as i32,
+            exchange: "binance".into(),
+            symbol: "BTC-USDT-PERP".into(),
+            window_secs: 300,
+            change_pct: 12.5,
+            change_abs: 1_500.0,
+            threshold: 10.0,
+            ts: 1_700_000_010_000,
+            details: [("k".to_string(), "v".to_string())].into_iter().collect(),
+        }
+    }
+
     fn event(payload: Payload) -> Event {
         Event {
             id: "1700000000123-0".into(),
@@ -67,6 +81,8 @@ mod tests {
         round_trip(&event(Payload::Liquidation(liquidation())));
         round_trip(&event(Payload::OpenInterest(open_interest())));
         round_trip(&event(Payload::Gap(gap())));
+        round_trip(&signal());
+        round_trip(&event(Payload::Signal(signal())));
         round_trip(&SubscribeRequest {
             exchanges: vec!["binance".into()],
             symbols: vec!["BTC-USDT-PERP".into()],
@@ -91,6 +107,7 @@ mod tests {
             symbols: vec![],
             base_assets: vec!["BTC".into()],
             metrics: vec![Metric::LiqSumUsd as i32, Metric::OiTotalUsd as i32],
+            oi_movers: None,
         });
         round_trip(&AggregateResponse {
             rows: vec![AggregateRow {
@@ -109,6 +126,49 @@ mod tests {
                 partial: true,
             }],
             partial: true,
+            oi_movers: None,
+        });
+        round_trip(&SetSymbolPolicyRequest {
+            policy: Some(SymbolPolicy {
+                exchange: "binance".into(),
+                mode: SymbolMode::Blacklist as i32,
+                symbols: vec!["DOGE-USDT-PERP".into()],
+                oi_intervals: vec![SymbolOiInterval {
+                    symbol: "BTC-USDT-PERP".into(),
+                    interval_seconds: 10,
+                }],
+            }),
+        });
+        round_trip(&ListSymbolPoliciesRequest {
+            exchanges: vec!["okx".into()],
+        });
+        round_trip(&AggregateRequest {
+            oi_movers: Some(OiMoversQuery {
+                window_secs: 900,
+                limit: 20,
+                sort_by: OiMoverSort::Pct as i32,
+                min_oi_usd: 1e6,
+            }),
+            to_ts: 5,
+            ..AggregateRequest::default()
+        });
+        round_trip(&AggregateResponse {
+            oi_movers: Some(OiMovers {
+                top_growth: vec![OiMover {
+                    exchange: "binance".into(),
+                    symbol: "SOL-USDT-PERP".into(),
+                    oi_base_start: 100.0,
+                    oi_base_end: 125.0,
+                    change_abs: 25.0,
+                    change_pct: 25.0,
+                    oi_usd_end: Some(2_500.0),
+                    partial: true,
+                }],
+                top_decline: vec![],
+                window_start_ts: 1,
+                window_end_ts: 2,
+            }),
+            ..AggregateResponse::default()
         });
         round_trip(&ListSubscriptionsResponse {
             subscriptions: vec![Subscription {
@@ -178,6 +238,8 @@ mod tests {
     const GOLDEN_OI: &str = "0a0f313730303030303030303132332d305a480a0562796269741207455448555344541a0d4554482d555344542d5045525020e8d795ffbc3128f2d795ffbc31310000000000408f40390000000080843e41410000000000409f40";
     const GOLDEN_GAP: &str = "0a0f313730303030303030303132332d3062210a036f6b78120c6c69717569646174696f6e7318d0df95ffbc312088f795ffbc31";
 
+    const GOLDEN_SIGNAL: &str = "0a0f313730303030303030303132332d306a470801120762696e616e63651a0d4254432d555344542d5045525020ac0229000000000000294031000000000070974039000000000000244040909e96ffbc314a060a016b120176";
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -210,5 +272,21 @@ mod tests {
     #[test]
     fn event_golden_gap() {
         check_golden(event(Payload::Gap(gap())), GOLDEN_GAP);
+    }
+
+    #[test]
+    fn event_golden_signal() {
+        // Event.signal is field 13 (tag 0x6a); the bytes were derived by hand from the field numbers.
+        check_golden(event(Payload::Signal(signal())), GOLDEN_SIGNAL);
+    }
+
+    #[test]
+    fn v01_events_still_decode_unchanged() {
+        // Bytes written before v0.2 (see the other golden constants) keep their meaning: the new
+        // payload variant uses an unused field number.
+        let ev = Event::decode(unhex(GOLDEN_GAP).as_slice()).unwrap();
+        assert!(matches!(ev.payload, Some(Payload::Gap(_))));
+        assert_eq!(EventType::Signal as i32, 4);
+        assert_eq!(EventType::Gap as i32, 3);
     }
 }

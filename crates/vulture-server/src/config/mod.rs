@@ -58,7 +58,7 @@ pub enum ConfigError {
 pub struct Config {
     /// gRPC listener and state directory.
     pub server: ServerConfig,
-    /// TLS material; mandatory once the gRPC server exists (V1-8), optional until then.
+    /// TLS material. Not applied yet (V1-8): the gRPC server serves plaintext and logs a warning if this is set.
     pub tls: Option<TlsConfig>,
     /// Redis Streams (hot window).
     pub redis: RedisConfig,
@@ -76,20 +76,44 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
-    /// gRPC listen address.
-    pub listen: String,
-    /// Directory for the token hash and service state.
+    /// gRPC listen address. Loopback by default; anything else needs `allow_plaintext` until TLS exists (V1-8).
+    pub listen_addr: String,
+    /// Allows a non-loopback `listen_addr` while the connection is not encrypted (the bearer token would travel
+    /// in clear text). A warning is logged at start. Off by default.
+    pub allow_plaintext: bool,
+    /// Directory for the token (`<data_dir>/token`, mode 0600) and service state. Created with mode 0700.
     pub data_dir: PathBuf,
     /// Upper bound for graceful shutdown, seconds.
     pub shutdown_timeout_secs: u64,
+    /// Simultaneous `Stream.Subscribe` clients; the next one gets `RESOURCE_EXHAUSTED`.
+    pub max_clients: usize,
+    /// Events queued for one client. When the queue stays full for `slow_client_timeout_ms`, the client is
+    /// disconnected with `RESOURCE_EXHAUSTED`.
+    pub client_buffer: usize,
+    /// How long a full client queue is tolerated, milliseconds.
+    pub slow_client_timeout_ms: u64,
+    /// HTTP/2 keepalive ping interval, seconds.
+    pub keepalive_interval_secs: u64,
+    /// HTTP/2 keepalive ping timeout, seconds: a client that does not answer is dropped.
+    pub keepalive_timeout_secs: u64,
+    /// How often the server re-reads the token file, milliseconds, to pick up `token rotate` run by another
+    /// process.
+    pub token_check_interval_ms: u64,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: "127.0.0.1:8443".into(),
+            listen_addr: "127.0.0.1:50051".into(),
+            allow_plaintext: false,
             data_dir: PathBuf::from("/var/lib/vulture"),
             shutdown_timeout_secs: 4,
+            max_clients: 16,
+            client_buffer: 1024,
+            slow_client_timeout_ms: 10_000,
+            keepalive_interval_secs: 30,
+            keepalive_timeout_secs: 10,
+            token_check_interval_ms: 1000,
         }
     }
 }
@@ -276,11 +300,40 @@ impl Config {
     /// Semantic checks. Collects every problem instead of stopping at the first.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut problems = Vec::new();
-        if self.server.listen.parse::<SocketAddr>().is_err() {
-            problems.push(format!(
-                "server.listen: {:?} is not a socket address (host:port)",
-                self.server.listen
-            ));
+        match self.server.listen_addr.parse::<SocketAddr>() {
+            Err(_) => problems.push(format!(
+                "server.listen_addr: {:?} is not a socket address (host:port)",
+                self.server.listen_addr
+            )),
+            Ok(addr) => {
+                if let Err(e) = crate::grpc::check_bind_policy(addr, self.server.allow_plaintext) {
+                    problems.push(format!("server.listen_addr: {e}"));
+                }
+            }
+        }
+        for (name, ok) in [
+            ("server.max_clients", self.server.max_clients > 0),
+            ("server.client_buffer", self.server.client_buffer > 0),
+            (
+                "server.slow_client_timeout_ms",
+                self.server.slow_client_timeout_ms > 0,
+            ),
+            (
+                "server.keepalive_interval_secs",
+                self.server.keepalive_interval_secs > 0,
+            ),
+            (
+                "server.keepalive_timeout_secs",
+                self.server.keepalive_timeout_secs > 0,
+            ),
+            (
+                "server.token_check_interval_ms",
+                self.server.token_check_interval_ms > 0,
+            ),
+        ] {
+            if !ok {
+                problems.push(format!("{name} must be greater than 0"));
+            }
         }
         if self.metrics.listen.parse::<SocketAddr>().is_err() {
             problems.push(format!(
@@ -288,8 +341,8 @@ impl Config {
                 self.metrics.listen
             ));
         }
-        if self.server.listen == self.metrics.listen {
-            problems.push("metrics.listen must differ from server.listen".into());
+        if self.server.listen_addr == self.metrics.listen {
+            problems.push("metrics.listen must differ from server.listen_addr".into());
         }
         if self.server.shutdown_timeout_secs == 0 {
             problems.push("server.shutdown_timeout_secs must be greater than 0".into());

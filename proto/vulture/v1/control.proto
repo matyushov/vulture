@@ -6,8 +6,16 @@ package vulture.v1;
 
 service Control {
   // Subscriptions: exchanges and symbols.
+  // Decision (v0.2): kept for compatibility but superseded by ListSymbolPolicies/SetSymbolPolicy,
+  // which cover the same need (which symbols an exchange tracks) with explicit modes. New clients
+  // should use the policy RPCs; a server may answer these two with UNIMPLEMENTED. They are not
+  // removed so that no field or method number changes.
   rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
   rpc SetSubscription(SetSubscriptionRequest) returns (SetSubscriptionResponse);
+  // Tracked symbols per exchange (v0.2). Changes apply on the fly, without restart.
+  rpc ListSymbolPolicies(ListSymbolPoliciesRequest) returns (ListSymbolPoliciesResponse);
+  // Replaces the policy of one exchange. Idempotent: the same request gives the same state.
+  rpc SetSymbolPolicy(SetSymbolPolicyRequest) returns (SetSymbolPolicyResponse);
   // Connector status.
   rpc GetConnectorStatus(GetConnectorStatusRequest) returns (GetConnectorStatusResponse);
   // OI polling interval.
@@ -47,6 +55,54 @@ message SetSubscriptionRequest {
 }
 
 message SetSubscriptionResponse {}
+
+// --- Symbol policies (v0.2) ---
+
+// Which symbols of an exchange are tracked.
+enum SymbolMode {
+  SYMBOL_MODE_UNSPECIFIED = 0;
+  // Every eligible perpetual the exchange offers; symbols is ignored.
+  SYMBOL_MODE_ALL = 1;
+  // Only the listed symbols.
+  SYMBOL_MODE_WHITELIST = 2;
+  // Everything except the listed symbols.
+  SYMBOL_MODE_BLACKLIST = 3;
+}
+
+// Override of the open interest poll interval for one symbol.
+message SymbolOiInterval {
+  // Normalized symbol (BTC-USDT-PERP).
+  string symbol = 1;
+  uint32 interval_seconds = 2;
+}
+
+message SymbolPolicy {
+  string exchange = 1;
+  SymbolMode mode = 2;
+  // Normalized symbols for WHITELIST and BLACKLIST.
+  repeated string symbols = 3;
+  // Optional per-symbol OI poll interval overrides; other symbols use the exchange interval.
+  repeated SymbolOiInterval oi_intervals = 4;
+  reserved 5 to 9;
+}
+
+message ListSymbolPoliciesRequest {
+  // An empty list = all configured exchanges.
+  repeated string exchanges = 1;
+}
+
+message ListSymbolPoliciesResponse {
+  repeated SymbolPolicy policies = 1;
+}
+
+message SetSymbolPolicyRequest {
+  SymbolPolicy policy = 1;
+}
+
+message SetSymbolPolicyResponse {
+  // The policy as stored after validation and normalization.
+  SymbolPolicy policy = 1;
+}
 
 // --- Connectors ---
 
