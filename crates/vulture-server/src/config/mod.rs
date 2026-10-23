@@ -154,6 +154,12 @@ pub struct ExchangeConfig {
     /// Open interest polling or slicing interval, seconds.
     #[serde(default = "default_oi_interval")]
     pub oi_poll_interval_secs: u64,
+    /// WebSocket endpoint override (`ws://` or `wss://`); the connector has a public default. Mainly for tests.
+    #[serde(default)]
+    pub ws_url: Option<String>,
+    /// REST endpoint override (`http://` or `https://`, no trailing path); the connector has a public default.
+    #[serde(default)]
+    pub rest_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -308,6 +314,20 @@ impl Config {
             if ex.oi_poll_interval_secs == 0 {
                 problems.push(format!(
                     "exchanges[{i}].oi_poll_interval_secs must be greater than 0"
+                ));
+            }
+            if let Some(url) = &ex.ws_url
+                && !(url.starts_with("ws://") || url.starts_with("wss://"))
+            {
+                problems.push(format!(
+                    "exchanges[{i}].ws_url: {url:?} must start with ws:// or wss://"
+                ));
+            }
+            if let Some(url) = &ex.rest_url
+                && !(url.starts_with("http://") || url.starts_with("https://"))
+            {
+                problems.push(format!(
+                    "exchanges[{i}].rest_url: {url:?} must start with http:// or https://"
                 ));
             }
             for symbol in &ex.symbols {

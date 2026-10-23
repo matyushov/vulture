@@ -4,6 +4,8 @@
 //! sessions through [`crate::ws`]) and pushes normalized [`Event`]s into a bounded channel until the
 //! shutdown token of the [`AppContext`] is cancelled. Event types come straight from `vulture-proto`.
 
+pub mod binance;
+
 use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
 use vulture_proto::v1::Event;
@@ -58,13 +60,28 @@ pub trait Exchange: Send + Sync {
 
 /// Builds the connectors for the enabled exchanges of the configuration.
 ///
-/// No exchange modules exist yet (Binance arrives in V1-4); configured names without an implementation are
-/// reported and skipped so the server still starts.
+/// Only Binance exists so far (V1-4); other configured names are reported and skipped so the server still
+/// starts.
 pub fn build_connectors(ctx: &AppContext) -> Vec<Box<dyn Exchange>> {
+    let mut connectors: Vec<Box<dyn Exchange>> = Vec::new();
     for ex in ctx.config.enabled_exchanges() {
-        tracing::warn!(exchange = %ex.name, "no connector implementation for this exchange yet; skipped");
+        match ex.name.as_str() {
+            binance::NAME => {
+                match binance::BinanceConnector::new(binance::BinanceConfig::from_exchange_config(
+                    ex,
+                )) {
+                    Ok(c) => connectors.push(Box::new(c)),
+                    Err(e) => {
+                        tracing::error!(exchange = %ex.name, error = %e, "cannot create the connector; skipped");
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(exchange = %ex.name, "no connector implementation for this exchange yet; skipped");
+            }
+        }
     }
-    Vec::new()
+    connectors
 }
 
 #[cfg(test)]
@@ -119,15 +136,33 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
-    #[test]
-    fn unknown_exchanges_are_skipped() {
-        let mut cfg = Config::default();
-        cfg.exchanges.push(crate::config::ExchangeConfig {
-            name: "binance".into(),
-            enabled: true,
+    fn entry(name: &str, enabled: bool) -> crate::config::ExchangeConfig {
+        crate::config::ExchangeConfig {
+            name: name.into(),
+            enabled,
             symbols: vec![],
             oi_poll_interval_secs: 30,
-        });
+            ws_url: None,
+            rest_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_enabled_known_exchanges_are_built() {
+        let mut cfg = Config::default();
+        cfg.exchanges.push(entry("binance", true));
+        cfg.exchanges.push(entry("okx", true));
+        cfg.exchanges.push(entry("bybit", false));
+        let ctx = AppContext::new(cfg, CancellationToken::new());
+        let connectors = build_connectors(&ctx);
+        assert_eq!(connectors.len(), 1);
+        assert_eq!(connectors[0].name(), "binance");
+    }
+
+    #[test]
+    fn disabled_binance_is_not_built() {
+        let mut cfg = Config::default();
+        cfg.exchanges.push(entry("binance", false));
         let ctx = AppContext::new(cfg, CancellationToken::new());
         assert!(build_connectors(&ctx).is_empty());
     }

@@ -40,6 +40,7 @@ fn exchange_defaults() {
     assert!(ex.enabled);
     assert!(ex.symbols.is_empty());
     assert_eq!(ex.oi_poll_interval_secs, 30);
+    assert!(ex.ws_url.is_none() && ex.rest_url.is_none());
 }
 
 #[test]
@@ -131,6 +132,8 @@ level = "info,foo=bar=baz"
 name = "Binance"
 oi_poll_interval_secs = 0
 symbols = ["BTCUSDT"]
+ws_url = "http://wrong"
+rest_url = "wss://wrong"
 [[exchanges]]
 name = "okx"
 [[exchanges]]
@@ -149,6 +152,8 @@ name = "okx"
         "exchanges[0].name",
         "exchanges[0].oi_poll_interval_secs",
         "exchanges[0].symbols",
+        "exchanges[0].ws_url",
+        "exchanges[0].rest_url",
         "duplicate",
     ] {
         assert!(joined.contains(needle), "missing {needle:?} in:\n{joined}");

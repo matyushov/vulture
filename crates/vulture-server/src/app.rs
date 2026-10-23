@@ -72,6 +72,29 @@ pub fn cancel_on_signals(token: CancellationToken) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Interval of the placeholder consumer's summary line.
+const COUNT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Event counters by type for the placeholder consumer.
+#[derive(Debug, Default, Clone, Copy)]
+struct EventCounts {
+    liquidations: u64,
+    open_interest: u64,
+    gaps: u64,
+}
+
+impl EventCounts {
+    fn add(&mut self, event: &vulture_proto::v1::Event) {
+        use vulture_proto::v1::event::Payload;
+        match &event.payload {
+            Some(Payload::Liquidation(_)) => self.liquidations += 1,
+            Some(Payload::OpenInterest(_)) => self.open_interest += 1,
+            Some(Payload::Gap(_)) => self.gaps += 1,
+            None => {}
+        }
+    }
+}
+
 /// Runs the server until `ctx.shutdown` is cancelled, then stops the connectors within
 /// `server.shutdown_timeout_secs`.
 pub async fn run(ctx: AppContext) {
@@ -79,14 +102,40 @@ pub async fn run(ctx: AppContext) {
         build_connectors(&ctx).into_iter().map(Arc::from).collect();
     let (sink, mut events) = mpsc::channel::<vulture_proto::v1::Event>(EVENT_CHANNEL_CAPACITY);
 
-    // Placeholder consumer; the Redis writer (V1-5) replaces it. Ends when every sender is dropped.
+    // Placeholder consumer; the Redis writer (V1-5) replaces it. Logs event counts by type once a minute.
+    // Ends when every sender is dropped.
     let consumer = tokio::spawn(async move {
-        let mut count: u64 = 0;
-        while let Some(event) = events.recv().await {
-            count += 1;
-            tracing::trace!(id = %event.id, "event");
+        let mut total = EventCounts::default();
+        let mut window = EventCounts::default();
+        let mut tick = tokio::time::interval(COUNT_LOG_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => {
+                        total.add(&event);
+                        window.add(&event);
+                    }
+                    None => break,
+                },
+                _ = tick.tick() => {
+                    tracing::info!(
+                        liquidations = window.liquidations,
+                        open_interest = window.open_interest,
+                        gaps = window.gaps,
+                        "events in the last minute"
+                    );
+                    window = EventCounts::default();
+                }
+            }
         }
-        tracing::debug!(count, "event consumer finished");
+        tracing::info!(
+            liquidations = total.liquidations,
+            open_interest = total.open_interest,
+            gaps = total.gaps,
+            "event consumer finished (totals)"
+        );
     });
 
     let mut tasks = Vec::new();

@@ -27,7 +27,9 @@ window_hours = 24
 name = "binance"
 enabled = true
 symbols = []
-oi_poll_interval_secs = 30
+oi_poll_interval_secs = 30     # open interest snapshot per symbol; stretched automatically when too many symbols
+# ws_url = "wss://fstream.binance.com/market/ws"   # defaults; override only for tests
+# rest_url = "https://fapi.binance.com"
 
 [[exchanges]]
 name = "bybit"

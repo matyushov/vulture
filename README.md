@@ -4,7 +4,8 @@ Open source service that collects **liquidations** and **open interest** from cr
 gRPC API, Redis Streams hot storage and ClickHouse history, plus a Qt6 client.
 
 Status: scaffold, proto v0 contract, CI, and the server foundation (configuration, exchange trait, symbol and
-open interest normalization, reconnecting WebSocket manager). No exchange connectors yet.
+open interest normalization, reconnecting WebSocket manager) and the Binance USDT-M connector. Storage, gRPC
+and the other exchanges are not implemented yet; the server currently logs per-type event counts once a minute.
 
 ## Components
 
@@ -52,6 +53,31 @@ added to the repository.
   `Gap` events after a loss, make-before-break planned reconnect with deduplication, observable state
   (`Connecting`, `Healthy`, `Degraded`, `Stopped`). Timers run on the monotonic clock and tests drive them with
   `tokio::time::pause`. Defaults are documented in `research/ws-reconnect.md`.
+
+### Binance connector (`exchange::binance`)
+
+Public data only, no keys. Settings in `[[exchanges]] name = "binance"`: `enabled`, `symbols` (optional whitelist of
+normalized names such as `BTC-USDT-PERP`; empty means all), `oi_poll_interval_secs` (default 30), and the optional
+test overrides `ws_url` / `rest_url`.
+- **Symbols:** REST `/fapi/v1/exchangeInfo` at start and every hour; perpetual, trading, USDT/USDC only
+  (`TRADIFI_PERPETUAL` is excluded). Listings and removals are logged and applied to polling. Non-ASCII symbols
+  are percent-encoded in URLs. If two symbols normalize to the same name (`PEPEUSDT` and `1000PEPEUSDT`), the
+  aliased one is kept under its exchange-side name (`1000PEPE-USDT-PERP`) instead of being merged.
+- **Liquidations:** one WebSocket to `wss://fstream.binance.com/market/ws` (the legacy `/ws` route accepts the
+  subscription but stays silent) with `!forceOrder@arr` and `!markPrice@arr@1s`; the mark price stream doubles as
+  the liveness signal. Server ping, planned make-before-break reconnect every 23 h 30 min +/- 10 min,
+  deduplication by `(symbol, T, side, z, ap)` during the switch, `Gap` events after a loss. An order side of
+  `SELL` is a liquidated long. Price and quantity are per real coin (for `1000PEPE` price/1000, quantity x1000;
+  unchanged for ordinary symbols).
+- **Mark price:** kept in memory only (never published) and used for `oi_usd`; a price older than 30 s is ignored.
+- **Open interest:** REST `/fapi/v1/openInterest`, one snapshot per symbol per interval
+  `max(oi_poll_interval_secs, N / 1440 * 60)` seconds, spread evenly (about `interval / N` apart), at most 12
+  requests in flight, token bucket at 60% of the 2400 weight/min limit, slowdown above 60% of the limit as read
+  from `X-MBX-USED-WEIGHT-1M`, pause on 429 (`Retry-After`) and on 418 (IP ban).
+- **Status:** `BinanceConnector::status()` exposes counters (frames, parse errors, duplicates, retries, ban state,
+  used weight) for the future metrics endpoint.
+- **Live check:** `cargo test -p vulture-server --test binance -- --ignored binance_live --nocapture` connects to
+  the real public endpoints for about 75 seconds (not run in CI).
 
 ## Contract (proto)
 
