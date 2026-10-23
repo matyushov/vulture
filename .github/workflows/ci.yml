@@ -50,14 +50,28 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      pull-requests: read
+    env:
+      GITLEAKS_VERSION: 8.24.3
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Прямой запуск CLI по всей истории: gitleaks-action на push считает диапазон
+      # <первый коммит>^..HEAD и падает на корневом коммите без родителя.
+      - name: Install gitleaks (checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          cd "$RUNNER_TEMP/gitleaks"
+          curl -fsSLO "${base}/${tarball}"
+          curl -fsSLO "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${tarball}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "${tarball}" gitleaks
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+      - name: gitleaks detect
+        run: gitleaks detect --source . --redact -v --exit-code 1
 
   proto:
     runs-on: ubuntu-24.04
