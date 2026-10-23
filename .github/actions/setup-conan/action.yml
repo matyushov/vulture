@@ -1,0 +1,33 @@
+name: Set up Conan
+description: Install Conan 2 and, when credentials are given, put the Nexus remote (prebuilt binaries) ahead of conan-center
+
+inputs:
+  username:
+    description: Nexus user (read access is enough for builds, upload needs write); empty means "no Nexus, build from source"
+    required: false
+    default: ''
+  password:
+    description: Nexus password
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        NEXUS_USER: ${{ inputs.username }}
+        NEXUS_PASS: ${{ inputs.password }}
+      run: |
+        python3 -m pip install "conan>=2.10,<3"
+        conan --version
+        # Create the default profile/remotes, then print what the runner really has.
+        conan profile detect --force
+        if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PASS" ]; then
+          echo "::warning::no Nexus credentials - third-party binaries (grpc & co.) will be built from source or taken from conan-center, this is slow"
+          exit 0
+        fi
+        # Index 0: Nexus is asked first, so prebuilt binaries win; conan-center
+        # stays for recipes Nexus does not have.
+        conan remote add nexus-local https://repo.blissbit.cc/repository/conan-local/ --index 0 --force
+        conan remote login nexus-local "$NEXUS_USER" -p "$NEXUS_PASS"

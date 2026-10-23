@@ -8,7 +8,20 @@ class VultureUiConan(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
     # require_qt=True: конфигурация падает, если Qt6 не найден (так собирает CI).
     options = {"require_qt": [True, False]}
-    default_options = {"require_qt": False}
+    default_options = {
+        "require_qt": False,
+        # Лишние плагины grpc не нужны (долгая сборка, больше бинарников в Nexus);
+        # остаётся cpp_plugin для генерации C++ из proto/. Паттерн действует и на
+        # tool_requires. Опции влияют на package_id: менять только на ветке vendor/*.
+        "grpc/*:shared": False,
+        "grpc/*:cpp_plugin": True,
+        "grpc/*:csharp_plugin": False,
+        "grpc/*:node_plugin": False,
+        "grpc/*:objective_c_plugin": False,
+        "grpc/*:php_plugin": False,
+        "grpc/*:python_plugin": False,
+        "grpc/*:ruby_plugin": False,
+    }
 
     # Заготовка: gRPC-клиент в UI будет на grpc++ из conan (решение 2026-10-22).
     # Версии уточняются в спайке S-2; удалённый репозиторий (Nexus) подключается

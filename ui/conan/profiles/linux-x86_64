@@ -5,4 +5,18 @@ build_type=Release
 compiler=gcc
 compiler.version=13
 compiler.libcxx=libstdc++11
-compiler.cppstd=20
+compiler.cppstd=17
+
+[conf]
+tools.build:compiler_executables={"c": "gcc-13", "cpp": "g++-13"}
+
+[options]
+# Нужны и в контексте build (tool_requires grpc): опции из conanfile.py его не касаются.
+grpc/*:shared=False
+grpc/*:cpp_plugin=True
+grpc/*:csharp_plugin=False
+grpc/*:node_plugin=False
+grpc/*:objective_c_plugin=False
+grpc/*:php_plugin=False
+grpc/*:python_plugin=False
+grpc/*:ruby_plugin=False

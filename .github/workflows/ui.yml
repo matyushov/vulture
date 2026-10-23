@@ -2,6 +2,7 @@
 name: ui
 
 on:
+  workflow_dispatch:
   push:
     branches: [develop, main]
     paths: ["ui/**", "proto/**", ".github/workflows/ui.yml"]
@@ -24,13 +25,9 @@ jobs:
   ui:
     name: ui (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # grpc из исходников долгий; с кэшем conan и Nexus укладывается заметно быстрее.
+    # Зависимости берутся готовыми из Nexus (их собирает conan-deps.yml). Без читающих
+    # секретов (форки) сборка grpc из исходников долгая, поэтому лимит большой.
     timeout-minutes: 90
-    env:
-      # Пусто для форков и пока секреты не заданы: тогда используется conan-center.
-      NEXUS_URL: ${{ secrets.NEXUS_URL }}
-      NEXUS_USER: ${{ secrets.NEXUS_USER }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
     strategy:
       fail-fast: false
       matrix:
@@ -51,7 +48,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgl1-mesa-dev libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+          sudo apt-get install -y gcc-13 g++-13 libgl1-mesa-dev libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
             libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xinerama0
 
       - uses: jurplel/install-qt-action@v4
@@ -63,27 +60,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "conan>=2,<3"
+
+      # Читающий пользователь Nexus (секреты репозитория). Пусто: форки и PR без секретов
+      # работают с conan-center.
+      - name: Set up Conan
+        uses: ./.github/actions/setup-conan
+        with:
+          username: ${{ secrets.NEXUS_RO_USERNAME }}
+          password: ${{ secrets.NEXUS_RO_PASSWORD }}
 
       - uses: actions/cache@v4
         with:
           path: ~/.conan2/p
-          key: conan-${{ matrix.profile }}-${{ hashFiles('ui/conanfile.py', 'ui/conan/profiles/*') }}
+          key: conan-${{ matrix.profile }}-${{ hashFiles('ui/conan.lock', 'ui/conanfile.py', 'ui/conan/profiles/*') }}
           restore-keys: conan-${{ matrix.profile }}-
 
-      - name: Conan remote (Nexus, if configured)
-        if: env.NEXUS_URL != ''
-        shell: bash
-        run: |
-          conan remote add nexus "$NEXUS_URL" --index 0
-          conan remote login nexus "$NEXUS_USER" -p "$NEXUS_PASSWORD"
-
+      # Профиль + conan.lock дают те же package_id, что выгрузил conan-deps.yml.
       - name: Conan install
         shell: bash
         run: >
           conan install ui
-          -pr:h ui/conan/profiles/${{ matrix.profile }}
-          -pr:b ui/conan/profiles/${{ matrix.profile }}
+          -pr:a ui/conan/profiles/${{ matrix.profile }}
+          --lockfile=ui/conan.lock
           -o '&:require_qt=True'
           --build=missing
 
@@ -91,6 +89,6 @@ jobs:
         shell: bash
         run: >
           conan build ui
-          -pr:h ui/conan/profiles/${{ matrix.profile }}
-          -pr:b ui/conan/profiles/${{ matrix.profile }}
+          -pr:a ui/conan/profiles/${{ matrix.profile }}
+          --lockfile=ui/conan.lock
           -o '&:require_qt=True'

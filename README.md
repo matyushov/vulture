@@ -58,9 +58,31 @@ GitHub Actions, запуск на `pull_request` и `push` в `develop` и `main
 | `ci.yml` / `proto` | `buf lint`, `buf breaking` против базовой ревизии |
 | `ui.yml` / `ui` | матрица ubuntu/macos/windows: Qt 6 (`jurplel/install-qt-action`, версия в `QT_VERSION`), conan 2 с профилями `ui/conan/profiles/`, кэш conan; сборка не блокирует Rust-задания |
 
-Remote Nexus для conan подключается только при заданных секретах репозитория `NEXUS_URL`,
-`NEXUS_USER`, `NEXUS_PASSWORD`; иначе используется conan-center (значения секретов в репозиторий
-не попадают).
+| `conan-deps.yml` / `deps` | матрица ubuntu/macos/windows: собирает недостающие conan-зависимости UI (grpc, protobuf, ...) и выгружает их в Nexus; запуск на ветках `vendor/**` и вручную (`rebuild_all`), окружение `nexus` |
+
+### Зависимости UI и Nexus
+
+Сторонние пакеты UI собираются один раз и лежат в Nexus (`https://repo.blissbit.cc/repository/conan-local/`,
+remote `nexus-local`); `ui.yml` только скачивает их. Одинаковые `package_id` у сборщика и
+потребителя обеспечивают закреплённые профили `ui/conan/profiles/*` и `ui/conan.lock`.
+
+Обновление зависимостей:
+
+1. `git checkout -b vendor/<что>` (например `vendor/grpc-1.85`).
+2. Изменить `ui/conanfile.py` (и при необходимости профили), пересоздать lock:
+   `conan lock create ui -pr:a ui/conan/profiles/<профиль> --lockfile-out=ui/conan.lock`
+   для каждого профиля с объединением через `conan lock merge`.
+3. `git push`: `conan-deps.yml` соберёт недостающее и выгрузит в Nexus.
+4. Открыть PR `vendor/<что>` в `develop`: `ui.yml` скачает готовые бинарники.
+
+Секреты: пишущий пользователь `NEXUS_USERNAME` / `NEXUS_PASSWORD` - секреты окружения `nexus`
+(Settings -> Environments), используются только в `conan-deps.yml`; читающий `NEXUS_RO_USERNAME` /
+`NEXUS_RO_PASSWORD` - секреты репозитория, используются в `ui.yml`. Без них (форки) remote не
+добавляется и берётся conan-center. Значения в репозиторий не попадают.
+
+Локально: `conan install ui -pr:a ui/conan/profiles/<профиль> --lockfile=ui/conan.lock --build=missing`
+(на хосте с другой версией компилятора скопируйте профиль и поправьте `compiler.version`; lock
+остаётся тем же, но пакеты придётся собирать).
 
 ## Лицензии
 

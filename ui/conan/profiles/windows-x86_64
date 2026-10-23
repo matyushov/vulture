@@ -3,6 +3,17 @@ os=Windows
 arch=x86_64
 build_type=Release
 compiler=msvc
-compiler.version=194
+compiler.version=193
 compiler.runtime=dynamic
-compiler.cppstd=20
+compiler.cppstd=17
+
+[options]
+# Нужны и в контексте build (tool_requires grpc): опции из conanfile.py его не касаются.
+grpc/*:shared=False
+grpc/*:cpp_plugin=True
+grpc/*:csharp_plugin=False
+grpc/*:node_plugin=False
+grpc/*:objective_c_plugin=False
+grpc/*:php_plugin=False
+grpc/*:python_plugin=False
+grpc/*:ruby_plugin=False
