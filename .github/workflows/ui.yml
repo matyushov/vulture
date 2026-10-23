@@ -41,6 +41,10 @@ jobs:
           - os: windows-2022
             profile: windows-x86_64
             qt_arch: win64_msvc2022_64
+            # aqtinstall 3.3.0 (latest) cannot find the Windows repository layout of Qt 6.11+
+            # ("Failed to locate XML data for Qt version '6.12.0'"), so Windows stays on the
+            # newest 6.10 until aqtinstall supports it. Remove this line then.
+            qt_version: "6.10.*"
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +57,7 @@ jobs:
 
       - uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ env.QT_VERSION }}
+          version: ${{ matrix.qt_version || env.QT_VERSION }}
           arch: ${{ matrix.qt_arch }}
           cache: true
 
