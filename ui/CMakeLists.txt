@@ -50,9 +50,9 @@ endif()
 option(VULTURE_UI_REQUIRE_QT "Fail configuration if Qt6 is not found" OFF)
 
 if(VULTURE_UI_REQUIRE_QT)
-    find_package(Qt6 REQUIRED COMPONENTS Widgets)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 else()
-    find_package(Qt6 QUIET COMPONENTS Widgets)
+    find_package(Qt6 QUIET COMPONENTS Widgets Network)
 endif()
 
 if(NOT Qt6_FOUND)
@@ -60,9 +60,64 @@ if(NOT Qt6_FOUND)
     return()
 endif()
 
-qt_add_executable(vulture-ui src/main.cpp)
-target_link_libraries(vulture-ui PRIVATE Qt6::Widgets)
+if(NOT TARGET vulture-proto-cpp)
+    message(WARNING "vulture-proto-cpp is disabled: target vulture-ui is disabled (run conan install)")
+    return()
+endif()
 
-if(TARGET vulture-proto-cpp)
-    target_link_libraries(vulture-ui PRIVATE vulture-proto-cpp)
+# --- Application core: everything except main(), so the tests can link it ---
+set(VULTURE_UI_CORE_SOURCES
+    src/util/RingBuffer.h
+    src/util/Format.h src/util/Format.cpp
+    src/util/Backoff.h src/util/Backoff.cpp
+    src/util/SemanticColors.h src/util/SemanticColors.cpp
+    src/model/FeedEvent.h
+    src/model/DisplayOptions.h
+    src/model/FeedStore.h src/model/FeedStore.cpp
+    src/model/FeedModel.h src/model/FeedModel.cpp
+    src/model/SymbolModel.h src/model/SymbolModel.cpp
+    src/model/Favorites.h src/model/Favorites.cpp
+    src/model/SessionStats.h src/model/SessionStats.cpp
+    src/model/LiveData.h src/model/LiveData.cpp
+    src/model/CsvExport.h src/model/CsvExport.cpp
+    src/net/ConnectionConfig.h src/net/ConnectionConfig.cpp
+    src/net/ConnectionStatus.h
+    src/net/ErrorText.h src/net/ErrorText.cpp
+    src/net/StreamClient.h src/net/StreamClient.cpp
+    src/app/Settings.h src/app/Settings.cpp
+    src/app/LargeLiquidationNotifier.h src/app/LargeLiquidationNotifier.cpp
+    src/ui/StatusIndicator.h src/ui/StatusIndicator.cpp
+    src/ui/ConnectionDialog.h src/ui/ConnectionDialog.cpp
+    src/ui/PreferencesDialog.h src/ui/PreferencesDialog.cpp
+    src/ui/SymbolsPanel.h src/ui/SymbolsPanel.cpp
+    src/ui/FeedPanel.h src/ui/FeedPanel.cpp
+    src/ui/SummaryPanel.h src/ui/SummaryPanel.cpp
+    src/ui/ExchangeTab.h src/ui/ExchangeTab.cpp
+    src/ui/AdminPanel.h src/ui/AdminPanel.cpp
+    src/ui/MainWindow.h src/ui/MainWindow.cpp
+)
+add_library(vulture-ui-core STATIC ${VULTURE_UI_CORE_SOURCES})
+target_include_directories(vulture-ui-core PUBLIC src)
+target_compile_definitions(vulture-ui-core PUBLIC VULTURE_UI_VERSION="${PROJECT_VERSION}")
+target_link_libraries(vulture-ui-core PUBLIC Qt6::Widgets Qt6::Network vulture-proto-cpp)
+target_compile_options(vulture-ui-core PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>)
+
+qt_add_executable(vulture-ui src/main.cpp)
+target_link_libraries(vulture-ui PRIVATE vulture-ui-core)
+target_compile_options(vulture-ui PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>)
+set_target_properties(vulture-ui PROPERTIES WIN32_EXECUTABLE ON MACOSX_BUNDLE OFF)
+
+# --- Tests (Qt Test + CTest); built only when Qt Test is available ---
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Qt6 QUIET OPTIONAL_COMPONENTS Test)
+    if(TARGET Qt6::Test)
+        add_subdirectory(tests)
+    else()
+        message(WARNING "Qt6::Test not found: tests are disabled")
+    endif()
 endif()

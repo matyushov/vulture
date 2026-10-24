@@ -38,12 +38,22 @@ cargo run -p vulture-cli -- --help
 The toolchain is pinned in `rust-toolchain.toml` (exact release, currently 1.99.1; rustup fetches it on first
 use). To bump it, change `channel` there and `ARG RUST_VERSION` in the `Dockerfile` (CI fails when the two differ).
 
-UI (requires Qt6 and CMake; gRPC/protobuf dependencies are described in `ui/conanfile.py`):
+UI (`ui/`, Qt 6 Widgets + grpc++ from conan; see [ui/README.md](ui/README.md) for usage, settings and limits). Qt 6.10 or
+newer, CMake 3.24+, conan 2 with a remote that serves the prebuilt `grpc`/`protobuf` packages:
 
 ```sh
-cmake -S ui -B ui/build   # without Qt6 the vulture-ui target is disabled with a warning
-cmake --build ui/build
+# dependencies (prebuilt binaries only; the profile selects the packages CI built)
+conan install ui -pr:a ui/conan/profiles/macos-armv8 --lockfile=ui/conan.lock --build=never -o '&:require_qt=True' -of ui/build
+# configure, build, test, run
+source ui/build/build/Release/generators/conanbuild.sh
+cmake -S ui -B ui/build/b -DCMAKE_TOOLCHAIN_FILE=$PWD/ui/build/build/Release/generators/conan_toolchain.cmake \
+      -DCMAKE_PREFIX_PATH=$HOME/Qt/6.12.0/macos -DCMAKE_BUILD_TYPE=Release -DVULTURE_UI_REQUIRE_QT=ON
+cmake --build ui/build/b -j
+QT_QPA_PLATFORM=offscreen ctest --test-dir ui/build/b --output-on-failure -E tst_Perf
+ui/build/b/vulture-ui
 ```
+
+Without conan or Qt the UI targets are disabled with a warning.
 
 Example configuration: [config.example.toml](config.example.toml). Secrets are not
 added to the repository.

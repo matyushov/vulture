@@ -96,3 +96,14 @@ jobs:
           -pr:a ui/conan/profiles/${{ matrix.profile }}
           --lockfile=ui/conan.lock
           -o '&:require_qt=True'
+
+      # Qt Test suite against the in-process fake gRPC server, without a display. Windows only builds the
+      # tests (loopback gRPC timing is not reliable enough there to gate on).
+      - name: Test
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          dir=$(dirname "$(find ui/build -maxdepth 3 -name CTestTestfile.cmake | head -1)")
+          ctest --test-dir "$dir" --output-on-failure -E tst_Perf
