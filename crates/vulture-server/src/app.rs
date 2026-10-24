@@ -9,6 +9,9 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::TokenStore;
 use crate::config::Config;
 use crate::exchange::{EVENT_CHANNEL_CAPACITY, Exchange, ExchangeMetrics, build_connectors};
+use crate::history::{
+    ClickHouseMonitor, FlusherMetrics, FlusherStatus, HistorySetup, Watermark, build_client,
+};
 use crate::metrics::{
     AuthMetrics, GrpcMetrics, MetricsHub, Readiness, RedisSampler, WriterMetrics,
 };
@@ -104,6 +107,9 @@ pub enum AppError {
     /// The state file of the symbol policies is unusable; the server refuses to start rather than guess.
     #[error(transparent)]
     State(#[from] crate::symbols::StateError),
+    /// The ClickHouse client could not be built from `[clickhouse]`.
+    #[error("clickhouse: {0}")]
+    ClickHouse(String),
     /// Signal handlers could not be installed.
     #[error("cannot install signal handlers: {0}")]
     Signals(std::io::Error),
@@ -209,7 +215,32 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
     ));
 
     let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
-    run_with_hub(ctx, store, connectors, Some(hub)).await;
+    let history = match ctx.config.clickhouse_enabled() {
+        Some(ch) => {
+            let client =
+                Arc::new(build_client(ch).map_err(|e| AppError::ClickHouse(e.to_string()))?);
+            let watermark = Arc::new(Watermark::new());
+            let status = Arc::new(FlusherStatus::new(
+                watermark.clone(),
+                ctx.config.redis.maxlen_safeguard,
+                crate::metrics::unix_now_ms(),
+            ));
+            Some(HistorySetup {
+                sink: client.clone(),
+                flusher: crate::history::FlusherConfig::from_config(ch, deadline),
+                watermark,
+                status,
+                monitor: Some((client, Duration::from_secs(ch.monitor_interval_secs))),
+            })
+        }
+        None => {
+            tracing::info!(
+                "[clickhouse] is not configured: no history is kept, the stream is trimmed by time only"
+            );
+            None
+        }
+    };
+    run_with_history(ctx.clone(), store, connectors, Some(hub), history).await;
     grpc.wait(deadline * 2).await;
     let _ = metrics_task.await;
     Ok(())
@@ -238,20 +269,54 @@ pub async fn run_with_hub(
     connectors: Vec<Box<dyn Exchange>>,
     hub: Option<Arc<MetricsHub>>,
 ) {
+    run_with_history(ctx, store, connectors, hub, None).await;
+}
+
+/// Like [`run_with_hub`] with the ClickHouse flusher: it shares its watermark with the writer (so nothing
+/// unflushed is trimmed by time) and gets a final flush after the writer has written its last events.
+pub async fn run_with_history(
+    ctx: AppContext,
+    store: Arc<dyn RedisStore>,
+    connectors: Vec<Box<dyn Exchange>>,
+    hub: Option<Arc<MetricsHub>>,
+    history: Option<HistorySetup>,
+) {
     let connectors: Vec<Arc<dyn Exchange>> = connectors.into_iter().map(Arc::from).collect();
     let (sink, events) = mpsc::channel::<vulture_proto::v1::Event>(EVENT_CHANNEL_CAPACITY);
 
     let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
-    let writer = RedisWriter::new(
-        store,
-        WriterConfig::from_redis(&ctx.config.redis, deadline),
-        Arc::new(SystemClock),
-    );
+    let mut writer_cfg = WriterConfig::from_redis(&ctx.config.redis, deadline);
+    writer_cfg.watermark = history.as_ref().map(|h| h.watermark.clone());
+    let writer = RedisWriter::new(store.clone(), writer_cfg, Arc::new(SystemClock));
     if let Some(hub) = &hub {
         hub.register(Arc::new(WriterMetrics(writer.status())));
         for connector in &connectors {
             hub.register(Arc::new(ExchangeMetrics(connector.clone())));
         }
+    }
+    // The flusher outlives the writer: it is stopped only after the writer wrote its last events.
+    let flusher_stop = CancellationToken::new();
+    let mut flusher_task = None;
+    if let Some(h) = history {
+        if let Some(hub) = &hub {
+            hub.register(Arc::new(FlusherMetrics(h.status.clone())));
+        }
+        if let Some((client, interval)) = h.monitor {
+            let monitor = ClickHouseMonitor::new();
+            if let Some(hub) = &hub {
+                hub.register(monitor.clone());
+            }
+            tokio::spawn(monitor.run(client, interval, ctx.shutdown.clone()));
+        }
+        let flusher = crate::history::Flusher::new(
+            store.clone(),
+            h.sink,
+            h.flusher,
+            h.watermark,
+            h.status,
+            Arc::new(SystemClock),
+        );
+        flusher_task = Some(tokio::spawn(flusher.run(flusher_stop.clone())));
     }
     // Ends when every sender is dropped (connectors stopped) and the buffer is flushed, or at the deadline.
     let writer_task = tokio::spawn(writer.run(events, ctx.shutdown.clone()));
@@ -281,6 +346,15 @@ pub async fn run_with_hub(
     };
     if tokio::time::timeout(deadline * 2, stop).await.is_err() {
         tracing::warn!(?deadline, "graceful shutdown timed out; exiting anyway");
+    }
+    if let Some(task) = flusher_task {
+        // The writer is done: let the flusher move the last events to ClickHouse (it bounds itself by `deadline`).
+        flusher_stop.cancel();
+        if tokio::time::timeout(deadline * 2, task).await.is_err() {
+            tracing::warn!(
+                "the final ClickHouse flush did not finish in time; Redis keeps the rest"
+            );
+        }
     }
     tracing::info!("vulture-server stopped");
 }

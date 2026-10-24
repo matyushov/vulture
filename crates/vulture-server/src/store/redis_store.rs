@@ -274,6 +274,38 @@ impl RedisStore for RedisClientStore {
         })
     }
 
+    fn state_get<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<String>, StoreError>> {
+        Box::pin(async move {
+            let mut conn = self.conn.clone();
+            redis::cmd("GET")
+                .arg(format!("{}:{name}", self.key))
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.err(&e))
+        })
+    }
+
+    fn state_apply<'a>(
+        &'a self,
+        ops: &'a [(&'a str, Option<&'a str>)],
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for (name, value) in ops {
+                let key = format!("{}:{name}", self.key);
+                match value {
+                    Some(v) => pipe.cmd("SET").arg(key).arg(*v).ignore(),
+                    None => pipe.cmd("DEL").arg(key).ignore(),
+                };
+            }
+            let mut conn = self.conn.clone();
+            pipe.query_async::<()>(&mut conn)
+                .await
+                .map_err(|e| self.err(&e))
+        })
+    }
+
     fn settings<'a>(
         &'a self,
         names: &'a [&'a str],

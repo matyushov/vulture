@@ -7,7 +7,8 @@ git ignores (`*.example` templates are committed).
 | Path | What |
 |---|---|
 | `../Dockerfile` | multi-stage image of `vulture-server` (distroless, non-root) |
-| `docker-compose.yml`, `.env.example`, `config.docker.toml` | vulture + Redis (+ optional ClickHouse placeholder) |
+| `docker-compose.yml`, `.env.example`, `config.docker.toml` | vulture + Redis (+ optional ClickHouse, profile `clickhouse`) |
+| `clickhouse/` | ClickHouse server config, backup and restore scripts, `BACKUP.md` |
 | `docker-compose.tls.yml`, `config.docker.tls.toml` | override that turns TLS on (certificate mount, published gRPC port) |
 | `certbot/` | DNS-01 certificate with certbot and a deploy hook that reloads the server |
 | `systemd/vulture.service` | example unit for running the binary without Docker |
@@ -129,6 +130,35 @@ The compose file starts Redis with `appendonly yes`, `appendfsync everysec`, `ma
 rate, so 3 GB is generous; a full Redis refuses writes and the server buffers events in memory (and records a `Gap`
 if even that overflows) instead of losing history silently.
 
-## ClickHouse (placeholder)
+## ClickHouse history (optional)
 
-`docker compose --profile clickhouse up -d` starts an empty ClickHouse. Nothing uses it yet (history is task V3a).
+Without it nothing changes: no flusher runs and Redis keeps 24 hours, trimmed by time. To keep the history forever:
+
+1. In `.env` set `CLICKHOUSE_PASSWORD` (letters and digits; quote it if it could read as a number) and
+   ```
+   COMPOSE_PROFILES=clickhouse
+   VULTURE_CLICKHOUSE_ENABLED=true
+   ```
+2. `docker compose up -d`. The `clickhouse` service (image tag pinned to `25.8`, upgrade it deliberately) has a named
+   volume for data, a separate volume for backups, a health check, no published port (vulture reaches it at
+   `http://clickhouse:8123` over the compose network) and a minimal server configuration
+   (`clickhouse/config.d/vulture.xml`: unused ports closed, system logs bounded, memory capped at 40% of RAM). For a
+   look inside: `docker compose exec clickhouse clickhouse-client --user vulture --password "$CLICKHOUSE_PASSWORD"`.
+   If you must publish a port, bind it to loopback (`127.0.0.1:8123:8123`).
+3. The server applies the schema at start (`vulture-server migrate --config /etc/vulture/config.toml` does it by hand,
+   idempotently and without ever dropping anything) and the flusher moves the Redis stream to ClickHouse every 10 minutes.
+
+Enabling it later is safe: the first flush starts from the oldest entry in Redis. Turning it off again leaves the data
+in place; Redis goes back to time trimming (the watermark is no longer consulted).
+
+**Disk.** Plan for about 16 GiB a year at 560 symbols and 30 s snapshots (measurements in the main README). Merges
+temporarily need extra room, up to the size of the partitions being merged, so alert on free space early: the alert rules
+`VultureClickHouseDiskLow` (under 25% or 20 GiB free) and `VultureClickHouseDiskCritical` use the gauges that vulture
+samples from `system.disks` every minute. Local backups live on the same machine and count against the same disk.
+
+**Backups are mandatory**: see [clickhouse/BACKUP.md](clickhouse/BACKUP.md) (`backup.sh`, the restore verification
+script, the S3 variant, retention, and what else to save: `state.json`, `audit.log`, the token file and the `.env`).
+
+**If ClickHouse is down for long.** The watermark stays, Redis is not trimmed by time past it, and the flusher catches
+up after the recovery. The one limit is `redis.maxlen_safeguard` (5 million entries, about 66 hours at the expected 21 events/s; watch
+`vulture_flusher_backlog_maxlen_ratio`): beyond it Redis drops the oldest unflushed entries to protect its memory. The alerts `VultureClickHouseDown` (5 minutes) and `VultureFlusherBacklogNearLoss` (70%) fire first.

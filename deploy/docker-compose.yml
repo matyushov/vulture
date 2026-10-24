@@ -1,4 +1,4 @@
-# vulture: server + Redis (+ an optional ClickHouse placeholder).
+# vulture: server + Redis (+ the optional ClickHouse history store).
 #
 #   cd deploy
 #   cp .env.example .env            # set REDIS_PASSWORD
@@ -6,7 +6,13 @@
 #   docker compose up -d
 #   docker compose exec vulture vulture-server token show --config /etc/vulture/config.toml   # no shell needed
 #
-# Ports are published to 127.0.0.1 of the host unless you change VULTURE_*_BIND in .env. Redis is never published.
+# Ports are published to 127.0.0.1 of the host unless you change VULTURE_*_BIND in .env. Redis and ClickHouse are
+# never published (the server reaches them over the compose network).
+#
+# History in ClickHouse is optional. To turn it on, set in .env
+#   COMPOSE_PROFILES=clickhouse
+#   VULTURE_CLICKHOUSE_ENABLED=true
+# and run `docker compose up -d`. Without it nothing changes: no flusher, the Redis stream is trimmed by time only.
 name: vulture
 
 services:
@@ -22,6 +28,13 @@ services:
     environment:
       # The password is part of the URL; the URL never reaches the logs. Letters and digits only in the password.
       VULTURE__REDIS__URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      # The flusher runs only when VULTURE_CLICKHOUSE_ENABLED=true (and the clickhouse profile is up). The password
+      # is read from the environment, never from the config file.
+      VULTURE__CLICKHOUSE__ENABLED: ${VULTURE_CLICKHOUSE_ENABLED:-false}
+      VULTURE__CLICKHOUSE__URL: http://clickhouse:8123
+      VULTURE__CLICKHOUSE__DATABASE: vulture
+      VULTURE__CLICKHOUSE__USER: vulture
+      VULTURE__CLICKHOUSE__PASSWORD: ${CLICKHOUSE_PASSWORD:-}
     volumes:
       - vulture-data:/var/lib/vulture
       - ./config.docker.toml:/etc/vulture/config.toml:ro
@@ -65,7 +78,8 @@ services:
       retries: 10
     # No "ports": only the vulture container reaches Redis, over the compose network.
 
-  # Placeholder for the history store (task V3a). Off by default: `docker compose --profile clickhouse up -d`.
+  # The history store (task V3a). Off by default: `COMPOSE_PROFILES=clickhouse` in .env (or
+  # `docker compose --profile clickhouse up -d`). The tag is pinned: upgrade it deliberately.
   clickhouse:
     profiles: ["clickhouse"]
     image: clickhouse/clickhouse-server:25.8
@@ -74,11 +88,43 @@ services:
       CLICKHOUSE_DB: vulture
       CLICKHOUSE_USER: vulture
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      # Do not hand out SQL-driven access management to the application user.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 0
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-    # Not published; nothing in vulture uses it yet.
+      # A separate volume for BACKUP ... TO Disk('backups', ...) (see clickhouse/BACKUP.md). Copy it off the machine.
+      - clickhouse-backups:/backups
+      - ./clickhouse/config.d/vulture.xml:/etc/clickhouse-server/config.d/vulture.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    cap_drop:
+      - ALL
+    cap_add:
+      # The image entrypoint starts as root, fixes ownership of the volumes, runs a temporary server to create the
+      # database and the user (hence KILL) and drops to the clickhouse user.
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 60s
+    # No "ports": only the vulture container reaches it, over the compose network. For a look inside use
+    #   docker compose exec clickhouse clickhouse-client --user vulture --password "$CLICKHOUSE_PASSWORD"
+    # If you must publish a port, bind it to loopback only: ["127.0.0.1:8123:8123"].
 
 volumes:
   vulture-data:
   redis-data:
   clickhouse-data:
+  clickhouse-backups:

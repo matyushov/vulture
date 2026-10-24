@@ -35,6 +35,21 @@ flush_interval_ms = 50         # longest wait before a partial batch is written
 buffer_limit = 100000          # events kept in memory while Redis is down; above it the oldest are dropped
                                # and one Gap event (exchange "*", stream "redis-writer") is written afterwards
 
+# History in ClickHouse (optional). Without this section nothing is kept beyond the Redis window: the stream is
+# trimmed by time only. With it, the flusher moves the stream to ClickHouse every flush_interval_secs and the
+# Redis time trim never passes what has been flushed (the MAXLEN safeguard above still caps Redis memory).
+# Apply the schema by hand with `vulture-server migrate --config <file>` (`run` does it at start as well).
+# [clickhouse]
+# enabled = true                   # false keeps the section but switches the flusher off
+# url = "http://127.0.0.1:8123"    # HTTP(S) endpoint
+# database = "vulture"             # created by the migrations if missing
+# user = "default"
+# password_file = "/run/secrets/clickhouse_password"   # or VULTURE__CLICKHOUSE__PASSWORD; never write it here
+# flush_interval_secs = 600        # pause between flush cycles
+# batch_max_rows = 100000          # stream entries per page and insert
+# insert_timeout_secs = 60         # deadline of one insert or migration statement
+# monitor_interval_secs = 60       # disk and table statistics sampling
+
 # The set of exchanges and symbols is data, not code. Symbols are normalized (BASE-QUOTE-PERP);
 # an empty list means every linear USDT/USDC perpetual the exchange offers. `symbols` is the DEFAULT policy
 # (empty = ALL, otherwise a whitelist): what the owner sets at runtime through Control.SetSymbolPolicy is kept in

@@ -8,9 +8,10 @@ open interest normalization, reconnecting WebSocket manager), the Binance USDT-M
 writer (24-hour hot window), the gRPC `Stream.Subscribe` with resume and the owner token, TLS with certificate hot
 reload, Prometheus metrics, tracked symbols managed at runtime (`Control.ListSymbolPolicies` /
 `SetSymbolPolicy`), and a Dockerfile with compose, certbot, systemd and Prometheus templates in `deploy/`.
-`History` and the rest of `Control` are in the contract but answer `UNIMPLEMENTED`; ClickHouse history and the other
-exchanges are not implemented yet. The server needs a Redis instance (`redis.url`); deployment is described in
-[deploy/README.md](deploy/README.md).
+ClickHouse history (schema, migrations, the Redis-to-ClickHouse flusher, disk monitoring, backups) is implemented;
+`History.Query`/`Aggregate` and the rest of `Control` are in the contract but answer `UNIMPLEMENTED`, and the other
+exchanges are not implemented yet. The server needs a Redis instance (`redis.url`); ClickHouse is optional
+(`[clickhouse]`). Deployment is described in [deploy/README.md](deploy/README.md).
 
 ## Components
 
@@ -186,6 +187,139 @@ docker stop vulture-test-redis
 `--nocapture` shows the stored size per entry. The tests kill all other client connections of the server
 (`CLIENT KILL`) to check reconnection, so never point them at a shared Redis. CI runs them against a Redis service.
 
+## ClickHouse history (V3a)
+
+Redis keeps 24 hours; ClickHouse keeps everything, without a TTL. It is optional: without a `[clickhouse]` section
+(or with `enabled = false`) no flusher runs and the Redis stream is trimmed by time only, exactly as before.
+
+### Schema and migrations
+
+Four `MergeTree` tables, created by numbered SQL files embedded in the binary
+(`crates/vulture-server/migrations/`): `liquidations`, `open_interest`, `gaps`, `signals`. All of them have
+`PARTITION BY toYYYYMM(<time>)` (about twelve partitions a year; `gaps` use `from_ts`, `signals` use `ts`), no TTL,
+`ORDER BY (exchange, symbol, <time>)` (`gaps`: `(exchange, stream, from_ts)`), and these properties:
+
+- Columns follow `common.proto`: both timestamps as `DateTime64(3, 'UTC')` with `DoubleDelta` + `ZSTD`, `exchange`,
+  `symbol`, `symbol_raw` as `LowCardinality(String)`, numbers as `Float64` with `Gorilla` + `ZSTD`, `oi_usd` and
+  `mark_price` as `Nullable(Float64)`, `side` and the signal `type` as `Enum8`, `Signal.details` as `Map(String,
+  String)`, and `event_id String` holding the Redis entry ID (`<ms>-<seq>`) for tracing.
+- The sorting key puts the exchange and symbol first because every query names a symbol (or scans all of them for a
+  period) and within a symbol the timestamps are close together, which is what `DoubleDelta` and `Gorilla` like.
+  On the synthetic week below a time-first key `(exchange_ts, symbol)` took 380 MiB instead of 288 MiB (+32%, 35.3 vs
+  26.7 bytes/row) and would also scan every symbol for a one-symbol query.
+- `non_replicated_deduplication_window = 10000` makes `insert_deduplication_token` work on these non-replicated
+  tables (verified against a real server by `tests/clickhouse_history.rs`).
+- `schema_migrations(version, name, checksum, applied_at)` records what ran. Applying is idempotent and additive
+  (a unit test rejects `DROP`, `TRUNCATE`, `DELETE`, `RENAME`, `MODIFY`, TTL); a migration edited after it ran is refused
+  with an explanatory error. `vulture-server migrate --config <file>` applies them by hand; `run` applies them at
+  start (and creates the database if it does not exist).
+
+### The flusher
+
+A task inside `vulture-server run`, enabled by `[clickhouse]`. Every `flush_interval_secs` (default 600) it reads the
+stream after a **watermark** (the last flushed entry ID, kept in Redis under `<stream_key>:flusher:watermark`) in
+pages of `batch_max_rows`, maps entries to rows (`d` decoded, `event_id` set), inserts per table with
+`RowBinary` over HTTP and, only when every table of the page is acknowledged, advances the watermark with an atomic
+`MULTI`/`EXEC`.
+
+- **No loss, no duplicates.** Each insert carries `insert_deduplication_token = vulture-v1:<table>:<first>:<last>`
+  (the entry ID range of the page). Before inserting, the exact range is recorded in Redis (`...:flusher:inflight`),
+  because after a crash a plain retry would read a *longer* page with a different token. After a restart the recorded
+  range is re-read and re-inserted with the same tokens, and ClickHouse drops the blocks it already stored.
+  `tests/clickhouse_history.rs` kills the "process" between the insert and the watermark update and checks that
+  every entry exists exactly once.
+- **Safe trimming.** With the flusher on, the writer's `XTRIM MINID` cutoff is `min(now - window, watermark)`: nothing
+  unflushed is ever trimmed by time (the watermark starts at `0-0`, so nothing is trimmed by time until the first
+  flush). The `MAXLEN` safeguard (`redis.maxlen_safeguard`) still caps Redis memory and is the **one place where data can
+  be lost**: if ClickHouse is down so long that the backlog outgrows it, the oldest unflushed entries disappear.
+  `vulture_flusher_backlog_maxlen_ratio` and an alert fire well before (at 70%), and
+  `vulture_flusher_possible_loss_total` counts the cases where the flusher finds that it happened.
+- **Outages.** Any failure aborts the cycle, keeps the watermark and retries after an exponential backoff with jitter
+  (1 s to 60 s). Connectors and the gRPC stream do not depend on the flusher. After recovery the backlog is flushed
+  page by page with a 50 ms pause between pages.
+- **Poison entries.** An entry that cannot be decoded is skipped, logged and counted
+  (`vulture_flusher_skipped_entries_total`); it never stops the flusher. Timestamps are clamped into the
+  `DateTime64` range.
+- **Shutdown.** After the writer has written its last events the flusher runs one more cycle within
+  `server.shutdown_timeout_secs` (best effort; what is left stays in Redis and is flushed after the next start).
+- **One flusher per stream.** Two server processes against one Redis would race for the watermark.
+
+### Configuration
+
+`[clickhouse]` (see `config.example.toml`): `enabled`, `url`, `database`, `user`, `password` (a `Secret`, also
+`password_file` or `VULTURE__CLICKHOUSE__PASSWORD`), `flush_interval_secs` (600), `batch_max_rows` (100000),
+`insert_timeout_secs` (60), `monitor_interval_secs` (60). The password travels in a request header, never in the URL,
+and never appears in logs or errors.
+
+### Metrics and alerts
+
+| Series | Meaning |
+|---|---|
+| `vulture_flusher_rows_inserted_total{table}`, `..._batches_total{table}` | rows and inserts per table |
+| `vulture_flusher_failures_total{stage}` | failed attempts (`insert`, `redis`, `migrate`) |
+| `vulture_flusher_last_success_age_seconds` | seconds since the last page was flushed |
+| `vulture_flusher_watermark_lag_seconds` | how long ago the flusher last confirmed that nothing unflushed is left (a sawtooth up to one interval; grows during an outage) |
+| `vulture_flusher_backlog_entries`, `..._backlog_maxlen_ratio` | estimated unflushed entries and their share of `maxlen_safeguard` |
+| `vulture_flusher_watermark_timestamp_seconds` | time part of the watermark |
+| `vulture_flusher_clickhouse_up`, `..._clickhouse_state{state}` | ClickHouse reachability (pinged every 15 s) |
+| `vulture_flusher_possible_loss_total`, `..._skipped_entries_total{reason}` | loss suspected, entries without rows |
+| `vulture_clickhouse_disk_free_bytes{disk}`, `..._disk_total_bytes{disk}` | from `system.disks`, sampled every `monitor_interval_secs` |
+| `vulture_clickhouse_table_{parts,max_parts_per_partition,bytes,rows}{table}` | from `system.parts` and `system.tables` |
+| `vulture_clickhouse_sample_age_seconds`, `..._sample_errors_total` | freshness of the sample |
+
+`deploy/prometheus/alerts.yml` has the rules: flusher lagging more than 30 minutes, ClickHouse down, flusher failing,
+backlog near `maxlen_safeguard`, watermark within 10 minutes of the oldest entry in Redis, possible loss, skipped
+entries, disk under 25% (or 20 GiB) free, disk critical, too many parts, stale statistics. Merges temporarily need
+extra room (a merge writes the new part before the old ones go), so keep the disk well below full.
+
+### Tests
+
+Unit tests cover the entry-to-row mapping of every type (including `NULL` cases, gaps, signals), the token, the
+migration list, the watermark and the trim cutoff, and the flusher on in-memory fakes (pages, crash/restart, outage
+with backoff, final flush, loss detection). `crates/vulture-server/tests/clickhouse_history.rs` runs against real
+servers: migrations twice, token deduplication, every row type with its values, Redis-to-ClickHouse end to end, the
+crash between insert and watermark, an outage with catch-up, a backlog of several pages, the watermark across a
+restart, trimming and metrics, the disk monitor, and the whole pipeline with a shutdown flush. It needs
+`VULTURE_TEST_CLICKHOUSE_URL` (and `VULTURE_TEST_CLICKHOUSE_USER` / `VULTURE_TEST_CLICKHOUSE_PASSWORD`) and
+`VULTURE_TEST_REDIS_URL`, and skips without them:
+
+```sh
+docker run -d --rm --name vulture-test-ch -p 127.0.0.1:8123:8123 -e CLICKHOUSE_PASSWORD=test clickhouse/clickhouse-server:25.8
+docker run -d --rm --name vulture-test-redis -p 127.0.0.1:6379:6379 redis:7
+VULTURE_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123 VULTURE_TEST_CLICKHOUSE_PASSWORD=test \
+  VULTURE_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -p vulture-server --test clickhouse_history
+```
+
+CI runs them against ClickHouse and Redis service containers.
+
+### Measurements on synthetic history (2026-10-24)
+
+`cargo run --release -p vulture-server --example synth_history` fills a scratch ClickHouse with 7 days of open
+interest for 560 symbols at 30 s (11.29 million rows) and 827 thousand liquidations (about 118 thousand a day, with
+three five-minute cascades a day at 40 times the rate), pushed through the flusher's code path (entry, row mapping,
+`RowBinary`, insert with token). ClickHouse 25.8 in a Docker container on a laptop; the data is a model (random walks
+with realistic quantization), so compression of real values will differ.
+
+| | rows | compressed | bytes/row | ratio |
+|---|---|---|---|---|
+| `open_interest` (after `OPTIMIZE FINAL`) | 11 289 600 | 287.7 MiB | 26.7 | 2.6x |
+| `liquidations` | 826 752 | 28.5 MiB | 36.2 | 1.8x |
+
+Per column of `open_interest` (bytes/row): `event_id` 7.8, `oi_usd` 5.9, `mark_price` 5.0, `oi_base` 4.5, both
+timestamps 1.7 each, symbols and exchange about 0. The timestamps and symbols compress as hoped; the floats are
+random walks and compress only about 1.5x. Inserted as pages of 100 000 entries, ClickHouse took 2.3 million rows/s
+(mapping and protobuf decoding add 2.7 s, 1.15 million rows/s end to end for the whole 12 million rows). Queries
+(warm, median of five): sum of liquidations per symbol per day over the week 10 ms; OI of one symbol over a day
+(2 880 rows) 3 ms; hourly average of one symbol over the week 2 ms; first/last OI of all 560 symbols over a day 11 ms;
+top 10 symbols by liquidated USD over the week 5 ms; `avg(oi_usd)` over all 11.3 million rows 13 ms.
+
+Capacity: 560 symbols every 30 s is 588 million OI rows a year, about **15 GiB a year** at 26.7 bytes/row
+(about 1.5 GiB for liquidations at 118 thousand a day), so **roughly 16 GiB a year and 65 GiB over four years**, in line
+with the earlier 10-20 GB/year estimate although the bytes/row are higher than the 3-6 assumed (the row count is
+lower). One column, the `event_id` text, costs 29% of an OI row; storing it as two integer columns (milliseconds and
+sequence) would take about 2.9 instead of 7.8 bytes/row and save about 18% of the table (not done: the task asks for
+the string). Re-measure on the real stream: repeated OI values compress much better than random walks.
+
 ## gRPC API and token
 
 `vulture-server run` serves three services on `server.listen_addr` (default `127.0.0.1:50051`): `Stream`
@@ -296,6 +430,7 @@ atomic counters and reports them at scrape time. Labels are low-cardinality on p
 | `vulture_ws_*{exchange}` | WebSocket manager: state (`state` label, 1 for the current one), reconnects, gaps, duplicates, overflow drops, bans |
 | `vulture_redis_*` | writer: written, batches, retries, buffered, dropped, gaps written, last write age, connection state; sampled stream length and oldest/newest entry age |
 | `vulture_grpc_*`, `vulture_auth_*` | clients, subscriptions, events sent, slow-client disconnects, resumes, out-of-range, failed and rate-limited authentications |
+| `vulture_flusher_*`, `vulture_clickhouse_*` | ClickHouse flusher and storage (see "ClickHouse history"): rows, failures, lag, backlog, reachability, disk, parts |
 | `vulture_tls_*` | enabled, seconds until expiry, reloads by `result`, last reload ok, handshake failures |
 
 The Redis stream length and entry ages are sampled every 15 s (they need round trips to Redis), the rest is read at
@@ -308,7 +443,7 @@ sets and `/readyz` against a failing store.
 
 See [deploy/README.md](deploy/README.md): `Dockerfile` (multi-stage, distroless, non-root, `HEALTHCHECK` through
 `vulture-server healthcheck`, `data_dir` as a volume, no secrets in the image), `deploy/docker-compose.yml` (vulture,
-Redis with AOF and a password, an optional ClickHouse placeholder profile; ports published to `127.0.0.1`),
+Redis with AOF and a password, an optional ClickHouse service with a pinned tag; ports published to `127.0.0.1`),
 `deploy/certbot/` (DNS-01 and a deploy hook that copies the certificate and sends `SIGHUP`), `deploy/systemd/`, and
 `deploy/prometheus/`. Everything is generic: placeholders instead of hostnames, secrets only in ignored `.env`
 files. CI builds the image (no push) and validates `docker compose config`.

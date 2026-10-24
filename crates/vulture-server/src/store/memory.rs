@@ -18,6 +18,8 @@ struct Inner {
     last_seq: u64,
     /// Sizes of the successful `append` calls, in order.
     batches: Vec<usize>,
+    /// Service state values (`state_get` / `state_apply`).
+    state: std::collections::HashMap<String, String>,
 }
 
 /// A stream kept in memory. IDs are `<ms>-<seq>` from the injected clock, strictly increasing.
@@ -29,6 +31,8 @@ struct Core {
     inner: Mutex<Inner>,
     clock: Box<dyn Clock>,
     failing: AtomicBool,
+    /// While set, `state_apply` fails (simulates a crash before the watermark update).
+    failing_state_apply: AtomicBool,
     attempts: AtomicUsize,
     settings: Mutex<Option<Vec<(String, String)>>>,
     /// Wakes blocked readers when entries are appended or connections are killed.
@@ -57,6 +61,7 @@ impl MemoryStore {
                 inner: Mutex::new(Inner::default()),
                 clock,
                 failing: AtomicBool::new(false),
+                failing_state_apply: AtomicBool::new(false),
                 attempts: AtomicUsize::new(0),
                 settings: Mutex::new(None),
                 notify: Notify::new(),
@@ -82,6 +87,18 @@ impl MemoryStore {
     pub fn set_failing(&self, failing: bool) {
         self.core.failing.store(failing, Ordering::SeqCst);
         self.core.notify.notify_waiters();
+    }
+
+    /// While `true`, `state_apply` fails with a connection error (other operations are unaffected).
+    pub fn set_failing_state_apply(&self, failing: bool) {
+        self.core
+            .failing_state_apply
+            .store(failing, Ordering::SeqCst);
+    }
+
+    /// A state value, for assertions.
+    pub fn state_value(&self, name: &str) -> Option<String> {
+        self.core.lock().state.get(name).cloned()
     }
 
     /// Number of `append` calls so far, failed ones included.
@@ -253,6 +270,33 @@ impl RedisStore for MemoryStore {
 
     fn health(&self) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move { self.core.check() })
+    }
+
+    fn state_get<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<String>, StoreError>> {
+        Box::pin(async move {
+            self.core.check()?;
+            Ok(self.core.lock().state.get(name).cloned())
+        })
+    }
+
+    fn state_apply<'a>(
+        &'a self,
+        ops: &'a [(&'a str, Option<&'a str>)],
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.core.check()?;
+            if self.core.failing_state_apply.load(Ordering::SeqCst) {
+                return Err(StoreError::Connection("injected failure".into()));
+            }
+            let mut inner = self.core.lock();
+            for (name, value) in ops {
+                match value {
+                    Some(v) => inner.state.insert((*name).to_string(), (*v).to_string()),
+                    None => inner.state.remove(*name),
+                };
+            }
+            Ok(())
+        })
     }
 
     fn settings<'a>(

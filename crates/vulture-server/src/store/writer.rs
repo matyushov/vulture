@@ -14,6 +14,8 @@
 //!   events that were kept (they are newer).
 //! - **Delivery:** at least once. A pipeline is `MULTI`/`EXEC`, so a batch is applied entirely or not at all,
 //!   but if the connection dies after `EXEC` ran and before the reply arrived, the retry duplicates that batch.
+//! - **Trimming with the flusher:** when a [`Watermark`] is configured, the time cutoff never passes it (see
+//!   [`trim_cutoff_ms`]); the `MAXLEN` safeguard still caps the stream.
 //! - **Shutdown:** when the token fires or the channel closes, the writer flushes everything without waiting for
 //!   `flush_interval`, for at most `shutdown_timeout`, and then stops.
 
@@ -29,6 +31,7 @@ use vulture_proto::v1::{Event, Gap, event::Payload};
 
 use super::{EntryFields, RedisStore, StoreError, StoreState, Trim, WriterStatus};
 use crate::config::RedisConfig;
+use crate::history::{Watermark, trim_cutoff_ms};
 use crate::ws::{Backoff, Clock};
 
 /// `Gap.exchange` of gaps produced by the writer itself: not tied to one exchange.
@@ -57,6 +60,10 @@ pub struct WriterConfig {
     pub shutdown_timeout: Duration,
     /// Period of the summary log line.
     pub log_interval: Duration,
+    /// The flusher's watermark. When set, the time cutoff of `XTRIM MINID` is `min(now - window, watermark)`, so
+    /// an entry the flusher has not delivered to ClickHouse is never trimmed by time. `MAXLEN` still applies and
+    /// is then the one place where unflushed data can be lost.
+    pub watermark: Option<Arc<Watermark>>,
 }
 
 impl WriterConfig {
@@ -72,6 +79,7 @@ impl WriterConfig {
             retry_max: Duration::from_secs(30),
             shutdown_timeout,
             log_interval: Duration::from_secs(60),
+            watermark: None,
         }
     }
 }
@@ -401,7 +409,11 @@ impl RedisWriter {
         );
 
         let trim = Trim {
-            min_id_ms: self.clock.now_ms() - self.cfg.window.as_millis() as i64,
+            min_id_ms: trim_cutoff_ms(
+                self.clock.now_ms(),
+                self.cfg.window.as_millis() as i64,
+                self.cfg.watermark.as_deref(),
+            ),
             maxlen: self.cfg.maxlen,
         };
         let result = if entries.is_empty() {
@@ -554,6 +566,81 @@ mod tests {
     fn ts_of(entry: &StoredEntry) -> i64 {
         let e = entry.clone().into_event().unwrap();
         event_span(&e).0
+    }
+
+    #[derive(Clone)]
+    struct ManualClock(Arc<std::sync::atomic::AtomicI64>);
+
+    impl Clock for ManualClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A writer and store sharing one hand-set clock, with a 1 s window.
+    fn timed(watermark: Option<Arc<Watermark>>) -> (Rig, ManualClock) {
+        let clock = ManualClock(Arc::new(std::sync::atomic::AtomicI64::new(10_000)));
+        let store = Arc::new(MemoryStore::with_clock(Box::new(clock.clone())));
+        let mut c = cfg();
+        c.window = Duration::from_secs(1);
+        c.watermark = watermark;
+        let writer = RedisWriter::new(store.clone(), c, Arc::new(clock.clone()));
+        let status = writer.status();
+        let (tx, rx) = mpsc::channel(10_000);
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(writer.run(rx, token.clone()));
+        (
+            Rig {
+                store,
+                tx,
+                token,
+                status,
+                handle,
+            },
+            clock,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_flusher_old_entries_are_trimmed_by_time() {
+        let (r, clock) = timed(None);
+        r.tx.send(liq(1)).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        clock.0.store(20_000, Ordering::SeqCst);
+        r.tx.send(liq(2)).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            r.store.entries().iter().map(ts_of).collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_trimming_never_passes_the_flusher_watermark() {
+        let wm = Arc::new(Watermark::new());
+        let (r, clock) = timed(Some(wm.clone()));
+        r.tx.send(liq(1)).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        // Far past the window, but nothing is flushed yet (watermark 0-0): everything stays.
+        clock.0.store(20_000, Ordering::SeqCst);
+        r.tx.send(liq(2)).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        clock.0.store(30_000, Ordering::SeqCst);
+        r.tx.send(liq(3)).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(r.store.entries().len(), 3);
+        // The flusher delivered the second entry: older ones may go, the rest stays.
+        let second = r.store.entries()[1].id.clone();
+        wm.set(&second);
+        clock.0.store(40_000, Ordering::SeqCst);
+        r.tx.send(liq(4)).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        let ts: Vec<i64> = r.store.entries().iter().map(ts_of).collect();
+        assert_eq!(
+            ts,
+            vec![2, 3, 4],
+            "entries before the watermark's millisecond are trimmed, none after"
+        );
     }
 
     #[tokio::test(start_paused = true)]

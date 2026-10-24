@@ -1,0 +1,58 @@
+<!-- Minimal ClickHouse server configuration for vulture. Mounted as
+     /etc/clickhouse-server/config.d/vulture.xml by deploy/docker-compose.yml. It adds to the image defaults:
+     only the HTTP and native ports are served, system logs are bounded (they are the usual disk eaters), memory is
+     capped for a machine that also runs Redis, and a local disk for BACKUP is declared. -->
+<clickhouse>
+    <!-- Features vulture does not use: closed ports, nothing to attack or keep patched. -->
+    <mysql_port remove="1"/>
+    <postgresql_port remove="1"/>
+    <interserver_http_port remove="1"/>
+    <prometheus remove="1"/>
+
+    <!-- Leave room for Redis (3 GB) and vulture on a single 8 GB machine. Raise it on a larger machine. -->
+    <max_server_memory_usage_to_ram_ratio>0.4</max_server_memory_usage_to_ram_ratio>
+
+    <logger>
+        <level>warning</level>
+        <console>1</console>
+    </logger>
+
+    <!-- System log tables grow without bound by default (query_log, trace_log, text_log, ...). Drop the ones nobody
+         reads and expire the rest. -->
+    <trace_log remove="1"/>
+    <text_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <query_log>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+    </query_log>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <part_log>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+    </part_log>
+    <metric_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </metric_log>
+    <asynchronous_metric_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </asynchronous_metric_log>
+    <error_log>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+    </error_log>
+
+    <!-- A disk that BACKUP may write to (see BACKUP.md). In compose it is a separate volume, so a backup does not
+         share the fate of the data it protects only if you also copy it off the machine. -->
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <path>/backups/</path>
+            </backups>
+        </disks>
+    </storage_configuration>
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+        <allowed_path>/backups/</allowed_path>
+    </backups>
+</clickhouse>

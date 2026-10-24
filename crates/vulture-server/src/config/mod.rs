@@ -63,6 +63,9 @@ pub struct Config {
     pub tls: Option<TlsConfig>,
     /// Redis Streams (hot window).
     pub redis: RedisConfig,
+    /// ClickHouse history and the Redis-to-ClickHouse flusher. Without this section (or with `enabled = false`)
+    /// the stream is trimmed by time only and no history is kept.
+    pub clickhouse: Option<ClickHouseConfig>,
     /// Exchanges to collect from. The list is data, not code.
     pub exchanges: Vec<ExchangeConfig>,
     /// Prometheus endpoint.
@@ -185,6 +188,60 @@ impl RedisConfig {
             (Some(url), _) => Ok(Some(url.clone())),
             (None, Some(path)) => Secret::from_file(path).map(Some),
             (None, None) => Ok(None),
+        }
+    }
+}
+
+/// `[clickhouse]` section: the cold store and the flusher that feeds it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClickHouseConfig {
+    /// The flusher runs only when this is `true` (the default when the section exists).
+    pub enabled: bool,
+    /// HTTP(S) endpoint of the server, for example `http://127.0.0.1:8123`.
+    pub url: String,
+    /// Database. Created by the migrations if it does not exist; letters, digits and underscore only.
+    pub database: String,
+    /// User name.
+    pub user: String,
+    /// Password. Prefer `VULTURE__CLICKHOUSE__PASSWORD` or `password_file`.
+    pub password: Option<Secret>,
+    /// File holding the password instead of `password`.
+    pub password_file: Option<PathBuf>,
+    /// Pause between flush cycles, seconds.
+    pub flush_interval_secs: u64,
+    /// Stream entries read and inserted per page (one insert per table and page).
+    pub batch_max_rows: usize,
+    /// Deadline of one insert or migration statement, seconds.
+    pub insert_timeout_secs: u64,
+    /// How often disk and table statistics are sampled, seconds.
+    pub monitor_interval_secs: u64,
+}
+
+impl Default for ClickHouseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: "http://127.0.0.1:8123".into(),
+            database: "vulture".into(),
+            user: "default".into(),
+            password: None,
+            password_file: None,
+            flush_interval_secs: 600,
+            batch_max_rows: 100_000,
+            insert_timeout_secs: 60,
+            monitor_interval_secs: 60,
+        }
+    }
+}
+
+impl ClickHouseConfig {
+    /// Resolves the password from `password` or `password_file`; empty when neither is set.
+    pub fn resolve_password(&self) -> Result<Secret, ConfigError> {
+        match (&self.password, &self.password_file) {
+            (Some(p), _) => Ok(p.clone()),
+            (None, Some(path)) => Secret::from_file(path),
+            (None, None) => Ok(Secret::new("")),
         }
     }
 }
@@ -391,6 +448,39 @@ impl Config {
         if self.redis.url.is_some() && self.redis.url_file.is_some() {
             problems.push("redis.url and redis.url_file are mutually exclusive".into());
         }
+        if let Some(ch) = &self.clickhouse {
+            if !(ch.url.starts_with("http://") || ch.url.starts_with("https://")) {
+                problems.push("clickhouse.url must start with http:// or https://".into());
+            }
+            if !crate::history::is_identifier(&ch.database) {
+                problems.push(
+                    "clickhouse.database must consist of ASCII letters, digits and underscore"
+                        .into(),
+                );
+            }
+            if ch.user.trim().is_empty() {
+                problems.push("clickhouse.user must not be empty".into());
+            }
+            if ch.password.is_some() && ch.password_file.is_some() {
+                problems.push(
+                    "clickhouse.password and clickhouse.password_file are mutually exclusive"
+                        .into(),
+                );
+            }
+            for (name, ok) in [
+                ("clickhouse.flush_interval_secs", ch.flush_interval_secs > 0),
+                ("clickhouse.batch_max_rows", ch.batch_max_rows > 0),
+                ("clickhouse.insert_timeout_secs", ch.insert_timeout_secs > 0),
+                (
+                    "clickhouse.monitor_interval_secs",
+                    ch.monitor_interval_secs > 0,
+                ),
+            ] {
+                if !ok {
+                    problems.push(format!("{name} must be greater than 0"));
+                }
+            }
+        }
         if let Some(tls) = &self.tls {
             if tls.cert.as_os_str().is_empty() || tls.key.as_os_str().is_empty() {
                 problems.push("tls.cert and tls.key must not be empty".into());
@@ -456,6 +546,11 @@ impl Config {
         } else {
             Err(ConfigError::Invalid(problems))
         }
+    }
+
+    /// The `[clickhouse]` section when the flusher is switched on.
+    pub fn clickhouse_enabled(&self) -> Option<&ClickHouseConfig> {
+        self.clickhouse.as_ref().filter(|c| c.enabled)
     }
 
     /// Exchanges that must be started.

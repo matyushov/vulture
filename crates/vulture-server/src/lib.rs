@@ -9,6 +9,7 @@
 //! - [`exchange`]: the [`exchange::Exchange`] trait implemented by every connector.
 //! - [`normalize`]: symbols, base asset aliases, open interest units, market filter.
 //! - [`store`]: the Redis Streams layout, the writer and its in-memory test double.
+//! - [`history`]: ClickHouse schema, migrations, the Redis-to-ClickHouse flusher and storage monitoring.
 //! - [`symbols`]: tracked symbols per exchange, changed at runtime through `Control` (policy, state file, audit).
 //! - [`ws`]: the reconnecting WebSocket session manager shared by all connectors.
 //! - [`tls`]: rustls for the gRPC listener with certificate hot reload.
@@ -20,6 +21,7 @@ pub mod auth;
 pub mod config;
 pub mod exchange;
 pub mod grpc;
+pub mod history;
 pub mod logging;
 pub mod metrics;
 pub mod normalize;

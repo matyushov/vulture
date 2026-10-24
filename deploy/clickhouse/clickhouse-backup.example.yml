@@ -1,0 +1,24 @@
+# Example configuration of the optional third-party tool clickhouse-backup (https://github.com/Altinity/clickhouse-backup),
+# an alternative to BACKUP ... TO S3. Placeholders only; keys come from the environment (S3_ACCESS_KEY, S3_SECRET_KEY)
+# or a secret file, never from this file. Not exercised by the vulture tests.
+general:
+  remote_storage: s3
+  backups_to_keep_local: 3        # local copies kept
+  backups_to_keep_remote: 30      # remote copies kept; tune with the retention policy in BACKUP.md
+clickhouse:
+  host: 127.0.0.1                 # run the tool next to ClickHouse (same container network or host)
+  port: 9000
+  username: vulture
+  password: ""                    # set CLICKHOUSE_PASSWORD in the environment instead
+  skip_tables:
+    - "system.*"
+    - "INFORMATION_SCHEMA.*"
+    - "information_schema.*"
+s3:
+  endpoint: "https://ENDPOINT"    # your S3-compatible endpoint
+  bucket: "BUCKET"
+  path: "vulture"
+  access_key: ""                  # S3_ACCESS_KEY
+  secret_key: ""                  # S3_SECRET_KEY
+  force_path_style: false
+  compression_format: none        # ClickHouse data is already compressed

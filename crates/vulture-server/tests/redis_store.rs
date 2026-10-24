@@ -124,6 +124,7 @@ fn fast_cfg(window: Duration) -> WriterConfig {
         retry_max: Duration::from_secs(1),
         shutdown_timeout: Duration::from_secs(5),
         log_interval: Duration::from_secs(3600),
+        watermark: None,
     }
 }
 

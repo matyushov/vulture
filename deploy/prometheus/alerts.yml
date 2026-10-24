@@ -90,3 +90,95 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "Many failed authentication attempts ({{ $value }} in 10 minutes)"
+
+  # History in ClickHouse (task V3a). These series exist only when [clickhouse] is configured and enabled.
+  - name: vulture-history
+    rules:
+      - alert: VultureFlusherLagging
+        # The flusher has not been able to confirm "everything is in ClickHouse" for 30 minutes (the regular cycle is
+        # 10 minutes). Redis keeps the data meanwhile, but only until the MAXLEN safeguard.
+        expr: vulture_flusher_watermark_lag_seconds > 1800
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The ClickHouse flusher is {{ $value | humanizeDuration }} behind"
+
+      - alert: VultureClickHouseDown
+        expr: vulture_flusher_clickhouse_up == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "ClickHouse is unreachable from vulture; history is piling up in Redis"
+
+      - alert: VultureFlusherFailing
+        # ClickHouse answers but inserts or migrations fail, or Redis state cannot be updated.
+        expr: increase(vulture_flusher_failures_total[15m]) > 3 and on() vulture_flusher_clickhouse_up == 1
+        labels: {severity: warning}
+        annotations:
+          summary: "The flusher keeps failing at stage {{ $labels.stage }} although ClickHouse answers"
+
+      - alert: VultureFlusherBacklogNearLoss
+        # The unflushed backlog approaches redis.maxlen_safeguard; beyond it the MAXLEN trim drops unflushed entries.
+        expr: vulture_flusher_backlog_maxlen_ratio > 0.7
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "The flusher backlog is {{ $value | humanizePercentage }} of redis.maxlen_safeguard: data loss is close"
+
+      - alert: VultureFlusherWatermarkNearOldestEntry
+        # How much already-flushed history Redis still holds before its oldest entry: the watermark time minus the
+        # time of the oldest retained entry. Near zero means the trim has eaten all the flushed data and is closing
+        # in on the unflushed part.
+        expr: >-
+          vulture_flusher_watermark_timestamp_seconds - (time() - vulture_redis_stream_oldest_age_seconds) < 600
+          and vulture_redis_stream_oldest_age_seconds > 0
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "The flush watermark is within 10 minutes of the oldest entry kept in Redis"
+
+      - alert: VultureFlusherPossibleLoss
+        expr: increase(vulture_flusher_possible_loss_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Unflushed entries were probably trimmed from Redis (MAXLEN safeguard); there is a hole in the history"
+
+      - alert: VultureFlusherSkippedEntries
+        expr: increase(vulture_flusher_skipped_entries_total[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Stream entries that could not be turned into rows were skipped (reason {{ $labels.reason }}); see the flusher log"
+
+      - alert: VultureClickHouseDiskLow
+        # Free space under 25%, or under an absolute floor (20 GiB). Merges temporarily need extra room, see deploy/README.md.
+        expr: >-
+          vulture_clickhouse_disk_free_bytes{disk="default"} / vulture_clickhouse_disk_total_bytes{disk="default"} < 0.25
+          or vulture_clickhouse_disk_free_bytes{disk="default"} < 20 * 1024 * 1024 * 1024
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "The ClickHouse disk has less than 25% (or less than 20 GiB) free"
+
+      - alert: VultureClickHouseDiskCritical
+        expr: >-
+          vulture_clickhouse_disk_free_bytes{disk="default"} / vulture_clickhouse_disk_total_bytes{disk="default"} < 0.10
+          or vulture_clickhouse_disk_free_bytes{disk="default"} < 5 * 1024 * 1024 * 1024
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "ClickHouse disk is almost full; inserts and merges will fail"
+
+      - alert: VultureClickHouseTooManyParts
+        # ClickHouse delays inserts at 1000 parts in one partition and refuses at 3000; merges normally keep this small.
+        expr: vulture_clickhouse_table_max_parts_per_partition > 300
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Table {{ $labels.table }} has {{ $value }} parts in one partition; merges are not keeping up"
+
+      - alert: VultureClickHouseSamplingFailing
+        expr: vulture_clickhouse_sample_age_seconds > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "No fresh ClickHouse disk and table statistics for {{ $value | humanizeDuration }}"

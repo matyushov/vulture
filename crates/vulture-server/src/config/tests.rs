@@ -297,3 +297,81 @@ fn missing_config_file_is_a_read_error() {
     assert!(matches!(err, ConfigError::Read { .. }));
     assert!(err.to_string().contains("/nonexistent/vulture.toml"));
 }
+
+#[test]
+fn clickhouse_section_is_optional_and_has_defaults() {
+    let cfg = parse("", no_env()).unwrap();
+    assert!(cfg.clickhouse.is_none() && cfg.clickhouse_enabled().is_none());
+    let cfg = parse("[clickhouse]\n", no_env()).unwrap();
+    let ch = cfg.clickhouse_enabled().expect("enabled by default");
+    assert_eq!(ch.url, "http://127.0.0.1:8123");
+    assert_eq!(ch.database, "vulture");
+    assert_eq!(ch.flush_interval_secs, 600);
+    assert_eq!(ch.batch_max_rows, 100_000);
+    assert_eq!(ch.insert_timeout_secs, 60);
+    assert_eq!(ch.monitor_interval_secs, 60);
+    let off = parse("[clickhouse]\nenabled = false\n", no_env()).unwrap();
+    assert!(off.clickhouse.is_some() && off.clickhouse_enabled().is_none());
+}
+
+#[test]
+fn clickhouse_env_overrides_create_and_switch_the_section() {
+    let cfg = parse(
+        "",
+        env(&[
+            ("VULTURE__CLICKHOUSE__URL", "http://clickhouse:8123"),
+            ("VULTURE__CLICKHOUSE__PASSWORD", "s3cretpw"),
+            ("VULTURE__CLICKHOUSE__ENABLED", "false"),
+        ]),
+    )
+    .unwrap();
+    let ch = cfg.clickhouse.as_ref().unwrap();
+    assert_eq!(ch.password.as_ref().unwrap().expose(), "s3cretpw");
+    assert!(cfg.clickhouse_enabled().is_none());
+    // The password never shows up in Debug output.
+    assert!(!format!("{cfg:?}").contains("s3cretpw"));
+}
+
+#[test]
+fn clickhouse_validation_lists_every_problem() {
+    let err = parse(
+        "[clickhouse]\nurl = \"tcp://x\"\ndatabase = \"a;b\"\nuser = \" \"\nflush_interval_secs = 0\nbatch_max_rows = 0\npassword = \"a\"\npassword_file = \"/x\"\n",
+        no_env(),
+    )
+    .unwrap_err()
+    .to_string();
+    for needle in [
+        "clickhouse.url",
+        "clickhouse.database",
+        "clickhouse.user",
+        "clickhouse.flush_interval_secs",
+        "clickhouse.batch_max_rows",
+        "mutually exclusive",
+    ] {
+        assert!(err.contains(needle), "{needle} missing in {err}");
+    }
+}
+
+#[test]
+fn clickhouse_password_comes_from_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("pw");
+    std::fs::write(&file, "from-file\n").unwrap();
+    let cfg = parse(
+        &format!(
+            "[clickhouse]\npassword_file = {:?}\n",
+            file.display().to_string()
+        ),
+        no_env(),
+    )
+    .unwrap();
+    let ch = cfg.clickhouse.unwrap();
+    assert_eq!(ch.resolve_password().unwrap().expose(), "from-file");
+    assert_eq!(
+        ClickHouseConfig::default()
+            .resolve_password()
+            .unwrap()
+            .expose(),
+        ""
+    );
+}

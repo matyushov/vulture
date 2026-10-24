@@ -21,7 +21,8 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # Throwaway Redis for the storage integration tests (crates/vulture-server/tests/redis_store.rs).
+    # Throwaway Redis and ClickHouse for the storage integration tests (crates/vulture-server/tests/redis_store.rs
+    # and clickhouse_history.rs). Both are skipped locally when the variables below are not set.
     services:
       redis:
         image: redis:7
@@ -32,8 +33,23 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        ports:
+          - 8123:8123
+        env:
+          CLICKHOUSE_PASSWORD: ci-throwaway
+        options: >-
+          --health-cmd "wget --quiet --tries=1 --spider http://127.0.0.1:8123/ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+          --ulimit nofile=262144:262144
     env:
       VULTURE_TEST_REDIS_URL: redis://127.0.0.1:6379
+      VULTURE_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      VULTURE_TEST_CLICKHOUSE_USER: default
+      VULTURE_TEST_CLICKHOUSE_PASSWORD: ci-throwaway
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,6 +72,9 @@ jobs:
           docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example config -q
           docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example --profile clickhouse config -q
           docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.tls.yml --env-file deploy/.env.example config -q
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.tls.yml --env-file deploy/.env.example --profile clickhouse config -q
+      - name: ClickHouse backup and restore verification (scratch containers, local disk)
+        run: deploy/clickhouse/verify-restore.sh
       - name: Toolchain pin matches the Dockerfile
         run: |
           pinned=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)

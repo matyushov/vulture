@@ -24,6 +24,13 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Apply the ClickHouse schema migrations (idempotent, additive, never destructive) and exit. The
+    /// `[clickhouse]` section is required; `run` applies the same migrations at start.
+    Migrate {
+        /// Path to the TOML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Configuration utilities.
     Config {
         #[command(subcommand)]
@@ -99,6 +106,7 @@ enum ConfigCommand {
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Run { config } => run(config).await,
+        Command::Migrate { config } => migrate(config).await,
         Command::Config {
             command: ConfigCommand::Check { config },
         } => check(config),
@@ -143,6 +151,9 @@ fn check(path: PathBuf) -> anyhow::Result<()> {
     if let Some(url) = config.redis.resolve_url()? {
         vulture_server::store::validate_url(url.expose())
             .map_err(|e| anyhow::anyhow!("redis URL: {e}"))?;
+    }
+    if let Some(ch) = &config.clickhouse {
+        ch.resolve_password()?;
     }
     if let Some(file) = &config.normalize.base_aliases_file {
         vulture_server::normalize::BaseAliases::load(file)?;
@@ -198,6 +209,26 @@ async fn healthcheck(path: PathBuf, ready: bool) -> anyhow::Result<()> {
         Ok((status, body)) => anyhow::bail!("{route} answered {status}: {}", body.trim()),
         Err(e) => anyhow::bail!("{e}"),
     }
+}
+
+async fn migrate(path: PathBuf) -> anyhow::Result<()> {
+    use vulture_server::history::{HistorySink, MIGRATIONS, build_client};
+    let config = Config::load(&path)?;
+    let ch = config
+        .clickhouse
+        .as_ref()
+        .context("no [clickhouse] section in the configuration")?;
+    let client = build_client(ch)?;
+    let applied = client.migrate().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    if applied.is_empty() {
+        println!(
+            "schema is current: {} migration(s) known, none applied now",
+            MIGRATIONS.len()
+        );
+    } else {
+        println!("applied migration(s): {applied:?}");
+    }
+    Ok(())
 }
 
 async fn run(path: PathBuf) -> anyhow::Result<()> {

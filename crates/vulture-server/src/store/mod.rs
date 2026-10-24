@@ -25,6 +25,10 @@
 //! `XTRIM ... MAXLEN ~ <safeguard>` (so that a broken time trimming can never fill Redis). Approximate
 //! trimming (`~`) removes whole internal nodes only, so a stream may hold slightly more than the window.
 //!
+//! The flusher (V3a, [`crate::history`]) moves entries to ClickHouse. When it is enabled, time trimming never
+//! passes its watermark (see [`crate::history::trim_cutoff_ms`]); `MAXLEN` still caps the stream and is the one
+//! place where unflushed data could be lost.
+//!
 //! # Components
 //!
 //! - [`RedisStore`]: the storage trait (append a batch, read a range, bounds, a dedicated tail reader per client,
@@ -128,6 +132,16 @@ pub trait RedisStore: Send + Sync {
 
     /// Cheap liveness check (`PING`).
     fn health(&self) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// Reads a small piece of service state stored next to the stream (the flusher's watermark). The Redis key
+    /// is `<stream_key>:<name>`.
+    fn state_get<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<String>, StoreError>>;
+
+    /// Sets (`Some`) or deletes (`None`) several state values in one `MULTI`/`EXEC`: all or none.
+    fn state_apply<'a>(
+        &'a self,
+        ops: &'a [(&'a str, Option<&'a str>)],
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// `CONFIG GET` of the named settings, lowercase names and values. Fails with [`StoreError::Command`]
     /// when the server does not allow `CONFIG`.
