@@ -77,6 +77,8 @@ pub struct WsProfile {
     pub degraded_after_gap: Duration,
     /// Number of keys remembered for deduplication during a switch.
     pub dedup_capacity: usize,
+    /// How long a runtime topic request may wait for its response before the session is declared broken.
+    pub subscribe_ack_timeout: Duration,
     /// Fixes the jitter sequence (tests only).
     pub jitter_seed: Option<u64>,
 }
@@ -110,6 +112,7 @@ impl WsProfile {
             degraded_after_failures: 5,
             degraded_after_gap: Duration::from_secs(120),
             dedup_capacity: 100_000,
+            subscribe_ack_timeout: Duration::from_secs(10),
             jitter_seed: None,
         }
     }
@@ -141,6 +144,7 @@ impl WsProfile {
             ("data_silence", self.data_silence),
             ("backoff_min", self.backoff_min),
             ("healthy_reset", self.healthy_reset),
+            ("subscribe_ack_timeout", self.subscribe_ack_timeout),
         ];
         for (name, d) in positive {
             if d.is_zero() {

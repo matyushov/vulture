@@ -5,6 +5,7 @@
 //! shutdown token of the [`AppContext`] is cancelled. Event types come straight from `vulture-proto`.
 
 pub mod binance;
+pub mod bybit;
 
 use std::sync::Arc;
 
@@ -85,8 +86,8 @@ impl crate::metrics::MetricSource for ExchangeMetrics {
 
 /// Builds the connectors for the enabled exchanges of the configuration.
 ///
-/// Only Binance exists so far (V1-4); other configured names are reported and skipped so the server still
-/// starts.
+/// Binance (V1-4) and Bybit (V2a) exist so far; other configured names are reported and skipped so the server
+/// still starts.
 pub fn build_connectors(ctx: &AppContext) -> Vec<Box<dyn Exchange>> {
     let mut connectors: Vec<Box<dyn Exchange>> = Vec::new();
     for ex in ctx.config.enabled_exchanges() {
@@ -95,6 +96,14 @@ pub fn build_connectors(ctx: &AppContext) -> Vec<Box<dyn Exchange>> {
                 match binance::BinanceConnector::new(binance::BinanceConfig::from_exchange_config(
                     ex,
                 )) {
+                    Ok(c) => connectors.push(Box::new(c)),
+                    Err(e) => {
+                        tracing::error!(exchange = %ex.name, error = %e, "cannot create the connector; skipped");
+                    }
+                }
+            }
+            bybit::NAME => {
+                match bybit::BybitConnector::new(bybit::BybitConfig::from_exchange_config(ex)) {
                     Ok(c) => connectors.push(Box::new(c)),
                     Err(e) => {
                         tracing::error!(exchange = %ex.name, error = %e, "cannot create the connector; skipped");
@@ -182,6 +191,17 @@ mod tests {
         let connectors = build_connectors(&ctx);
         assert_eq!(connectors.len(), 1);
         assert_eq!(connectors[0].name(), "binance");
+    }
+
+    #[tokio::test]
+    async fn enabled_bybit_is_built() {
+        let mut cfg = Config::default();
+        cfg.exchanges.push(entry("bybit", true));
+        let ctx = AppContext::new(cfg, CancellationToken::new());
+        let connectors = build_connectors(&ctx);
+        assert_eq!(connectors.len(), 1);
+        assert_eq!(connectors[0].name(), "bybit");
+        assert!(connectors[0].symbols().is_some());
     }
 
     #[test]

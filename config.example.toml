@@ -62,10 +62,17 @@ oi_poll_interval_secs = 30     # open interest snapshot per symbol; stretched au
 # ws_url = "wss://fstream.binance.com/market/ws"   # defaults; override only for tests
 # rest_url = "https://fapi.binance.com"
 
+# Bybit linear perpetuals (USDT and USDC). Public data only. `symbols` is the default tracked-symbol policy as
+# for Binance; per tracked symbol the server subscribes to allLiquidation.<symbol> and tickers.<symbol> on one
+# WebSocket (more connections only for very large sets) and follows runtime policy changes without reconnecting.
+# `oi_poll_interval_secs` is the interval of the open interest samples taken from the ticker stream.
 [[exchanges]]
 name = "bybit"
 enabled = false
+symbols = []
 oi_poll_interval_secs = 30
+# ws_url = "wss://stream.bybit.com/v5/public/linear"   # defaults; override only for tests
+# rest_url = "https://api.bybit.com"
 
 [[exchanges]]
 name = "okx"

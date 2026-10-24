@@ -8,9 +8,10 @@ open interest normalization, reconnecting WebSocket manager), the Binance USDT-M
 writer (24-hour hot window), the gRPC `Stream.Subscribe` with resume and the owner token, TLS with certificate hot
 reload, Prometheus metrics, tracked symbols managed at runtime (`Control.ListSymbolPolicies` /
 `SetSymbolPolicy`), and a Dockerfile with compose, certbot, systemd and Prometheus templates in `deploy/`.
-ClickHouse history (schema, migrations, the Redis-to-ClickHouse flusher, disk monitoring, backups) is implemented;
+The Bybit linear connector (V2a) with runtime subscriptions and a connection budget in the WebSocket manager is
+implemented. ClickHouse history (schema, migrations, the Redis-to-ClickHouse flusher, disk monitoring, backups) is implemented;
 `History.Query`/`Aggregate` and the rest of `Control` are in the contract but answer `UNIMPLEMENTED`, and the other
-exchanges are not implemented yet. The server needs a Redis instance (`redis.url`); ClickHouse is optional
+exchanges except Bybit are not implemented yet. The server needs a Redis instance (`redis.url`); ClickHouse is optional
 (`[clickhouse]`). Deployment is described in [deploy/README.md](deploy/README.md).
 
 ## Components
@@ -132,6 +133,69 @@ test overrides `ws_url` / `rest_url`.
   used weight); they are exported by the metrics endpoint (see "Metrics").
 - **Live check:** `cargo test -p vulture-server --test binance -- --ignored binance_live --nocapture` connects to
   the real public endpoints for about 75 seconds (not run in CI).
+
+### Runtime subscriptions and the connection budget (`ws`)
+
+A connection can follow a changing set of topics without reconnecting. The connector holds a
+`TopicControl` with the **desired** set; every session subscribes to the whole set right after connecting
+(so a reconnect needs no special case) and then sends `subscribe` / `unsubscribe` requests for the difference
+whenever the set changes. The handler builds the frames (`WsHandler::topic_requests`) and splits them to the
+exchange's message limit (`chunk_topics`). Requests are tracked until their response arrives
+(`subscribe_ack_timeout`, 10 s; a missing response ends the session and the usual reconnect applies). A refused
+`subscribe` is not silent: topics named in the refusal are dropped from the session, counted
+(`vulture_ws_topics_rejected_total`), logged at `warn` and listed by `TopicControl::rejected()`; the others are
+sent again; a refusal that names nothing is split in halves until the offender is isolated. A refused topic stays
+in the desired set (the owner's choice is not overridden) and is tried again on the next connection. With an
+empty set the connection stays up (ping only) and the silence watchdog is off until a topic is subscribed.
+
+`ConnectionLimiter` is a per-exchange budget (new connections per window, concurrent connections) that the
+manager consults before every connection attempt, failed attempts included. Its default is half of the
+documented limits.
+
+### Bybit connector (`exchange::bybit`)
+
+Public data only, no keys. Settings in `[[exchanges]] name = "bybit"`: `enabled`, `symbols` (default policy, as for
+Binance), `oi_poll_interval_secs` (default 30, the interval of the open interest samples), and the optional test
+overrides `ws_url` / `rest_url`. Formats and units were checked against the live exchange on 2026-10-24
+(`research/bybit-live.md`).
+- **Symbols:** REST `GET /v5/market/instruments-info?category=linear&limit=1000`, followed through
+  `nextPageCursor` (the cursor goes back exactly as sent), at start and every hour. `LinearPerpetual` in `Trading`
+  state with quote USDT or USDC. Base and quote come from `baseCoin` / `quoteCoin`; USDC perpetuals are named
+  like `1000BONKPERP` and normalize to `BONK-USDC-PERP`. `1000`-prefixed bases use the alias table (section
+  `bybit`); a prefixed name that is not in the table keeps its exchange-side name. The same collision rule as for
+  Binance applies. A 403 pauses REST for 10 minutes.
+- **WebSocket:** `wss://stream.bybit.com/v5/public/linear`. For every tracked symbol the topics
+  `allLiquidation.{symbol}` and `tickers.{symbol}` are subscribed and unsubscribed at runtime as the policy
+  changes, and re-sent in full after every reconnect. One connection normally carries everything (the `args` of a
+  request are split at 20 000 characters; Bybit documents no topic cap for linear); more connections are opened
+  only if a connection would exceed `max_topics_per_connection` (4 000 topics), within the connection budget.
+  Application ping `{"op":"ping"}` every 20 s with a 10 s pong timeout; the ticker stream is the liveness stream
+  (10 s silence). A handshake 403 waits at least 10 minutes. A subscribe request holding one invalid topic is
+  refused as a whole by Bybit; the connector handles that as described above.
+- **Liquidations:** `allLiquidation` pushes arrays of `{T, s, S, v, p}`. `S = Buy` means a **long** position was
+  liquidated (`Side::Long`), `Sell` a short. **`p` is the bankruptcy price, not the fill price**, and is published
+  as `price`; `v` is in the base coin (for `1000PEPE`-style symbols price/1000 and quantity x1000, like Binance);
+  `notional_usd = p * v`. Records repeated within the last 10 000 are dropped as duplicates (key
+  `symbol|T|S|v|p`).
+- **Tickers:** `snapshot` first, then `delta` messages that carry only changed fields. The connector keeps the
+  last `markPrice`, `openInterest` and `openInterestValue` per symbol; a missing field means unchanged and is
+  never filled with zero. A new `openInterest` without a new value drops the stale value (the sample then uses
+  size x mark). The state is dropped for the symbols of a connection that was lost, and the sampler skips
+  symbols whose connection is down.
+- **Open interest:** an interval sampler publishes one `OpenInterest` per tracked symbol every
+  `oi_poll_interval_secs`, from the ticker state, spread evenly over the interval (never one event per delta, never
+  one burst): `oi_base = openInterest` (times the alias multiplier), `oi_usd = openInterestValue`,
+  `mark_price` per real coin, `exchange_ts` = time of the last ticker message. Symbols without data are skipped.
+- **Gaps:** after a connection loss `Gap` events with the streams `liquidations` and `open_interest` (same range)
+  are published before the first event of the recovered connection. Changing the tracked set never produces a
+  `Gap`.
+- **Status and metrics:** `BybitConnector::status()`; the series of the Binance connector with `exchange="bybit"`
+  plus `vulture_ws_connections`, `vulture_ws_topics_subscribed`, `vulture_ws_topic_requests_total`,
+  `vulture_ws_topics_rejected_total`, `vulture_ws_topic_ack_timeouts_total`,
+  `vulture_ws_connection_permits_total`, `vulture_ws_connection_budget_waits_total`,
+  `vulture_ws_connections_open`, `vulture_oi_samples_skipped_total`.
+- **Live check:** `cargo test -p vulture-server --test bybit -- --ignored bybit_live --nocapture` (about 75 s,
+  not run in CI).
 
 ## Redis storage
 

@@ -18,11 +18,13 @@ use super::backoff::Backoff;
 use super::clock::Clock;
 use super::connector::WsConnector;
 use super::handler::WsHandler;
+use super::limiter::ConnectionLimiter;
 use super::profile::WsProfile;
 use super::session::{
     ConnectFailure, Outcome, Report, SessionParams, Shared, WsOutput, run_session,
 };
 use super::status::{ConnectionState, WsCounters, WsStatus};
+use super::topics::TopicControl;
 
 /// Handle to a running managed connection.
 pub struct WsHandle {
@@ -40,6 +42,16 @@ impl WsHandle {
     }
 }
 
+/// Optional extras of a managed connection.
+#[derive(Default, Clone)]
+pub struct WsOptions {
+    /// Desired topics, changed at runtime. Needs a handler that implements
+    /// [`WsHandler::topic_requests`].
+    pub topics: Option<Arc<TopicControl>>,
+    /// Connection budget shared with the other connections of the exchange.
+    pub limiter: Option<Arc<ConnectionLimiter>>,
+}
+
 /// Starts a managed connection.
 ///
 /// Returns the handle and the receiver of [`WsOutput`]. The consumer must keep reading: a full channel
@@ -51,6 +63,25 @@ pub fn spawn_ws(
     connector: Arc<dyn WsConnector>,
     clock: Arc<dyn Clock>,
     shutdown: CancellationToken,
+) -> Result<(WsHandle, mpsc::Receiver<WsOutput>), String> {
+    spawn_ws_with(
+        profile,
+        handler,
+        connector,
+        clock,
+        shutdown,
+        WsOptions::default(),
+    )
+}
+
+/// [`spawn_ws`] with runtime topics and/or a connection limiter.
+pub fn spawn_ws_with(
+    profile: WsProfile,
+    handler: Arc<dyn WsHandler>,
+    connector: Arc<dyn WsConnector>,
+    clock: Arc<dyn Clock>,
+    shutdown: CancellationToken,
+    options: WsOptions,
 ) -> Result<(WsHandle, mpsc::Receiver<WsOutput>), String> {
     profile.validate()?;
     let (out_tx, out_rx) = mpsc::channel(profile.channel_capacity);
@@ -71,6 +102,7 @@ pub fn spawn_ws(
         handler,
         connector,
         clock,
+        options,
         out: out_tx,
         shutdown,
         status: status_tx,
@@ -119,6 +151,7 @@ struct Supervisor {
     handler: Arc<dyn WsHandler>,
     connector: Arc<dyn WsConnector>,
     clock: Arc<dyn Clock>,
+    options: WsOptions,
     out: mpsc::Sender<WsOutput>,
     shared: Arc<Shared>,
     shutdown: CancellationToken,
@@ -230,6 +263,8 @@ impl Supervisor {
             shared: self.shared.clone(),
             cancel,
             report: report_tx.clone(),
+            topics: self.options.topics.clone(),
+            limiter: self.options.limiter.clone(),
         }));
         self.publish();
     }

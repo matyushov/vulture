@@ -1,5 +1,7 @@
 //! The exchange-specific part of a WebSocket session.
 
+use super::topics::{TopicOp, TopicRequest};
+
 /// A data frame received from the exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -38,6 +40,16 @@ pub enum FrameClass {
     /// Protocol message that needs an answer (Deribit `test_request`); the text is sent back, nothing is
     /// forwarded.
     Reply(String),
+    /// Response to a runtime topic request (see [`WsHandler::topic_requests`]); swallowed. A failure makes the
+    /// session reject or split the request, it does not end the session.
+    TopicResponse {
+        /// Correlation id of the request, if the exchange echoed one.
+        id: Option<String>,
+        /// Whether the exchange accepted the request.
+        ok: bool,
+        /// The exchange's message (used to find the offending topic).
+        detail: String,
+    },
     /// Not interesting (welcome banners, info notices); swallowed.
     Ignore,
 }
@@ -50,6 +62,19 @@ pub trait WsHandler: Send + Sync + 'static {
 
     /// Classifies an incoming frame.
     fn classify(&self, frame: &Frame) -> FrameClass;
+
+    /// Request frames for a runtime subscription change, split to respect the exchange's message limits. The
+    /// default builds none, which is right for connectors with a fixed subscription
+    /// ([`WsHandler::subscribe_messages`]). `next_id` is the next free correlation id; the handler advances it
+    /// by one per request.
+    fn topic_requests(
+        &self,
+        _op: TopicOp,
+        _topics: &[String],
+        _next_id: &mut u64,
+    ) -> Vec<TopicRequest> {
+        Vec::new()
+    }
 
     /// Key for deduplication during a make-before-break switch. Frames with equal keys are delivered once
     /// while two sessions overlap. `None` disables deduplication for the frame.

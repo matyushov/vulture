@@ -49,4 +49,12 @@ pub struct WsCounters {
     pub degraded_entered: AtomicU64,
     /// Handshake rejections with 403, 429 or 418.
     pub handshake_bans: AtomicU64,
+    /// Runtime topic requests sent (subscribe and unsubscribe, retries included).
+    pub topic_requests: AtomicU64,
+    /// Topics the exchange refused.
+    pub topics_rejected: AtomicU64,
+    /// Sessions ended because a topic request was not answered in time.
+    pub topic_ack_timeouts: AtomicU64,
+    /// Topics subscribed in the newest session (gauge).
+    pub topics_active: AtomicU64,
 }

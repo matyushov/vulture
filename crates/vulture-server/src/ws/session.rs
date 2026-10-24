@@ -4,6 +4,7 @@
 //! `try_send`, and a full channel drops the frame and counts it. The supervisor in [`super::manager`] decides
 //! what to do when a session ends.
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -20,8 +21,10 @@ use super::clock::Clock;
 use super::connector::{BoxedConnection, ConnectError, WsConnector};
 use super::dedup::Dedup;
 use super::handler::{Frame, FrameClass, WsHandler};
+use super::limiter::ConnectionLimiter;
 use super::profile::{PingMessage, WsProfile};
 use super::status::WsCounters;
+use super::topics::{TopicControl, TopicOp, TopicRequest};
 
 /// A frame delivered to the consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +69,8 @@ pub(crate) enum Outcome {
     Cancelled,
     Connect(ConnectFailure),
     SubscribeRejected,
+    /// A runtime topic request got no response within `subscribe_ack_timeout`.
+    SubscribeTimeout,
     /// The liveness stream was silent for `data_silence` (also the "connected but mute" case).
     Silence,
     PongTimeout,
@@ -125,10 +130,26 @@ pub(crate) struct SessionParams {
     pub shared: Arc<Shared>,
     pub cancel: CancellationToken,
     pub report: mpsc::UnboundedSender<Report>,
+    pub topics: Option<Arc<TopicControl>>,
+    pub limiter: Option<Arc<ConnectionLimiter>>,
 }
 
 /// Task body: runs the session and reports how it ended.
 pub(crate) async fn run_session(p: SessionParams) {
+    // The permit lives until the socket is closed. Failed attempts use a slot of the window as well.
+    let _permit = match &p.limiter {
+        Some(limiter) => {
+            tokio::select! {
+                biased;
+                _ = p.cancel.cancelled() => {
+                    let _ = p.report.send(Report::Ended { id: p.id, outcome: Outcome::Cancelled });
+                    return;
+                }
+                permit = limiter.acquire() => Some(permit),
+            }
+        }
+        None => None,
+    };
     let (outcome, conn) = session(&p).await;
     if outcome == Outcome::Cancelled {
         // Shutdown or a finished switch: the close handshake is part of the job.
@@ -215,12 +236,37 @@ async fn drive(p: &SessionParams, conn: &mut BoxedConnection) -> Outcome {
 
     let now = Instant::now();
     let idle = prof.idle_timeout();
-    let mut liveness_deadline = now + prof.data_silence;
+    let mut tracker = p.topics.as_ref().map(|c| Tracker::new(c.clone()));
+    let mut topics_rx = p.topics.as_ref().map(|c| c.watch());
+    // Without runtime topics the liveness stream is expected from the moment the subscription is sent. With
+    // them, the clock starts when the first topic is subscribed (an empty set has nothing to watch).
+    let mut liveness_deadline = if tracker.is_some() {
+        None
+    } else {
+        Some(now + prof.data_silence)
+    };
     let mut idle_deadline = idle.map(|d| now + d);
     let mut next_ping = prof.ping.as_ref().map(|c| now + c.interval);
     let mut pong_deadline: Option<Instant> = None;
     let mut live = false;
     let mut gap_done = false;
+
+    if let (Some(tr), Some(rx)) = (tracker.as_mut(), topics_rx.as_mut()) {
+        tr.control.clear_rejected();
+        let desired = rx.borrow_and_update().clone();
+        if let Err(o) = tr.sync(p, conn, &desired).await {
+            return o;
+        }
+        if tr.known.is_empty() {
+            // Nothing to listen to: the connection is healthy as it is, and no gap can have happened.
+            live = true;
+            let _ = p.report.send(Report::Live { id: p.id });
+            p.shared.gap_from_ms.store(0, Ordering::Release);
+            gap_done = true;
+        } else {
+            liveness_deadline = Some(Instant::now() + prof.data_silence);
+        }
+    }
 
     loop {
         tokio::select! {
@@ -252,6 +298,17 @@ async fn drive(p: &SessionParams, conn: &mut BoxedConnection) -> Outcome {
                     FrameClass::Pong => pong_deadline = None,
                     FrameClass::Ack { ok: true } | FrameClass::Ignore => {}
                     FrameClass::Ack { ok: false } => break Outcome::SubscribeRejected,
+                    FrameClass::TopicResponse { id, ok, detail } => {
+                        if let Some(tr) = tracker.as_mut() {
+                            let was_empty = tr.known.is_empty();
+                            if let Err(o) = tr.on_response(p, conn, id, ok, &detail).await {
+                                break o;
+                            }
+                            if tr.known.is_empty() && !was_empty {
+                                liveness_deadline = None;
+                            }
+                        }
+                    }
                     FrameClass::Reply(text) => {
                         if let Err(o) = send(conn, Message::text(text), prof.write_timeout).await {
                             break o;
@@ -259,7 +316,9 @@ async fn drive(p: &SessionParams, conn: &mut BoxedConnection) -> Outcome {
                     }
                     FrameClass::Data { liveness } => {
                         if liveness {
-                            liveness_deadline = now + prof.data_silence;
+                            if liveness_deadline.is_some() || tracker.is_none() {
+                                liveness_deadline = Some(now + prof.data_silence);
+                            }
                             if !live {
                                 live = true;
                                 let _ = p.report.send(Report::Live { id: p.id });
@@ -278,7 +337,41 @@ async fn drive(p: &SessionParams, conn: &mut BoxedConnection) -> Outcome {
                     }
                 }
             }
-            _ = sleep_until(liveness_deadline) => break Outcome::Silence,
+            changed = topics_changed(&mut topics_rx) => {
+                if !changed {
+                    topics_rx = None;
+                    continue;
+                }
+                let tr = tracker.as_mut().expect("topic receiver implies tracker");
+                let desired = topics_rx
+                    .as_mut()
+                    .expect("checked above")
+                    .borrow_and_update()
+                    .clone();
+                let was_empty = tr.known.is_empty();
+                if let Err(o) = tr.sync(p, conn, &desired).await {
+                    break o;
+                }
+                if tr.known.is_empty() {
+                    liveness_deadline = None;
+                } else if was_empty || liveness_deadline.is_none() {
+                    liveness_deadline = Some(Instant::now() + prof.data_silence);
+                }
+                if !live && tr.known.is_empty() {
+                    live = true;
+                    let _ = p.report.send(Report::Live { id: p.id });
+                }
+            }
+            _ = at(liveness_deadline) => break Outcome::Silence,
+            _ = at(tracker.as_ref().and_then(|t| t.ack_deadline(prof.subscribe_ack_timeout))) => {
+                p.shared.counters.topic_ack_timeouts.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    exchange = %prof.exchange,
+                    stream = %prof.stream,
+                    "topic request not answered in time; reconnecting"
+                );
+                break Outcome::SubscribeTimeout;
+            }
             _ = at(next_ping) => {
                 let cfg = prof.ping.as_ref().expect("ping timer implies ping config");
                 let msg = match &cfg.message {
@@ -358,5 +451,256 @@ fn forward(p: &SessionParams, frame: Frame, recv_ts: i64) -> Result<(), Outcome>
             Ok(())
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(Outcome::SinkClosed),
+    }
+}
+
+/// Resolves with `true` when the desired topic set changed, `false` when its control is gone; never resolves
+/// without a receiver.
+async fn topics_changed(
+    rx: &mut Option<tokio::sync::watch::Receiver<Arc<BTreeSet<String>>>>,
+) -> bool {
+    match rx {
+        Some(rx) => rx.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+struct PendingRequest {
+    op: TopicOp,
+    topics: Vec<String>,
+    sent_at: Instant,
+}
+
+/// Topic bookkeeping of one session.
+struct Tracker {
+    control: Arc<TopicControl>,
+    /// Subscribed (request sent and not refused) in this session.
+    known: BTreeSet<String>,
+    /// Refused in this session; not retried until the next one.
+    declined: BTreeSet<String>,
+    pending: HashMap<String, PendingRequest>,
+    next_id: u64,
+}
+
+impl Tracker {
+    fn new(control: Arc<TopicControl>) -> Self {
+        Self {
+            control,
+            known: BTreeSet::new(),
+            declined: BTreeSet::new(),
+            pending: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    fn ack_deadline(&self, timeout: Duration) -> Option<Instant> {
+        self.pending.values().map(|r| r.sent_at + timeout).min()
+    }
+
+    /// Brings the session in line with the desired set: unsubscribe what left, subscribe what is new.
+    async fn sync(
+        &mut self,
+        p: &SessionParams,
+        conn: &mut BoxedConnection,
+        desired: &BTreeSet<String>,
+    ) -> Result<(), Outcome> {
+        self.declined.retain(|t| desired.contains(t));
+        let remove: Vec<String> = self.known.difference(desired).cloned().collect();
+        let add: Vec<String> = desired
+            .iter()
+            .filter(|t| !self.known.contains(*t) && !self.declined.contains(*t))
+            .cloned()
+            .collect();
+        if !remove.is_empty() {
+            for t in &remove {
+                self.known.remove(t);
+            }
+            self.send(p, conn, TopicOp::Unsubscribe, &remove).await?;
+        }
+        if !add.is_empty() {
+            self.known.extend(add.iter().cloned());
+            self.send(p, conn, TopicOp::Subscribe, &add).await?;
+        }
+        p.shared
+            .counters
+            .topics_active
+            .store(self.known.len() as u64, Ordering::Relaxed);
+        if !remove.is_empty() || !add.is_empty() {
+            tracing::debug!(
+                exchange = %p.profile.exchange,
+                stream = %p.profile.stream,
+                added = add.len(),
+                removed = remove.len(),
+                subscribed = self.known.len(),
+                "topics synchronized"
+            );
+        }
+        Ok(())
+    }
+
+    async fn send(
+        &mut self,
+        p: &SessionParams,
+        conn: &mut BoxedConnection,
+        op: TopicOp,
+        topics: &[String],
+    ) -> Result<(), Outcome> {
+        let requests: Vec<TopicRequest> = p.handler.topic_requests(op, topics, &mut self.next_id);
+        for r in requests {
+            send(conn, Message::text(r.text), p.profile.write_timeout).await?;
+            p.shared
+                .counters
+                .topic_requests
+                .fetch_add(1, Ordering::Relaxed);
+            self.pending.insert(
+                r.id,
+                PendingRequest {
+                    op,
+                    topics: r.topics,
+                    sent_at: Instant::now(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn on_response(
+        &mut self,
+        p: &SessionParams,
+        conn: &mut BoxedConnection,
+        id: Option<String>,
+        ok: bool,
+        detail: &str,
+    ) -> Result<(), Outcome> {
+        let request = id.as_ref().and_then(|i| self.pending.remove(i));
+        if ok {
+            return Ok(());
+        }
+        let Some(request) = request else {
+            tracing::warn!(
+                exchange = %p.profile.exchange,
+                stream = %p.profile.stream,
+                id = ?id,
+                detail,
+                "failure response to an unknown topic request"
+            );
+            return Ok(());
+        };
+        if request.op == TopicOp::Unsubscribe {
+            // The topic keeps arriving; the connector filters it. Nothing else to do.
+            tracing::warn!(
+                exchange = %p.profile.exchange,
+                stream = %p.profile.stream,
+                topics = request.topics.len(),
+                detail,
+                "unsubscribe refused"
+            );
+            return Ok(());
+        }
+        let live: Vec<String> = request
+            .topics
+            .into_iter()
+            .filter(|t| self.known.contains(t))
+            .collect();
+        let offenders: Vec<String> = live
+            .iter()
+            .filter(|t| names_topic(detail, t))
+            .cloned()
+            .collect();
+        let rest: Vec<String> = live
+            .iter()
+            .filter(|t| !offenders.contains(t))
+            .cloned()
+            .collect();
+        // A single-topic request cannot be split further: it is the offender even if the message is vague.
+        let offenders = if offenders.is_empty() && live.len() == 1 {
+            live.clone()
+        } else {
+            offenders
+        };
+        for t in &offenders {
+            self.reject(p, t, detail);
+        }
+        let rest: Vec<String> = rest
+            .into_iter()
+            .filter(|t| self.known.contains(t))
+            .collect();
+        if rest.is_empty() {
+            return Ok(());
+        }
+        if !offenders.is_empty() {
+            // The refusal named the culprit: send the others again as one request.
+            return self.send(p, conn, TopicOp::Subscribe, &rest).await;
+        }
+        // Unknown culprit: halve until it is isolated (at most log2(n) rounds, 2 requests per round).
+        let (a, b) = rest.split_at(rest.len() / 2);
+        tracing::warn!(
+            exchange = %p.profile.exchange,
+            stream = %p.profile.stream,
+            topics = rest.len(),
+            detail,
+            "subscribe refused without naming a topic; splitting the request"
+        );
+        self.send(p, conn, TopicOp::Subscribe, a).await?;
+        self.send(p, conn, TopicOp::Subscribe, b).await
+    }
+
+    fn reject(&mut self, p: &SessionParams, topic: &str, detail: &str) {
+        self.known.remove(topic);
+        self.declined.insert(topic.to_string());
+        self.control.mark_rejected(topic, detail);
+        p.shared
+            .counters
+            .topics_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        p.shared
+            .counters
+            .topics_active
+            .store(self.known.len() as u64, Ordering::Relaxed);
+        tracing::warn!(
+            exchange = %p.profile.exchange,
+            stream = %p.profile.stream,
+            topic,
+            reason = detail,
+            "topic refused by the exchange; it stays unsubscribed until the next connection"
+        );
+    }
+}
+
+/// Whether `detail` mentions `topic` as a whole token (not inside a longer name).
+fn names_topic(detail: &str, topic: &str) -> bool {
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '.' || c == '_';
+    let mut from = 0;
+    while let Some(i) = detail[from..].find(topic) {
+        let start = from + i;
+        let end = start + topic.len();
+        let before = detail[..start].chars().next_back();
+        let after = detail[end..].chars().next();
+        if before.is_none_or(|c| !is_name_char(c)) && after.is_none_or(|c| !is_name_char(c)) {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::names_topic;
+
+    #[test]
+    fn topic_names_match_whole_tokens() {
+        assert!(names_topic(
+            "error:handler not found,topic:tickers.FOOUSDT",
+            "tickers.FOOUSDT"
+        ));
+        assert!(names_topic(
+            "bad topic tickers.FOOUSDT, sorry",
+            "tickers.FOOUSDT"
+        ));
+        assert!(!names_topic("topic:tickers.FOOUSDT2", "tickers.FOOUSDT"));
+        assert!(!names_topic("topic:tickers.XFOOUSDT", "FOOUSDT"));
+        assert!(!names_topic("handler not found,topic:bad", "c"));
+        assert!(!names_topic("nothing here", "tickers.FOOUSDT"));
     }
 }

@@ -129,6 +129,10 @@ mod tests {
             1_000_000.0
         );
         assert_eq!(a.resolve("bitmex", "XBT").base, "BTC");
+        let mog = a.resolve("bybit", "1000000MOG");
+        assert_eq!((mog.base.as_str(), mog.multiplier), ("MOG", 1_000_000.0));
+        assert_eq!(a.resolve("bybit", "10000SATS").multiplier, 10_000.0);
+        assert_eq!(a.resolve("bybit", "10000NEX").base, "NEX");
     }
 
     #[test]

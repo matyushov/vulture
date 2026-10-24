@@ -81,6 +81,20 @@ multiplier = 1000
 base = "BABYDOGE"
 multiplier = 1000000
 
+# Seen in the live instrument list of 2026-10-24 (research/bybit-live.md). Further prefixed names stay under
+# their exchange-side name (for example `1000NEIROCTO-USDC-PERP`) until they are added here.
+[bybit."1000000MOG"]
+base = "MOG"
+multiplier = 1000000
+
+[bybit."10000NEX"]
+base = "NEX"
+multiplier = 10000
+
+[bybit."10000SATS"]
+base = "SATS"
+multiplier = 10000
+
 # BitMEX calls bitcoin XBT.
 [bitmex."XBT"]
 base = "BTC"

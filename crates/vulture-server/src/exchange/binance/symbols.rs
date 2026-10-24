@@ -63,6 +63,15 @@ impl SymbolTable {
     /// [`BuildReport::renamed_on_collision`] and logged by the caller. Nothing is dropped and nothing is
     /// merged silently. If the fallback name is taken as well, the symbol is skipped and reported.
     pub fn build(metas: &[InstrumentMeta], aliases: &BaseAliases) -> (Self, BuildReport) {
+        Self::build_for(Venue::Binance, metas, aliases)
+    }
+
+    /// [`SymbolTable::build`] for another venue's naming and alias section (Bybit shares the rules).
+    pub fn build_for(
+        venue: Venue,
+        metas: &[InstrumentMeta],
+        aliases: &BaseAliases,
+    ) -> (Self, BuildReport) {
         let mut report = BuildReport::default();
         struct Candidate<'a> {
             meta: &'a InstrumentMeta,
@@ -72,7 +81,7 @@ impl SymbolTable {
         }
         let mut candidates = Vec::new();
         for meta in metas.iter().filter(|m| is_wanted_market(m)) {
-            match normalize_instrument(Venue::Binance, meta, aliases) {
+            match normalize_instrument(venue, meta, aliases) {
                 Ok(n) => candidates.push(Candidate {
                     aliased: n.base != meta.base,
                     meta,

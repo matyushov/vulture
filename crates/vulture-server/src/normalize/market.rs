@@ -37,6 +37,17 @@ impl ContractKind {
     }
 }
 
+impl ContractKind {
+    /// Maps a Bybit `contractType` (`LinearPerpetual`, `LinearFutures`, `InversePerpetual`, ...).
+    pub fn from_bybit(contract_type: &str) -> Self {
+        match contract_type {
+            "LinearPerpetual" => Self::Perpetual,
+            "LinearFutures" | "InverseFutures" => Self::Dated,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 /// Instrument metadata as reported by an exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentMeta {
@@ -86,6 +97,68 @@ pub fn parse_binance_exchange_info(json: &str) -> Result<Vec<InstrumentMeta>, se
             trading: s.status == "TRADING",
         })
         .collect())
+}
+
+/// One page of Bybit `GET /v5/market/instruments-info`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BybitInstrumentsPage {
+    /// Instruments of the page (unfiltered).
+    pub metas: Vec<InstrumentMeta>,
+    /// Cursor of the next page; `None` on the last one.
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BybitEnvelope {
+    #[serde(rename = "retCode")]
+    ret_code: i64,
+    #[serde(rename = "retMsg", default)]
+    ret_msg: String,
+    #[serde(default)]
+    result: Option<BybitResult>,
+}
+
+#[derive(Deserialize)]
+struct BybitResult {
+    #[serde(default)]
+    list: Vec<BybitInstrument>,
+    #[serde(rename = "nextPageCursor", default)]
+    next_page_cursor: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitInstrument {
+    symbol: String,
+    #[serde(default)]
+    contract_type: String,
+    #[serde(default)]
+    status: String,
+    base_coin: String,
+    quote_coin: String,
+}
+
+/// Parses a page of Bybit `instruments-info`. A non-zero `retCode` is an error.
+pub fn parse_bybit_instruments(json: &str) -> Result<BybitInstrumentsPage, String> {
+    let env: BybitEnvelope = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    if env.ret_code != 0 {
+        return Err(format!("retCode {}: {}", env.ret_code, env.ret_msg));
+    }
+    let result = env.result.ok_or("response has no result")?;
+    Ok(BybitInstrumentsPage {
+        metas: result
+            .list
+            .into_iter()
+            .map(|i| InstrumentMeta {
+                raw: i.symbol,
+                base: i.base_coin,
+                quote: i.quote_coin,
+                kind: ContractKind::from_bybit(&i.contract_type),
+                trading: i.status == "Trading",
+            })
+            .collect(),
+        next_cursor: Some(result.next_page_cursor).filter(|c| !c.is_empty()),
+    })
 }
 
 #[cfg(test)]
@@ -158,6 +231,44 @@ mod tests {
                 "币安人生USDT"
             ]
         );
+    }
+
+    /// Shape of a live `instruments-info` page (first item as received on 2026-10-24, trimmed).
+    const BYBIT_PAGE: &str = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[
+        {"symbol":"0GUSDT","contractType":"LinearPerpetual","status":"Trading","baseCoin":"0G","quoteCoin":"USDT","launchTime":"1758175736000","settleCoin":"USDT","lotSizeFilter":{"qtyStep":"0.1"}},
+        {"symbol":"1000BONKPERP","contractType":"LinearPerpetual","status":"Trading","baseCoin":"1000BONK","quoteCoin":"USDC","settleCoin":"USDC"},
+        {"symbol":"BTC-27MAR26","contractType":"LinearFutures","status":"Trading","baseCoin":"BTC","quoteCoin":"USDT"},
+        {"symbol":"NEWUSDT","contractType":"LinearPerpetual","status":"PreLaunch","baseCoin":"NEW","quoteCoin":"USDT"}
+        ],"nextPageCursor":"first%3D0GUSDT%26last%3DMETISUSDT"},"retExtInfo":{},"time":1792851150134}"#;
+
+    #[test]
+    fn bybit_page_selection_and_cursor() {
+        let page = parse_bybit_instruments(BYBIT_PAGE).unwrap();
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("first%3D0GUSDT%26last%3DMETISUSDT")
+        );
+        let wanted: Vec<&str> = page
+            .metas
+            .iter()
+            .filter(|m| is_wanted_market(m))
+            .map(|m| m.raw.as_str())
+            .collect();
+        assert_eq!(wanted, ["0GUSDT", "1000BONKPERP"]);
+        let usdc = &page.metas[1];
+        assert_eq!(
+            (usdc.base.as_str(), usdc.quote.as_str()),
+            ("1000BONK", "USDC")
+        );
+        let last = BYBIT_PAGE.replace("first%3D0GUSDT%26last%3DMETISUSDT", "");
+        assert!(
+            parse_bybit_instruments(&last)
+                .unwrap()
+                .next_cursor
+                .is_none()
+        );
+        assert!(parse_bybit_instruments(r#"{"retCode":10001,"retMsg":"bad"}"#).is_err());
+        assert!(parse_bybit_instruments("nope").is_err());
     }
 
     #[test]
