@@ -8,6 +8,7 @@ git ignores (`*.example` templates are committed).
 |---|---|
 | `../Dockerfile` | multi-stage image of `vulture-server` (distroless, non-root) |
 | `docker-compose.yml`, `.env.example`, `config.docker.toml` | vulture + Redis (+ optional ClickHouse placeholder) |
+| `docker-compose.tls.yml`, `config.docker.tls.toml` | override that turns TLS on (certificate mount, published gRPC port) |
 | `certbot/` | DNS-01 certificate with certbot and a deploy hook that reloads the server |
 | `systemd/vulture.service` | example unit for running the binary without Docker |
 | `prometheus/` | sample scrape configuration and alert rules |
@@ -63,9 +64,13 @@ tunnel or a TLS-terminating proxy to reach it from elsewhere). To serve TLS dire
 1. Get a certificate (`certbot/README.md`), so that `fullchain.pem` and `privkey.pem` are in a directory readable by
    uid `65532` (the container user), for example `/etc/vulture/tls` (the certbot hook maintains it).
 2. In `.env` set `VULTURE_TLS_DIR=/etc/vulture/tls`.
-3. In `config.docker.toml` uncomment `[tls]` (and optionally `client_ca` for mTLS) and remove `allow_plaintext`.
-4. `docker compose up -d`, then set `VULTURE_GRPC_BIND=0.0.0.0` in `.env` to publish the gRPC port to the network
-   and `docker compose up -d` again. Open the port in your firewall deliberately.
+3. Start with the TLS override: `docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d`. It mounts
+   `config.docker.tls.toml` (`[tls]` enabled, `allow_plaintext = false`; uncomment `client_ca` there for mTLS) and
+   the certificate directory, and publishes the gRPC port on `VULTURE_GRPC_BIND` (all interfaces by default in
+   the override; set `127.0.0.1` in `.env` to keep it local). Open the port in your firewall deliberately.
+   Use the same two `-f` arguments for every later compose command (`ps`, `logs`, `kill`, `up`).
+   Validate without starting: `docker compose -f docker-compose.yml -f docker-compose.tls.yml --env-file
+   .env.example config -q`. The override needs Docker Compose 2.24 or newer.
 
 Check the files without starting anything: `docker compose run --rm --no-deps vulture tls check --config
 /etc/vulture/config.toml` (the entrypoint is the binary).
@@ -79,7 +84,9 @@ certificate), the old certificate stays in use, the error is logged without key 
 `vulture_tls_reloads_total{result="error"}` counts it. The expiry is logged at start and on every reload (a warning
 below 14 days) and exported as `vulture_tls_certificate_expiry_seconds`. `client_ca` is read at start only.
 
-Manual reload: `docker compose kill -s HUP vulture` (compose) or `systemctl reload vulture` (systemd). A `SIGHUP`
+Manual reload: `docker compose kill -s HUP vulture` (compose; add `-f docker-compose.yml -f
+docker-compose.tls.yml` and `--project-directory <dir>` when you run it from another directory, as the certbot hook
+does through `VULTURE_COMPOSE_FILE` and `VULTURE_COMPOSE_DIR`) or `systemctl reload vulture` (systemd). A `SIGHUP`
 is harmless when TLS is off.
 
 ## Metrics
@@ -102,6 +109,18 @@ Install the binary, a config file (copy `../config.example.toml`), an environmen
 `VULTURE__REDIS__URL=redis://:<password>@127.0.0.1:6379` (not in the repository, mode `0640`) and
 `systemd/vulture.service`; the header of the unit lists the commands. `systemctl reload vulture` sends `SIGHUP`.
 Set `VULTURE_RELOAD=systemd` for the certbot hook.
+
+## Tracked symbols and the state file
+
+The `symbols` list of an `[[exchanges]]` entry is only the **default** policy (empty = every symbol). The owner
+changes it at runtime with the `Control` gRPC service (`ListSymbolPolicies`, `SetSymbolPolicy`; try
+`cargo run -p vulture-server --example control_client -- --endpoint ... list`). What the owner sets is stored in
+`/var/lib/vulture/state.json` (mode `0600`, versioned) in the data volume and overrides the configuration default
+of that exchange from then on; every change is also appended to `/var/lib/vulture/audit.log` (JSON lines, rotated
+at 4 MiB to `audit.log.1`). Both files live in the `vulture-data` volume next to the token: they survive upgrades
+and are never overwritten by the image, and they belong in the backups. A damaged or unknown-version
+`state.json` stops the server from starting with an explanatory message (it does not fall back to the
+configuration, which could re-enable symbols you removed): fix or delete the file deliberately.
 
 ## Redis
 

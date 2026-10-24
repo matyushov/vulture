@@ -1,4 +1,5 @@
 [toolchain]
-# Stable as of 2026-10-22: 1.99.1. For CI reproducibility the exact version can be pinned.
-channel = "stable"
+# The exact release the project builds with. To bump it, change this line and `ARG RUST_VERSION` in the Dockerfile
+# (CI fails if the two differ), then run `rustup toolchain install` once or just `cargo build` (rustup fetches it).
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]

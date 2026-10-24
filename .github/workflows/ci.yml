@@ -55,6 +55,12 @@ jobs:
         run: |
           docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example config -q
           docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example --profile clickhouse config -q
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.tls.yml --env-file deploy/.env.example config -q
+      - name: Toolchain pin matches the Dockerfile
+        run: |
+          pinned=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          docker=$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)
+          test -n "$pinned" && test "$pinned" = "$docker" || { echo "rust-toolchain.toml ($pinned) and Dockerfile ($docker) differ"; exit 1; }
       - name: Build the image (no push)
         uses: docker/build-push-action@v6
         with:

@@ -41,13 +41,15 @@ atomically. Then it asks the server to reload:
 
 | deployment | reload command (done by the hook) |
 |---|---|
-| docker compose | `docker kill --signal HUP <container>` |
+| docker compose | `docker compose [-f <file>] [--project-directory <dir>] kill -s HUP vulture` |
 | systemd | `systemctl kill --signal=SIGHUP vulture.service` |
 
 Settings come from environment variables, see the header of `vulture-deploy-hook.sh`. For compose, set
 `VULTURE_TLS_DIR` in `deploy/.env` to the same directory so that it is mounted into the container at
-`/etc/vulture/tls`, and set `VULTURE_CONTAINER` to the container name (`docker compose ps` shows it; the default
-is `vulture-vulture-1`). For systemd use `VULTURE_RELOAD=systemd`. Pass them to certbot with `--deploy-hook
+`/etc/vulture/tls`, and set `VULTURE_COMPOSE_FILE` (the compose file, for example `/srv/vulture/deploy/docker-compose.yml`;
+several files separated by spaces, for example the TLS override) and `VULTURE_COMPOSE_DIR` (the directory with
+`.env`, passed as `--project-directory`) so that the hook can find the project from certbot's environment. The
+service is addressed by its compose name `vulture` (`VULTURE_SERVICE` to change it), not by a container name. For systemd use `VULTURE_RELOAD=systemd`. Pass them to certbot with `--deploy-hook
 'VULTURE_RELOAD=systemd /etc/letsencrypt/renewal-hooks/deploy/vulture-deploy-hook.sh'` or export them in a
 wrapper.
 

@@ -6,18 +6,12 @@
 [server]
 # Inside the container the server must listen on all interfaces so that the published port works. The compose
 # file publishes the ports to 127.0.0.1 of the host by default. Without [tls] the connection is plaintext, hence
-# the flag; remove it (and publish the port wider) only after enabling [tls] below.
+# the flag. For TLS use config.docker.tls.toml with docker-compose.tls.yml instead (see deploy/README.md).
 listen_addr = "0.0.0.0:50051"
 allow_plaintext = true
 data_dir = "/var/lib/vulture"
 
-# TLS: uncomment, mount the directory with the certificate (VULTURE_TLS_DIR in .env, see deploy/README.md) and
-# restart. After that certificate renewals are picked up without a restart (SIGHUP or the file poll).
-# [tls]
-# cert = "/etc/vulture/tls/fullchain.pem"
-# key = "/etc/vulture/tls/privkey.pem"
-# client_ca = "/etc/vulture/tls/client-ca.pem"   # optional: require client certificates (mTLS)
-# reload_interval_secs = 30
+# TLS: use config.docker.tls.toml together with docker-compose.tls.yml (deploy/README.md, section TLS).
 
 [metrics]
 # Not authenticated. Published to the host's loopback by default; scrape it from a trusted network only.

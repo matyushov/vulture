@@ -8,7 +8,11 @@
 //!   ([`oi`]), with rate control ([`rate`]). The first poll waits for the first mark price frame (at most 10 s).
 //!   A 418 ban, and a 429 pause longer than one polling interval, produce a `Gap` with stream
 //!   [`OPEN_INTEREST_STREAM`] covering the pause.
-//! - Symbols: `exchangeInfo`, reloaded hourly ([`info`], [`symbols`]).
+//! - Symbols: `exchangeInfo`, reloaded hourly ([`info`], [`symbols`]). The table is the *universe*; the tracked
+//!   set is the universe filtered by the owner's [`SymbolPolicy`] (config default, overridden at runtime through
+//!   `Control`). The poller re-reads the policy every cycle and skips an untracked symbol at once; liquidation
+//!   frames of untracked symbols are dropped and counted in `liquidations_filtered`; mark prices are stored for
+//!   every symbol. Policy changes never produce a `Gap`.
 
 mod http;
 mod info;
@@ -48,6 +52,7 @@ use self::rate::RateState;
 use super::{EventSink, Exchange, ExchangeError};
 use crate::app::AppContext;
 use crate::config::ExchangeConfig;
+use crate::symbols::{SymbolChannel, SymbolPolicy};
 use crate::ws::{
     Clock, SystemClock, TungsteniteConnector, WsConnector, WsOutput, WsProfile, spawn_ws,
 };
@@ -66,7 +71,8 @@ pub const OPEN_INTEREST_STREAM: &str = "open_interest";
 /// What the `[[exchanges]]` entry says, with defaults applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BinanceConfig {
-    /// Whitelist of normalized symbols; empty means all.
+    /// Default whitelist of normalized symbols from the configuration; empty means all. The owner's runtime
+    /// policy (state file) overrides it.
     pub symbols: Vec<String>,
     /// Configured open interest interval, seconds (a floor; see [`effective_interval`]).
     pub oi_poll_interval_secs: u64,
@@ -173,6 +179,7 @@ pub struct BinanceConnector {
     clock: Arc<dyn Clock>,
     status: Arc<BinanceStatus>,
     profile_hook: Option<fn(&mut WsProfile)>,
+    symbols: Arc<SymbolChannel>,
 }
 
 impl BinanceConnector {
@@ -196,6 +203,7 @@ impl BinanceConnector {
         http: Arc<dyn HttpClient>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let symbols = SymbolChannel::new(SymbolPolicy::from_config(&cfg.symbols));
         Self {
             cfg,
             tuning,
@@ -204,6 +212,7 @@ impl BinanceConnector {
             clock,
             status: Arc::new(BinanceStatus::default()),
             profile_hook: None,
+            symbols,
         }
     }
 
@@ -236,6 +245,7 @@ impl BinanceConnector {
         let marks = Arc::new(MarkPrices::default());
         let rate = RateState::new(status.clone(), self.clock.clone());
         let (table_tx, table_rx) = watch::channel::<Option<Arc<SymbolTable>>>(None);
+        let policy_rx = self.symbols.subscribe_policy();
 
         let (ws_handle, mut ws_rx) = spawn_ws(
             self.profile(),
@@ -260,7 +270,7 @@ impl BinanceConnector {
                 rate: rate.clone(),
                 status: status.clone(),
                 aliases: ctx.aliases.clone(),
-                whitelist: self.cfg.symbols.clone(),
+                symbols: self.symbols.clone(),
                 tuning: self.tuning.clone(),
                 tx: table_tx,
                 shutdown: stop.clone(),
@@ -277,6 +287,7 @@ impl BinanceConnector {
                 tuning: self.tuning.clone(),
                 configured_interval_secs: self.cfg.oi_poll_interval_secs,
                 symbols: table_rx.clone(),
+                policy: self.symbols.subscribe_policy(),
                 sink: sink.clone(),
                 sink_closed: sink_closed.clone(),
                 shutdown: stop.clone(),
@@ -313,7 +324,7 @@ impl BinanceConnector {
                         BinanceStatus::inc(&status.unknown_frames);
                         continue;
                     };
-                    self.handle_text(text, m.recv_ts_ms, &marks, &table_rx, &ctx)
+                    self.handle_text(text, m.recv_ts_ms, &marks, &table_rx, &policy_rx, &ctx)
                         .map(Payload::Liquidation)
                 }
             };
@@ -351,6 +362,7 @@ impl BinanceConnector {
         recv_ts: i64,
         marks: &MarkPrices,
         table: &watch::Receiver<Option<Arc<SymbolTable>>>,
+        policy: &watch::Receiver<Arc<SymbolPolicy>>,
         ctx: &AppContext,
     ) -> Option<vulture_proto::v1::Liquidation> {
         let status = &self.status;
@@ -390,9 +402,13 @@ impl BinanceConnector {
             // The first seconds after start, before `exchangeInfo` has arrived: strict name parsing only.
             None => symbols::fallback_entry(&order.symbol, &ctx.aliases),
         };
+        let policy = policy.borrow().clone();
         match entry {
-            Some(entry) => Some(liquidation_event(&order, &entry, recv_ts)),
-            None => {
+            Some(entry) if policy.allows(&entry.symbol) => {
+                Some(liquidation_event(&order, &entry, recv_ts))
+            }
+            // Not in the universe (TradFi, settling) or not tracked under the current policy.
+            _ => {
                 BinanceStatus::inc(&status.liquidations_filtered);
                 None
             }
@@ -415,5 +431,9 @@ impl Exchange for BinanceConnector {
 
     fn collect_metrics(&self, out: &mut crate::metrics::Families) {
         self.status.collect_metrics(out);
+    }
+
+    fn symbols(&self) -> Option<Arc<SymbolChannel>> {
+        Some(self.symbols.clone())
     }
 }

@@ -15,6 +15,10 @@ service Control {
   // Tracked symbols per exchange (v0.2). Changes apply on the fly, without restart.
   rpc ListSymbolPolicies(ListSymbolPoliciesRequest) returns (ListSymbolPoliciesResponse);
   // Replaces the policy of one exchange. Idempotent: the same request gives the same state.
+  // Errors: INVALID_ARGUMENT (unknown exchange, malformed or unknown symbol names, empty WHITELIST,
+  // UNSPECIFIED mode), UNIMPLEMENTED (non-empty oi_intervals: per-symbol overrides are not supported yet),
+  // FAILED_PRECONDITION (the exchange's symbol list is not loaded yet; retry), INTERNAL (the state could
+  // not be stored; nothing changed). The change is stored before the call returns.
   rpc SetSymbolPolicy(SetSymbolPolicyRequest) returns (SetSymbolPolicyResponse);
   // Connector status.
   rpc GetConnectorStatus(GetConnectorStatusRequest) returns (GetConnectorStatusResponse);
@@ -81,7 +85,8 @@ message SymbolPolicy {
   SymbolMode mode = 2;
   // Normalized symbols for WHITELIST and BLACKLIST.
   repeated string symbols = 3;
-  // Optional per-symbol OI poll interval overrides; other symbols use the exchange interval.
+  // Optional per-symbol OI poll interval overrides; other symbols use the exchange interval. The current
+  // server does not support them: a non-empty list is refused with UNIMPLEMENTED.
   repeated SymbolOiInterval oi_intervals = 4;
   reserved 5 to 9;
 }
@@ -93,6 +98,23 @@ message ListSymbolPoliciesRequest {
 
 message ListSymbolPoliciesResponse {
   repeated SymbolPolicy policies = 1;
+  // One entry per element of policies, same order (added in v0.3).
+  repeated SymbolPolicyStatus statuses = 2;
+}
+
+// Counts for one exchange's policy (v0.3).
+message SymbolPolicyStatus {
+  string exchange = 1;
+  // Symbols tracked under the policy (the universe filtered by the mode and the list).
+  uint32 tracked_count = 2;
+  // Symbols the exchange offers (linear USDT/USDC perpetuals). 0 until the server has loaded the list.
+  uint32 universe_size = 3;
+  // False until the server has loaded the exchange's symbol list; names cannot be validated before.
+  bool universe_loaded = 4;
+  // True when the policy was set through SetSymbolPolicy (stored on the server), false when it is the
+  // default from the server configuration.
+  bool overridden = 5;
+  reserved 6 to 9;
 }
 
 message SetSymbolPolicyRequest {
@@ -100,8 +122,20 @@ message SetSymbolPolicyRequest {
 }
 
 message SetSymbolPolicyResponse {
-  // The policy as stored after validation and normalization.
+  // The policy as stored after validation and normalization (names upper-cased, duplicates removed; the
+  // list is empty for ALL).
   SymbolPolicy policy = 1;
+  // Fields below were added in v0.3.
+  // Symbols tracked after the change.
+  uint32 tracked_count = 2;
+  // Symbols the exchange offers.
+  uint32 universe_size = 3;
+  // Difference of the tracked sets, sorted: started to be tracked / stopped being tracked.
+  repeated string added = 4;
+  repeated string removed = 5;
+  // False when the request repeated the policy already in force (idempotent repeat).
+  bool changed = 6;
+  reserved 7 to 9;
 }
 
 // --- Connectors ---

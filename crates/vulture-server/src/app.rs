@@ -14,6 +14,7 @@ use crate::metrics::{
 };
 use crate::normalize::{AliasError, BaseAliases};
 use crate::store::{RedisClientStore, RedisStore, RedisWriter, WriterConfig};
+use crate::symbols::SymbolManager;
 use crate::tls::TlsReloader;
 use crate::ws::SystemClock;
 
@@ -100,6 +101,9 @@ pub enum AppError {
     /// The metrics endpoint could not start.
     #[error(transparent)]
     Metrics(#[from] crate::metrics::MetricsError),
+    /// The state file of the symbol policies is unusable; the server refuses to start rather than guess.
+    #[error(transparent)]
+    State(#[from] crate::symbols::StateError),
     /// Signal handlers could not be installed.
     #[error("cannot install signal handlers: {0}")]
     Signals(std::io::Error),
@@ -155,13 +159,25 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
         Some(cfg) => Some(TlsReloader::load(cfg)?),
         None => None,
     };
+    // The symbol policies: configuration defaults overridden by <data_dir>/state.json. A broken state file stops
+    // the start here, before anything listens.
+    let connectors = build_connectors(&ctx);
+    let symbols = SymbolManager::new(
+        &ctx.config,
+        connectors
+            .iter()
+            .filter_map(|c| c.symbols().map(|ch| (c.name().to_string(), ch)))
+            .collect(),
+    )?;
     let hub = Arc::new(MetricsHub::new());
+    hub.register(symbols.clone());
     let metrics_listener = crate::metrics::bind(&ctx.config.metrics.listen_addr).await?;
     let grpc = crate::grpc::start(
         &ctx.config.server,
         tls.clone(),
         store.clone(),
         authority,
+        Some(symbols),
         ctx.shutdown.clone(),
     )
     .await?;
@@ -193,7 +209,6 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
     ));
 
     let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
-    let connectors = build_connectors(&ctx);
     run_with_hub(ctx, store, connectors, Some(hub)).await;
     grpc.wait(deadline * 2).await;
     let _ = metrics_task.await;

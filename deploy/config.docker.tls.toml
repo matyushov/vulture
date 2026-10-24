@@ -1,0 +1,33 @@
+# TLS variant of config.docker.toml, mounted at /etc/vulture/config.toml by deploy/docker-compose.tls.yml.
+# It holds no secrets: the Redis URL (with its password) comes from the environment
+# (VULTURE__REDIS__URL, set by the compose file from REDIS_PASSWORD in your .env), and the access token lives in
+# the data volume. Reference of every key: config.example.toml in the repository root.
+
+[server]
+# Inside the container the server must listen on all interfaces so that the published port works. The compose
+# override publishes the gRPC port on VULTURE_GRPC_BIND. Plaintext is not allowed; the certificate files are read
+# from the directory mounted at /etc/vulture/tls.
+listen_addr = "0.0.0.0:50051"
+allow_plaintext = false
+data_dir = "/var/lib/vulture"
+
+# Certificate and key (PEM); renewals are picked up without a restart (SIGHUP or the file poll).
+[tls]
+cert = "/etc/vulture/tls/fullchain.pem"
+key = "/etc/vulture/tls/privkey.pem"
+# client_ca = "/etc/vulture/tls/client-ca.pem"   # optional: require client certificates (mTLS)
+reload_interval_secs = 30
+
+[metrics]
+# Not authenticated. Published to the host's loopback by default; scrape it from a trusted network only.
+listen_addr = "0.0.0.0:9100"
+
+[logging]
+level = "info"
+format = "json"
+
+[[exchanges]]
+name = "binance"
+enabled = true
+symbols = []            # empty = every linear USDT/USDC perpetual
+oi_poll_interval_secs = 30

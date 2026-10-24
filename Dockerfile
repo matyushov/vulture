@@ -6,7 +6,7 @@
 #
 #   docker build -t vulture-server .
 #
-# RUST_VERSION must match the toolchain the project is built with (rust-toolchain.toml).
+# RUST_VERSION must equal `channel` in rust-toolchain.toml (CI checks it); bump both together.
 ARG RUST_VERSION=1.99.1
 
 FROM rust:${RUST_VERSION}-bookworm AS builder

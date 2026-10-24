@@ -17,6 +17,7 @@ use super::rate::{RateState, TokenBucket, budget_per_min, effective_interval};
 use super::status::BinanceStatus;
 use super::stream::MarkPrices;
 use super::symbols::{SymbolEntry, SymbolTable};
+use crate::symbols::SymbolPolicy;
 use crate::ws::Clock;
 
 /// REST path of one snapshot (weight 1, S-1).
@@ -40,7 +41,10 @@ pub struct OiPoller {
     pub clock: Arc<dyn Clock>,
     pub tuning: BinanceTuning,
     pub configured_interval_secs: u64,
+    /// The universe.
     pub symbols: watch::Receiver<Option<Arc<SymbolTable>>>,
+    /// The owner's policy; the tracked set is the universe filtered by it.
+    pub policy: watch::Receiver<Arc<SymbolPolicy>>,
     pub sink: mpsc::Sender<Event>,
     /// Set when the sink is gone; the connector turns it into `ExchangeError::SinkClosed`.
     pub sink_closed: Arc<AtomicBool>,
@@ -60,7 +64,8 @@ impl OiPoller {
     /// Schedule: a cycle visits every symbol once. Slot `i` of a cycle is `i * interval / N` after the
     /// previous slot's time plus the slowdown stretch, so requests are evenly spread and never bursty. A
     /// request that is late (all permits busy) delays the slots after it rather than being followed by a
-    /// catch-up burst. N and the interval are re-read at the start of every cycle.
+    /// catch-up burst. The tracked set (universe filtered by the policy), N and the interval are re-read at the
+    /// start of every cycle; a symbol removed mid-cycle is skipped at once, an added one starts next cycle.
     pub async fn run(self) {
         let this = Arc::new(self);
         let semaphore = Arc::new(Semaphore::new(this.tuning.oi_concurrency.max(1)));
@@ -71,6 +76,7 @@ impl OiPoller {
         ));
         let mut tasks: JoinSet<()> = JoinSet::new();
         let mut symbols = this.symbols.clone();
+        let mut policy = this.policy.clone();
         // The first snapshots should carry `oi_usd` and `mark_price`: wait for the first mark price frame, but
         // never longer than `first_mark_wait`.
         tokio::select! {
@@ -84,20 +90,30 @@ impl OiPoller {
 
         'cycles: loop {
             let table = symbols.borrow_and_update().clone();
-            let Some(table) = table.filter(|t| !t.is_empty()) else {
+            let current = policy.borrow_and_update().clone();
+            let tracked: Vec<SymbolEntry> = table
+                .as_ref()
+                .map(|t| t.tracked(&current).cloned().collect())
+                .unwrap_or_default();
+            if tracked.is_empty() {
                 tokio::select! {
                     r = symbols.changed() => if r.is_err() { break 'cycles },
+                    r = policy.changed() => if r.is_err() { break 'cycles },
                     _ = this.shutdown.cancelled() => break 'cycles,
                 }
                 continue;
-            };
-            let n = table.len();
+            }
+            let n = tracked.len();
             let interval = effective_interval(this.configured_interval_secs, n);
             let step = interval.div_f64(n as f64);
             this.status
                 .oi_interval_ms
                 .store(interval.as_millis() as u64, Ordering::Relaxed);
-            for entry in table.entries() {
+            for entry in &tracked {
+                // Removed from the policy (or delisted) since the cycle began: do not poll it.
+                if !this.still_tracked(entry) {
+                    continue;
+                }
                 match this.rate.wait_unpaused(&this.shutdown).await {
                     None => break 'cycles,
                     Some(true) => next_at = Instant::now(),
@@ -109,6 +125,10 @@ impl OiPoller {
                 tokio::select! {
                     _ = sleep_until(next_at) => {}
                     _ = this.shutdown.cancelled() => break 'cycles,
+                }
+                // The wait for the slot may have been long: check again right before the request.
+                if !this.still_tracked(entry) {
+                    continue;
                 }
                 let permit = tokio::select! {
                     p = semaphore.clone().acquire_owned() => match p {
@@ -137,6 +157,16 @@ impl OiPoller {
         }
         // Tasks end on their own: they watch the same shutdown token.
         while tasks.join_next().await.is_some() {}
+    }
+
+    /// Whether `entry` is still in the universe and allowed by the policy as of now.
+    fn still_tracked(&self, entry: &SymbolEntry) -> bool {
+        let listed = self
+            .symbols
+            .borrow()
+            .as_ref()
+            .is_some_and(|t| t.get(&entry.raw).is_some());
+        listed && self.policy.borrow().allows(&entry.symbol)
     }
 
     /// Turns finished REST pauses into `Gap` events (`open_interest` stream): every 418 ban, and a 429 pause

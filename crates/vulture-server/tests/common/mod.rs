@@ -316,6 +316,16 @@ impl Server {
         stream: StreamConfig,
         limiter: LimiterConfig,
     ) -> Self {
+        Self::start_full(backend, stream, limiter, None).await
+    }
+
+    /// Like `start_with`, with the symbol control behind the `Control` service.
+    pub async fn start_full(
+        backend: &Backend,
+        stream: StreamConfig,
+        limiter: LimiterConfig,
+        symbols: Option<Arc<vulture_server::symbols::SymbolManager>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let token_store = TokenStore::new(dir.path());
         let token = token_store.create_if_missing().unwrap().into_secret();
@@ -335,6 +345,7 @@ impl Server {
             keepalive_timeout: Duration::from_secs(10),
             limiter,
             stream,
+            symbols,
         };
         let task = tokio::spawn({
             let (store, authority, stats, auth_stats, shutdown) = (

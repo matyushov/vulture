@@ -9,7 +9,9 @@
 #   VULTURE_TLS_DIR    directory the server reads cert and key from       [/etc/vulture/tls]
 #   VULTURE_TLS_OWNER  owner of the copied files, user:group or uid:gid   [65532:65532, the container user]
 #   VULTURE_RELOAD     "docker" (compose) or "systemd"                     [docker]
-#   VULTURE_CONTAINER  container name for docker mode                      [vulture-vulture-1]
+#   VULTURE_COMPOSE_FILE  compose file(s) for docker mode, space-separated  [docker compose default lookup]
+#   VULTURE_COMPOSE_DIR   --project-directory for docker mode (where .env lives) [unset]
+#   VULTURE_SERVICE    compose service name in docker mode                [vulture]
 #   VULTURE_UNIT       unit name for systemd mode                          [vulture.service]
 #
 # Install: copy to /etc/letsencrypt/renewal-hooks/deploy/ (or pass --deploy-hook) and make it executable.
@@ -32,7 +34,15 @@ done
 
 case "$mode" in
     docker)
-        docker kill --signal HUP "${VULTURE_CONTAINER:-vulture-vulture-1}" ;;
+        # Addressed by compose service, not by a container name: it survives project renames and recreation.
+        set -- compose
+        if [ -n "${VULTURE_COMPOSE_DIR:-}" ]; then
+            set -- "$@" --project-directory "$VULTURE_COMPOSE_DIR"
+        fi
+        for f in ${VULTURE_COMPOSE_FILE:-}; do
+            set -- "$@" -f "$f"
+        done
+        docker "$@" kill -s HUP "${VULTURE_SERVICE:-vulture}" ;;
     systemd)
         systemctl kill --signal=SIGHUP "${VULTURE_UNIT:-vulture.service}" ;;
     *)

@@ -58,6 +58,7 @@ async fn sighup_swaps_the_certificate_and_open_streams_survive() {
         keepalive_timeout: Duration::from_secs(10),
         limiter: LimiterConfig::default(),
         stream: test_stream_config(),
+        symbols: None,
     };
     let server = tokio::spawn(grpc::serve_tls(
         listener,

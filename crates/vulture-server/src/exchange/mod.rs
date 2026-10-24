@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use vulture_proto::v1::Event;
 
 use crate::app::AppContext;
+use crate::symbols::SymbolChannel;
 
 /// Capacity of the channel from connectors to the writer.
 pub const EVENT_CHANNEL_CAPACITY: usize = 10_000;
@@ -62,6 +63,15 @@ pub trait Exchange: Send + Sync {
     /// Adds the connector's counters and state to a metrics scrape. Labels must stay low-cardinality
     /// (`exchange`, `type`, `state`; never symbols). The default reports nothing.
     fn collect_metrics(&self, _out: &mut crate::metrics::Families) {}
+
+    /// The link through which the owner's symbol policy reaches the connector and the connector publishes its
+    /// universe (see [`crate::symbols`]). A connector that returns it must apply policy changes while running:
+    /// stop producing events of untracked symbols, start for added ones, never publish a `Gap` for the
+    /// difference. The default (`None`) means the connector tracks whatever its configuration says and cannot
+    /// be controlled at runtime; such a connector keeps compiling and running unchanged.
+    fn symbols(&self) -> Option<Arc<SymbolChannel>> {
+        None
+    }
 }
 
 /// Reports a running connector to the metrics hub.

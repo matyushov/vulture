@@ -3,11 +3,12 @@
 Open source service that collects **liquidations** and **open interest** from crypto exchanges: a Rust server,
 gRPC API, Redis Streams hot storage and ClickHouse history, plus a Qt6 client.
 
-Status: scaffold, proto v0.2 contract, CI, the server foundation (configuration, exchange trait, symbol and
+Status: scaffold, proto v0.3 contract, CI, the server foundation (configuration, exchange trait, symbol and
 open interest normalization, reconnecting WebSocket manager), the Binance USDT-M connector, the Redis Streams
 writer (24-hour hot window), the gRPC `Stream.Subscribe` with resume and the owner token, TLS with certificate hot
-reload, Prometheus metrics, and a Dockerfile with compose, certbot, systemd and Prometheus templates in `deploy/`.
-`History` and `Control` are in the contract but answer `UNIMPLEMENTED`; ClickHouse history and the other
+reload, Prometheus metrics, tracked symbols managed at runtime (`Control.ListSymbolPolicies` /
+`SetSymbolPolicy`), and a Dockerfile with compose, certbot, systemd and Prometheus templates in `deploy/`.
+`History` and the rest of `Control` are in the contract but answer `UNIMPLEMENTED`; ClickHouse history and the other
 exchanges are not implemented yet. The server needs a Redis instance (`redis.url`); deployment is described in
 [deploy/README.md](deploy/README.md).
 
@@ -31,6 +32,9 @@ cargo run -p vulture-server -- config check --config config.example.toml
 cargo run -p vulture-server -- run --config config.example.toml   # needs redis.url, see "Redis storage"
 cargo run -p vulture-cli -- --help
 ```
+
+The toolchain is pinned in `rust-toolchain.toml` (exact release, currently 1.99.1; rustup fetches it on first
+use). To bump it, change `channel` there and `ARG RUST_VERSION` in the `Dockerfile` (CI fails when the two differ).
 
 UI (requires Qt6 and CMake; gRPC/protobuf dependencies are described in `ui/conanfile.py`):
 
@@ -66,10 +70,44 @@ added to the repository.
   (`Connecting`, `Healthy`, `Degraded`, `Stopped`). Timers run on the monotonic clock and tests drive them with
   `tokio::time::pause`. Defaults are documented in `research/ws-reconnect.md`.
 
+### Tracked symbols (`symbols`, V1-11)
+
+Which symbols an exchange tracks is a **policy**: `ALL` (the exchange's whole universe: linear USDT/USDC
+perpetuals as loaded from its symbol list), `WHITELIST` (only the listed ones) or `BLACKLIST` (the universe minus the
+listed ones). The effective set is recomputed whenever the policy or the universe changes (for Binance the hourly
+`exchangeInfo` reload), so a whitelisted symbol that is listed later starts being tracked and a blacklisted one stays
+excluded when it is delisted and relisted.
+
+- **Default and override.** The `symbols` list of `[[exchanges]]` is the default policy (empty = `ALL`, otherwise a
+  whitelist). The owner's runtime changes are stored in `<data_dir>/state.json` (versioned, written atomically with
+  mode `0600`) and override the default of that exchange. An unreadable, corrupt or unknown-version state file makes
+  the server **refuse to start** with a clear message instead of falling back to the configuration (which could
+  re-enable symbols the owner removed). The file is never overwritten by an image update.
+- **Control RPCs.** `ListSymbolPolicies` returns the policy per exchange plus the tracked count and the universe
+  size. `SetSymbolPolicy` replaces one exchange's policy: the exchange must be configured and enabled, names must
+  be `BASE-USDT-PERP` / `BASE-USDC-PERP` (case-insensitive, duplicates collapse), `WHITELIST` needs at least one
+  symbol, and **names the exchange does not list are rejected with `INVALID_ARGUMENT`** and named in the message (a
+  typo must not silently track nothing; the check needs the symbol list, `FAILED_PRECONDITION` until it is loaded).
+  `ALL` ignores the list. It is idempotent (a repeat answers `changed = false`), returns the tracked count and the
+  added/removed diff, and stores the state before answering. Per-symbol OI interval overrides (`oi_intervals`) are
+  not supported: a non-empty list is refused with `UNIMPLEMENTED`. All other `Control` RPCs stay `UNIMPLEMENTED`.
+  `cargo run -p vulture-server --example control_client -- --help` is a small client (TLS and token flags as in
+  `stream_client`); the proper CLI comes in V5.
+- **Applied on the fly.** The connector receives the policy through `Exchange::symbols()` (a `SymbolChannel`, two
+  `watch` values: policy in, universe out; connectors that return `None` are unaffected). Binance: the OI poller
+  re-reads the tracked set and `N` at the start of every cycle and skips a symbol removed mid-cycle at once, so a
+  removed symbol stops being polled within one cycle and an added one starts at the next; liquidation frames of
+  untracked symbols are dropped and counted (`vulture_connector_filtered_liquidations_total`); mark prices are still
+  kept for all symbols. Symbols that stay tracked keep flowing with no `Gap` and no duplicates.
+- **No gap for removed symbols.** Untracking is not an outage, so no `Gap` is published. History for a period in
+  which a symbol was not tracked does not exist and cannot be backfilled.
+- **Audit.** Every change is appended as one JSON line to `<data_dir>/audit.log` (time, exchange, mode, added,
+  removed, counts, peer address; no secrets; rotated at 4 MiB to `audit.log.1`) and logged with `tracing`.
+
 ### Binance connector (`exchange::binance`)
 
 Public data only, no keys. Settings in `[[exchanges]] name = "binance"`: `enabled`, `symbols` (optional whitelist of
-normalized names such as `BTC-USDT-PERP`; empty means all), `oi_poll_interval_secs` (default 30), and the optional
+normalized names such as `BTC-USDT-PERP`; empty means all; the default policy, see "Tracked symbols"), `oi_poll_interval_secs` (default 30), and the optional
 test overrides `ws_url` / `rest_url`.
 - **Symbols:** REST `/fapi/v1/exchangeInfo` at start and every hour; perpetual, trading, USDT/USDC only
   (`TRADIFI_PERPETUAL` is excluded). Listings and removals are logged and applied to polling. Non-ASCII symbols
@@ -151,8 +189,8 @@ docker stop vulture-test-redis
 ## gRPC API and token
 
 `vulture-server run` serves three services on `server.listen_addr` (default `127.0.0.1:50051`): `Stream`
-(implemented), `History` and `Control` (registered, every method answers `UNIMPLEMENTED`, so the contract is
-visible to `grpcurl`). Every RPC of every service needs the token. Without `[tls]` the connection is plaintext, so
+(implemented), `History` and `Control` (`History` and all `Control` methods except the two symbol RPCs answer `UNIMPLEMENTED`; the
+contract stays visible to `grpcurl`). Every RPC of every service needs the token. Without `[tls]` the connection is plaintext, so
 the server **refuses a non-loopback `listen_addr`** unless `server.allow_plaintext = true` is set (a warning is
 logged; for an internal network or a TLS-terminating proxy). With `[tls]` any address is accepted (see "TLS").
 
@@ -252,7 +290,8 @@ atomic counters and reports them at scrape time. Labels are low-cardinality on p
 |---|---|
 | `vulture_build_info`, `vulture_process_*` | version, uptime, start time |
 | `vulture_events_total{exchange,type}`, `vulture_parse_errors_total{exchange,type}` | events published (liquidation, open_interest, gap) and unparsable frames |
-| `vulture_connector_*`, `vulture_symbols`, `vulture_mark_price_age_seconds` | frames, filtered liquidations, symbol count, liveness |
+| `vulture_connector_*`, `vulture_symbols`, `vulture_mark_price_age_seconds` | frames, filtered liquidations (untracked symbols included), universe size, liveness |
+| `vulture_symbols_universe{exchange}`, `vulture_symbols_tracked{exchange}`, `vulture_symbol_policy_changes_total{exchange,result}` | symbols the exchange offers, symbols tracked under the policy, `SetSymbolPolicy` requests (`applied`, `unchanged`, `rejected`, `error`) |
 | `vulture_oi_*`, `vulture_rest_*`, `vulture_exchange_info_loads_total` | open interest polling: requests, retries, failures, used weight, 429/418, pause and ban state, interval |
 | `vulture_ws_*{exchange}` | WebSocket manager: state (`state` label, 1 for the current one), reconnects, gaps, duplicates, overflow drops, bans |
 | `vulture_redis_*` | writer: written, batches, retries, buffered, dropped, gaps written, last write age, connection state; sampled stream length and oldest/newest entry age |
@@ -326,7 +365,9 @@ v0.2 (additive, `buf breaking` green): the `Signal` message (`OI_SPIKE_UP`, `OI_
 per-symbol OI interval overrides; the older `ListSubscriptions` / `SetSubscription` stay but are documented as
 superseded); and the OI movers ranking in `History.Aggregate` (`AggregateRequest.oi_movers` selects it, the answer is
 `AggregateResponse.oi_movers` with top growth and top decline by `oi_base`, absolute and percent change and a
-`partial` flag). Contract only: no server logic for these yet. Timestamps are int64, Unix epoch milliseconds;
+`partial` flag). Contract only: no server logic for these yet (the symbol policy RPCs got theirs in v0.3). v0.3 (additive): `SetSymbolPolicyResponse` gained `tracked_count`, `universe_size`, `added`, `removed`, `changed`, and
+`ListSymbolPoliciesResponse` gained `statuses` (`SymbolPolicyStatus`: tracked count, universe size, whether the
+list is loaded, whether the policy is an owner override). Timestamps are int64, Unix epoch milliseconds;
 numbers are `double`. Evolution rules: fields may only be added, numbers are not reused,
 removed fields are marked `reserved`. Checks: `cd proto && buf lint`, and `buf breaking --against "../.git#ref=<base>,subdir=proto"` against the previous revision. Rust code is generated in
 `build.rs` (vendored protoc, tonic server+client); C++ for the UI uses `protoc` and `grpc_cpp_plugin` from

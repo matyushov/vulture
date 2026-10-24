@@ -6,7 +6,11 @@
 #   VULTURE__EXCHANGES__0__ENABLED=false                (array elements are addressed by index)
 
 [server]
-listen_addr = "127.0.0.1:50051"  # gRPC. A non-loopback address needs # TLS for the gRPC listener. Uncomment to enable; paths are placeholders. The files are PEM; the certificate
+listen_addr = "127.0.0.1:50051"  # gRPC. A non-loopback address needs [tls] (or allow_plaintext = true, see below)
+# allow_plaintext = false         # accept a non-loopback bind without [tls]: the token travels unencrypted
+# data_dir = "/var/lib/vulture"   # token, state.json (symbol policies set at runtime), audit.log
+
+# TLS for the gRPC listener. Uncomment to enable; paths are placeholders. The files are PEM; the certificate
 # file may hold the whole chain (certbot's fullchain.pem). Certificate and key are reloaded without dropping open
 # streams on SIGHUP and when the files change (poll below); an invalid replacement is rejected and the old
 # certificate stays in use. Check the files with `vulture-server tls check --config <file>`.
@@ -32,7 +36,9 @@ buffer_limit = 100000          # events kept in memory while Redis is down; abov
                                # and one Gap event (exchange "*", stream "redis-writer") is written afterwards
 
 # The set of exchanges and symbols is data, not code. Symbols are normalized (BASE-QUOTE-PERP);
-# an empty list means every linear USDT/USDC perpetual the exchange offers.
+# an empty list means every linear USDT/USDC perpetual the exchange offers. `symbols` is the DEFAULT policy
+# (empty = ALL, otherwise a whitelist): what the owner sets at runtime through Control.SetSymbolPolicy is kept in
+# <data_dir>/state.json and overrides it from then on.
 [[exchanges]]
 name = "binance"
 enabled = true

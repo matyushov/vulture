@@ -52,8 +52,9 @@ impl SymbolDiff {
 }
 
 impl SymbolTable {
-    /// Filters `metas` (perpetual, trading, USDT/USDC; `TRADIFI_PERPETUAL` stays out), normalizes the names
-    /// and applies the optional whitelist of normalized symbols.
+    /// Filters `metas` (perpetual, trading, USDT/USDC; `TRADIFI_PERPETUAL` stays out) and normalizes the names.
+    /// The result is the exchange's universe; which of its symbols are tracked is the business of
+    /// [`crate::symbols::SymbolPolicy`].
     ///
     /// **Alias collisions.** `PEPEUSDT` and `1000PEPEUSDT` both normalize to `PEPE-USDT-PERP`. They are
     /// different markets (different price scale and different open interest units), so merging them into one
@@ -61,11 +62,7 @@ impl SymbolTable {
     /// aliased one is renamed to its exchange-side name with multiplier 1 (`1000PEPE-USDT-PERP`), reported in
     /// [`BuildReport::renamed_on_collision`] and logged by the caller. Nothing is dropped and nothing is
     /// merged silently. If the fallback name is taken as well, the symbol is skipped and reported.
-    pub fn build(
-        metas: &[InstrumentMeta],
-        aliases: &BaseAliases,
-        whitelist: &[String],
-    ) -> (Self, BuildReport) {
+    pub fn build(metas: &[InstrumentMeta], aliases: &BaseAliases) -> (Self, BuildReport) {
         let mut report = BuildReport::default();
         struct Candidate<'a> {
             meta: &'a InstrumentMeta,
@@ -104,9 +101,6 @@ impl SymbolTable {
                     continue;
                 }
             };
-            if !whitelist.is_empty() && !whitelist.contains(&symbol) {
-                continue;
-            }
             entries.push(SymbolEntry {
                 raw: c.meta.raw.clone(),
                 symbol,
@@ -137,6 +131,14 @@ impl SymbolTable {
     /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The entries the policy tracks, in raw-name order.
+    pub fn tracked<'a>(
+        &'a self,
+        policy: &'a crate::symbols::SymbolPolicy,
+    ) -> impl Iterator<Item = &'a SymbolEntry> {
+        self.entries.iter().filter(|e| policy.allows(&e.symbol))
     }
 
     /// Looks a symbol up by its raw name.
@@ -196,7 +198,7 @@ mod tests {
     fn fixture_selection_and_normalization() {
         let json = include_str!("../../../../../fixtures/binance/exchange_info_sample.json");
         let metas = parse_binance_exchange_info(json).unwrap();
-        let (t, report) = SymbolTable::build(&metas, &BaseAliases::builtin(), &[]);
+        let (t, report) = SymbolTable::build(&metas, &BaseAliases::builtin());
         // Ordered by raw name (byte order).
         let names: Vec<_> = t.entries().iter().map(|e| e.symbol.as_str()).collect();
         assert_eq!(
@@ -215,18 +217,20 @@ mod tests {
     }
 
     #[test]
-    fn whitelist_selects_by_normalized_name() {
+    fn policy_selects_by_normalized_name() {
+        use crate::symbols::{Mode, SymbolPolicy};
         let metas = vec![
             meta("BTCUSDT", "BTC", "USDT"),
             meta("ETHUSDT", "ETH", "USDT"),
         ];
-        let (t, _) = SymbolTable::build(
-            &metas,
-            &BaseAliases::builtin(),
-            &["ETH-USDT-PERP".to_string()],
-        );
-        assert_eq!(t.len(), 1);
-        assert_eq!(t.entries()[0].raw, "ETHUSDT");
+        let (t, _) = SymbolTable::build(&metas, &BaseAliases::builtin());
+        assert_eq!(t.len(), 2);
+        let wl = SymbolPolicy::new(Mode::Whitelist, ["ETH-USDT-PERP"]).unwrap();
+        let raws: Vec<_> = t.tracked(&wl).map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, ["ETHUSDT"]);
+        let bl = SymbolPolicy::new(Mode::Blacklist, ["ETH-USDT-PERP"]).unwrap();
+        let raws: Vec<_> = t.tracked(&bl).map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, ["BTCUSDT"]);
     }
 
     #[test]
@@ -235,7 +239,7 @@ mod tests {
             meta("1000PEPEUSDT", "1000PEPE", "USDT"),
             meta("PEPEUSDT", "PEPE", "USDT"),
         ];
-        let (t, report) = SymbolTable::build(&metas, &BaseAliases::builtin(), &[]);
+        let (t, report) = SymbolTable::build(&metas, &BaseAliases::builtin());
         assert_eq!(t.len(), 2);
         let plain = t.get("PEPEUSDT").unwrap();
         assert_eq!(plain.symbol, "PEPE-USDT-PERP");
@@ -248,7 +252,7 @@ mod tests {
         // The result does not depend on the input order.
         let mut reversed = metas.clone();
         reversed.reverse();
-        let (t2, _) = SymbolTable::build(&reversed, &BaseAliases::builtin(), &[]);
+        let (t2, _) = SymbolTable::build(&reversed, &BaseAliases::builtin());
         assert_eq!(t, t2);
     }
 
@@ -263,14 +267,14 @@ mod tests {
             meta("SOLUSDT", "SOL", "USDT"),
         ];
         let al = BaseAliases::builtin();
-        let (ta, _) = SymbolTable::build(&a, &al, &[]);
-        let (tb, _) = SymbolTable::build(&b, &al, &[]);
+        let (ta, _) = SymbolTable::build(&a, &al);
+        let (tb, _) = SymbolTable::build(&b, &al);
         let d = ta.diff(&tb);
         assert_eq!(d.added, ["SOLUSDT"]);
         assert_eq!(d.removed, ["ETHUSDT"]);
         // A symbol that stops trading leaves the set.
         b[1].trading = false;
-        let (tc, _) = SymbolTable::build(&b, &al, &[]);
+        let (tc, _) = SymbolTable::build(&b, &al);
         assert_eq!(tb.diff(&tc).removed, ["SOLUSDT"]);
         assert!(ta.diff(&ta).is_empty());
     }

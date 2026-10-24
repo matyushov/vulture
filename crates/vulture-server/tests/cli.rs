@@ -186,6 +186,30 @@ fn run_without_a_redis_url_fails_with_a_clear_message() {
 }
 
 #[test]
+fn a_corrupt_state_file_refuses_to_start() {
+    let data = data_dir("corrupt-state");
+    std::fs::create_dir_all(&data).unwrap();
+    for content in ["{ not json", r#"{"version":2,"exchanges":{}}"#] {
+        std::fs::write(std::path::Path::new(&data).join("state.json"), content).unwrap();
+        let cfg = temp_file(
+            "corrupt_state.toml",
+            &format!(
+                "[server]\nlisten_addr = \"127.0.0.1:0\"\ndata_dir = {data:?}\n\
+                 [metrics]\nlisten_addr = \"127.0.0.1:0\"\n[redis]\nurl = \"redis://127.0.0.1:1\"\n"
+            ),
+        );
+        let out = Command::new(BIN)
+            .args(["run", "--config"])
+            .arg(&cfg)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("state file"), "{err}");
+    }
+}
+
+#[test]
 fn a_bad_redis_url_is_rejected_without_echoing_it() {
     let cfg = temp_file(
         "bad_redis.toml",

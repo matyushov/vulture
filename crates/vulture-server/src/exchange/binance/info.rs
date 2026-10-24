@@ -13,6 +13,7 @@ use super::rate::RateState;
 use super::status::BinanceStatus;
 use super::symbols::SymbolTable;
 use crate::normalize::{BaseAliases, parse_binance_exchange_info};
+use crate::symbols::SymbolChannel;
 
 /// REST path of the symbol list (weight 1, S-1).
 pub const EXCHANGE_INFO_PATH: &str = "/fapi/v1/exchangeInfo";
@@ -23,7 +24,8 @@ pub struct InfoLoader {
     pub rate: Arc<RateState>,
     pub status: Arc<BinanceStatus>,
     pub aliases: Arc<BaseAliases>,
-    pub whitelist: Vec<String>,
+    /// Receives the universe (every normalized name) after each load.
+    pub symbols: Arc<SymbolChannel>,
     pub tuning: BinanceTuning,
     pub tx: watch::Sender<Option<Arc<SymbolTable>>>,
     pub shutdown: CancellationToken,
@@ -89,7 +91,7 @@ impl InfoLoader {
             other => return Err(format!("HTTP {other}")),
         }
         let metas = parse_binance_exchange_info(&response.body).map_err(|e| e.to_string())?;
-        let (table, report) = SymbolTable::build(&metas, &self.aliases, &self.whitelist);
+        let (table, report) = SymbolTable::build(&metas, &self.aliases);
         if table.is_empty() && metas.is_empty() {
             return Err("exchangeInfo contains no symbols".into());
         }
@@ -129,6 +131,9 @@ impl InfoLoader {
                 }
             }
         }
+        // The table is the whole universe; the owner's policy is applied by the consumers.
+        self.symbols
+            .publish_universe(table.entries().iter().map(|e| e.symbol.clone()).collect());
         self.tx.send_replace(Some(Arc::new(table)));
         Ok(())
     }

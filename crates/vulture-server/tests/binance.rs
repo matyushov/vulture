@@ -25,6 +25,7 @@ use vulture_server::exchange::binance::{
 };
 use vulture_server::exchange::{Exchange, ExchangeError};
 use vulture_server::normalize::BaseAliases;
+use vulture_server::symbols::{Mode, SymbolChannel, SymbolPolicy};
 use vulture_server::ws::{BoxedConnection, Clock, ConnectError, MaxAge, WsConnector, WsProfile};
 
 // ---------------------------------------------------------------------------------------------
@@ -387,6 +388,7 @@ struct Rig {
     shutdown: CancellationToken,
     handle: JoinHandle<Result<(), ExchangeError>>,
     ws: Arc<MockWs>,
+    symbols: Arc<SymbolChannel>,
 }
 
 fn config(whitelist: &[&str], interval: u64) -> BinanceConfig {
@@ -419,6 +421,9 @@ fn start_with(
         connector = connector.with_profile_hook(h);
     }
     let status = connector.status();
+    let symbols = connector
+        .symbols()
+        .expect("Binance supports symbol policies");
     let ctx = AppContext::new(Config::default(), shutdown.clone());
     let (tx, rx) = mpsc::channel(100_000);
     let handle = tokio::spawn(async move { connector.run(ctx, tx).await });
@@ -428,6 +433,7 @@ fn start_with(
         shutdown,
         handle,
         ws,
+        symbols,
     }
 }
 
@@ -1488,6 +1494,309 @@ async fn whitelist_limits_polling_and_liquidations() {
     rig.oi_events(3).await;
     assert!(http.oi_requests().iter().all(|r| r.1.contains("ETHUSDT")));
     assert_eq!(rig.count(|s| &s.liquidations_filtered), 1);
+    rig.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Runtime symbol policy (V1-11)
+// ---------------------------------------------------------------------------------------------
+
+fn policy(mode: Mode, symbols: &[&str]) -> SymbolPolicy {
+    SymbolPolicy::new(mode, symbols).unwrap()
+}
+
+/// Mock WebSocket: marks for the given symbols every second and, every second, one liquidation per symbol with
+/// a unique timestamp (so the manager's duplicate filter never swallows one).
+fn ticking_ws(marks: &[(&str, &str)], liq_symbols: &'static [&'static str]) -> Arc<MockWs> {
+    let marks = mark_frame(marks);
+    MockWs::new(
+        vec![],
+        script(move |mut ws, _| {
+            let marks = marks.clone();
+            async move {
+                if !handshake(&mut ws, None).await {
+                    return;
+                }
+                let mut timer = tokio::time::interval(Duration::from_secs(1));
+                let mut tick = 0i64;
+                loop {
+                    tokio::select! {
+                        incoming = ws.next() => match incoming {
+                            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                            Some(Ok(_)) => {}
+                        },
+                        _ = timer.tick() => {
+                            tick += 1;
+                            if ws.send(Message::text(marks.clone())).await.is_err() {
+                                return;
+                            }
+                            for (i, s) in liq_symbols.iter().enumerate() {
+                                let t = 1_000 * tick + i as i64;
+                                if ws.send(Message::text(force_order(s, "SELL", "100", "1", t))).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    )
+}
+
+fn drain(rig: &mut Rig) -> Vec<Event> {
+    let mut v = Vec::new();
+    while let Ok(e) = rig.rx.try_recv() {
+        v.push(e);
+    }
+    v
+}
+
+fn count_symbol(events: &[Event], raw: &str) -> (usize, usize) {
+    let mut oi = 0;
+    let mut liq = 0;
+    for e in events {
+        match &e.payload {
+            Some(Payload::OpenInterest(o)) if o.symbol_raw == raw => oi += 1,
+            Some(Payload::Liquidation(l)) if l.symbol_raw == raw => liq += 1,
+            _ => {}
+        }
+    }
+    (oi, liq)
+}
+
+const THREE: [&str; 3] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+
+fn three() -> Vec<Sym> {
+    vec![
+        ("BTCUSDT", "BTC", "USDT"),
+        ("ETHUSDT", "ETH", "USDT"),
+        ("SOLUSDT", "SOL", "USDT"),
+    ]
+}
+
+#[tokio::test(start_paused = true)]
+async fn removing_and_adding_a_symbol_takes_effect_without_gaps_or_duplicates() {
+    let http = standard_http(vec![info_body(&three())], KNOWN.to_vec(), "1", |r| r);
+    let mut rig = start(
+        config(&[], 30),
+        ticking_ws(
+            &[("BTCUSDT", "1"), ("ETHUSDT", "1"), ("SOLUSDT", "1")],
+            &THREE,
+        ),
+        http.clone(),
+    );
+    // Everything flows under the default policy ALL.
+    rig.oi_events(3).await;
+    assert_eq!(rig.symbols.universe().unwrap().len(), 3);
+    assert_eq!(rig.symbols.tracked_count(), 3);
+    let (mut seen_eth_liq, mut seen_btc_liq) = (false, false);
+    while !(seen_eth_liq && seen_btc_liq) {
+        let l = rig.next_liq().await;
+        seen_eth_liq |= l.symbol_raw == "ETHUSDT";
+        seen_btc_liq |= l.symbol_raw == "BTCUSDT";
+    }
+
+    // Remove ETH.
+    let removed_at = Instant::now() - http.start;
+    rig.symbols
+        .set_policy(policy(Mode::Blacklist, &["ETH-USDT-PERP"]));
+    let filtered_before = rig.count(|s| &s.liquidations_filtered);
+    sleep(Duration::from_secs(2)).await;
+    drain(&mut rig);
+    sleep(Duration::from_secs(95)).await;
+    let events = drain(&mut rig);
+    let (eth_oi, eth_liq) = count_symbol(&events, "ETHUSDT");
+    assert_eq!((eth_oi, eth_liq), (0, 0), "events of the removed symbol");
+    let (btc_oi, btc_liq) = count_symbol(&events, "BTCUSDT");
+    let (sol_oi, sol_liq) = count_symbol(&events, "SOLUSDT");
+    // 95 s at 15 s per symbol slot... three cycles of two symbols (30 s each): about 3 snapshots each.
+    assert!(
+        (2..=4).contains(&btc_oi) && (2..=4).contains(&sol_oi),
+        "{btc_oi} {sol_oi}"
+    );
+    assert!(btc_liq >= 90 && sol_liq >= 90, "{btc_liq} {sol_liq}");
+    // No gap, no duplicate liquidation (timestamps are unique per symbol).
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.payload, Some(Payload::Gap(_))))
+    );
+    let mut ts = std::collections::HashSet::new();
+    for e in &events {
+        if let Some(Payload::Liquidation(l)) = &e.payload {
+            assert!(
+                ts.insert((l.symbol_raw.clone(), l.exchange_ts)),
+                "duplicate {l:?}"
+            );
+        }
+    }
+    assert!(rig.count(|s| &s.liquidations_filtered) > filtered_before + 90);
+    // Nothing was requested for ETH after the change (the first cycle may have had it already queued: none
+    // starts later than one slot after the change).
+    let late_eth = http
+        .oi_requests()
+        .into_iter()
+        .filter(|(t, p)| p.contains("ETHUSDT") && *t > removed_at + Duration::from_secs(1))
+        .count();
+    assert_eq!(late_eth, 0);
+
+    // Add ETH again: both streams resume, the others keep flowing.
+    rig.symbols.set_policy(SymbolPolicy::all());
+    sleep(Duration::from_secs(2)).await;
+    drain(&mut rig);
+    sleep(Duration::from_secs(65)).await;
+    let events = drain(&mut rig);
+    let (eth_oi, eth_liq) = count_symbol(&events, "ETHUSDT");
+    assert!(eth_oi >= 1, "ETH open interest resumed: {eth_oi}");
+    assert!(eth_liq >= 60, "ETH liquidations resumed: {eth_liq}");
+    assert!(count_symbol(&events, "BTCUSDT").1 >= 60);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.payload, Some(Payload::Gap(_))))
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_interval_follows_the_tracked_count() {
+    // 2400 symbols need 100 s; tracking two of them goes back to the configured 30 s.
+    let big: Vec<Sym> = (0..2400)
+        .map(|i| usdt(Box::leak(format!("B{i:04}USDT").into_boxed_str())))
+        .collect();
+    let known: Vec<&'static str> = big.iter().map(|s| s.0).collect();
+    let http = standard_http(vec![info_body(&big)], known, "1", |r| r);
+    let mut rig = start(config(&[], 30), quiet_ws(&[("B0000USDT", "1")]), http);
+    rig.next_oi().await;
+    assert_eq!(rig.count(|s| &s.oi_interval_ms), 100_000);
+    rig.symbols.set_policy(policy(
+        Mode::Whitelist,
+        &["B0001-USDT-PERP", "B0002-USDT-PERP"],
+    ));
+    assert_eq!(rig.symbols.tracked_count(), 2);
+    sleep(Duration::from_secs(200)).await;
+    assert_eq!(rig.count(|s| &s.oi_interval_ms), 30_000);
+    let events = drain(&mut rig);
+    let late: Vec<_> = events
+        .iter()
+        .rev()
+        .take(4)
+        .filter_map(|e| match &e.payload {
+            Some(Payload::OpenInterest(o)) => Some(o.symbol_raw.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        late.iter().all(|s| s == "B0001USDT" || s == "B0002USDT"),
+        "{late:?}"
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_hourly_reload_respects_a_blacklist() {
+    let (a, b, c) = (
+        vec![("BTCUSDT", "BTC", "USDT"), ("ETHUSDT", "ETH", "USDT")],
+        // ETH is delisted, SOL is new.
+        vec![("BTCUSDT", "BTC", "USDT"), ("SOLUSDT", "SOL", "USDT")],
+        // ETH is listed again.
+        three(),
+    );
+    let http = standard_http(
+        vec![info_body(&a), info_body(&b), info_body(&c)],
+        KNOWN.to_vec(),
+        "1",
+        |r| r,
+    );
+    let tuning = BinanceTuning {
+        info_reload_interval: Duration::from_secs(100),
+        ..BinanceTuning::default()
+    };
+    let mut rig = start_with(
+        config(&[], 10),
+        tuning,
+        quiet_ws(&[("BTCUSDT", "1")]),
+        http.clone(),
+        Some(fast_ws_profile),
+    );
+    rig.symbols
+        .set_policy(policy(Mode::Blacklist, &["ETH-USDT-PERP"]));
+    sleep(Duration::from_secs(40)).await;
+    assert_eq!(
+        rig.symbols.tracked_count(),
+        1,
+        "only BTC under the blacklist"
+    );
+    sleep(Duration::from_secs(100)).await;
+    // Second load: ETH gone, SOL new and tracked automatically.
+    assert_eq!(rig.symbols.universe().unwrap().len(), 2);
+    assert_eq!(rig.symbols.tracked_count(), 2);
+    drain(&mut rig);
+    sleep(Duration::from_secs(100)).await;
+    // Third load: ETH is back but stays excluded.
+    assert_eq!(rig.symbols.universe().unwrap().len(), 3);
+    assert_eq!(rig.symbols.tracked_count(), 2);
+    let events = drain(&mut rig);
+    assert_eq!(count_symbol(&events, "ETHUSDT").0, 0);
+    assert!(count_symbol(&events, "SOLUSDT").0 >= 1);
+    assert!(http.info_requests() >= 3);
+    assert!(
+        http.oi_requests()
+            .iter()
+            .all(|(_, p)| !p.contains("ETHUSDT")),
+        "ETH was polled"
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_policy_applies_before_the_symbol_list_has_loaded() {
+    // exchangeInfo never answers: liquidations use the strict name parsing, and the policy still filters.
+    let http = MockHttp::new(|path, _| {
+        if path.starts_with("/fapi/v1/exchangeInfo") {
+            Reply::hang()
+        } else {
+            Reply::ok("{}")
+        }
+    });
+    let plan = Plan {
+        marks: Some(mark_frame(&[("BTCUSDT", "1")])),
+        frames: vec![
+            force_order("BTCUSDT", "SELL", "100", "1", 1_000),
+            force_order("ETHUSDT", "SELL", "100", "1", 2_000),
+        ],
+        close_after: false,
+    };
+    let mut rig = start(
+        config(&[], 30),
+        MockWs::new(vec![], plan_script(plan, None)),
+        http,
+    );
+    rig.symbols
+        .set_policy(policy(Mode::Whitelist, &["BTC-USDT-PERP"]));
+    assert_eq!(rig.next_liq().await.symbol_raw, "BTCUSDT");
+    sleep(Duration::from_secs(2)).await;
+    assert_eq!(rig.count(|s| &s.liquidations_filtered), 1);
+    assert!(rig.symbols.universe().is_none());
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_empty_tracked_set_idles_and_resumes() {
+    let http = standard_http(vec![info_body(&btc_eth())], KNOWN.to_vec(), "1", |r| r);
+    let mut rig = start(config(&[], 30), quiet_ws(&[("BTCUSDT", "1")]), http.clone());
+    rig.next_oi().await;
+    rig.symbols
+        .set_policy(policy(Mode::Blacklist, &["BTC-USDT-PERP", "ETH-USDT-PERP"]));
+    sleep(Duration::from_secs(5)).await;
+    drain(&mut rig);
+    let before = http.oi_requests().len();
+    sleep(Duration::from_secs(120)).await;
+    assert_eq!(http.oi_requests().len(), before, "nothing is polled");
+    assert!(rig.rx.try_recv().is_err());
+    rig.symbols.set_policy(SymbolPolicy::all());
+    rig.oi_events(2).await;
     rig.stop().await;
 }
 

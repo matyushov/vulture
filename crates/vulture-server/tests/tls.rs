@@ -48,6 +48,7 @@ impl TlsServer {
             keepalive_timeout: Duration::from_secs(10),
             limiter: LimiterConfig::default(),
             stream: test_stream_config(),
+            symbols: None,
         };
         let task = tokio::spawn({
             let (store, reloader, shutdown) = (backend.store(), reloader.clone(), shutdown.clone());

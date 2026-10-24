@@ -1,10 +1,11 @@
-//! The gRPC server (V1-6, V1-7): `Stream.Subscribe` with resume, stubs for `History` and `Control`, all behind
-//! the bearer token interceptor.
+//! The gRPC server (V1-6, V1-7, V1-11): `Stream.Subscribe` with resume, the symbol RPCs of `Control`, a stub for
+//! `History` and `UNIMPLEMENTED` for the rest of `Control`, all behind the bearer token interceptor.
 //!
 //! With `[tls]` the listener serves TLS ([`crate::tls`], certificate hot reload) on any address. Without it the
 //! server accepts only a loopback bind unless `server.allow_plaintext` is set, because the token would travel
 //! unencrypted. HTTP/2 keepalive drops clients that vanished without closing the connection.
 
+mod control;
 mod stats;
 mod stream;
 mod stub;
@@ -23,11 +24,12 @@ use vulture_proto::v1::control_server::ControlServer;
 use vulture_proto::v1::history_server::HistoryServer;
 use vulture_proto::v1::stream_server::StreamServer;
 
+pub use control::ControlService;
 pub use stats::{GrpcSnapshot, GrpcStats};
 pub use stream::{
     ClientStream, Filter, Start, StreamConfig, StreamService, ZERO_ID, resolve_start,
 };
-pub use stub::{ControlStub, HistoryStub};
+pub use stub::HistoryStub;
 
 use crate::auth::{
     AuthInterceptor, AuthStats, FailureLimiter, LimiterConfig, TokenAuthority, TokenError,
@@ -35,6 +37,7 @@ use crate::auth::{
 };
 use crate::config::ServerConfig;
 use crate::store::RedisStore;
+use crate::symbols::SymbolManager;
 use crate::tls::TlsReloader;
 
 /// Why the gRPC server could not start or stopped abnormally.
@@ -118,6 +121,8 @@ pub struct ServeOptions {
     pub limiter: LimiterConfig,
     /// Stream service settings.
     pub stream: StreamConfig,
+    /// Backend of the symbol RPCs of `Control`; without it they answer `UNIMPLEMENTED` like the rest.
+    pub symbols: Option<Arc<SymbolManager>>,
 }
 
 impl ServeOptions {
@@ -128,6 +133,7 @@ impl ServeOptions {
             keepalive_timeout: Duration::from_secs(server.keepalive_timeout_secs),
             limiter: LimiterConfig::default(),
             stream: StreamConfig::from_server(server),
+            symbols: None,
         }
     }
 }
@@ -211,7 +217,9 @@ where
         .layer(InterceptorLayer::new(interceptor))
         .add_service(StreamServer::new(stream))
         .add_service(HistoryServer::new(HistoryStub))
-        .add_service(ControlServer::new(ControlStub))
+        .add_service(ControlServer::new(ControlService::new(
+            options.symbols.clone(),
+        )))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
         .await?;
     Ok(())
@@ -249,6 +257,7 @@ pub async fn start(
     tls: Option<Arc<TlsReloader>>,
     store: Arc<dyn RedisStore>,
     authority: Arc<TokenAuthority>,
+    symbols: Option<Arc<SymbolManager>>,
     shutdown: CancellationToken,
 ) -> Result<GrpcHandle, GrpcError> {
     let tls_enabled = tls.is_some();
@@ -275,7 +284,8 @@ pub async fn start(
             shutdown.clone(),
             running.clone(),
         );
-        let options = ServeOptions::from_server(server);
+        let mut options = ServeOptions::from_server(server);
+        options.symbols = symbols;
         async move {
             let result = match tls {
                 Some(tls) => {
