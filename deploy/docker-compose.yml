@@ -4,7 +4,7 @@
 #   cp .env.example .env            # set REDIS_PASSWORD
 #   docker compose build
 #   docker compose up -d
-#   docker compose exec vulture vulture-server token show --config /etc/vulture/config.toml   # no shell needed
+#   cat data/token                  # the access token is a plain file on the host (see VULTURE_DATA_DIR below)
 #
 # Ports are published to 127.0.0.1 of the host unless you change VULTURE_*_BIND in .env. Redis and ClickHouse are
 # never published (the server reaches them over the compose network).
@@ -13,7 +13,19 @@
 #   COMPOSE_PROFILES=clickhouse
 #   VULTURE_CLICKHOUSE_ENABLED=true
 # and run `docker compose up -d`. Without it nothing changes: no flusher, the Redis stream is trimmed by time only.
+#
+# State on the host: ${VULTURE_DATA_DIR:-./data} is bind-mounted at /var/lib/vulture and holds `token` (the access
+# token, created on the first start, never overwritten), `state.json` and `audit.log`. Read or change the token by
+# reading or editing data/token; the running server picks the change up. The container runs as
+# ${VULTURE_UID:-65532}:${VULTURE_GID:-65532}: the directory must be writable by that user (see deploy/README.md).
 name: vulture
+
+# Docker keeps container logs forever by default. Rotate them for every service.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
 
 services:
   vulture:
@@ -22,6 +34,10 @@ services:
       context: ..
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    # The owner's own ids make data/token readable and editable without sudo. The TLS files must be readable by
+    # the same ids (VULTURE_TLS_OWNER in deploy/certbot/vulture-deploy-hook.sh).
+    user: "${VULTURE_UID:-65532}:${VULTURE_GID:-65532}"
     depends_on:
       redis:
         condition: service_healthy
@@ -36,7 +52,9 @@ services:
       VULTURE__CLICKHOUSE__USER: vulture
       VULTURE__CLICKHOUSE__PASSWORD: ${CLICKHOUSE_PASSWORD:-}
     volumes:
-      - vulture-data:/var/lib/vulture
+      # A host directory, not a named volume, and the directory, not the single file: Docker would create a
+      # directory for a missing file. Create it yourself (see deploy/README.md) or Docker creates it as root.
+      - ${VULTURE_DATA_DIR:-./data}:/var/lib/vulture
       - ./config.docker.toml:/etc/vulture/config.toml:ro
       - ${VULTURE_TLS_DIR:-./tls}:/etc/vulture/tls:ro
     ports:
@@ -56,6 +74,7 @@ services:
   redis:
     image: redis:7.4
     restart: unless-stopped
+    logging: *default-logging
     # AOF with everysec fsync; a full Redis refuses writes (the writer buffers) instead of evicting history.
     # The password comes from the environment at run time, not from the command line.
     command:
@@ -84,6 +103,7 @@ services:
     profiles: ["clickhouse"]
     image: clickhouse/clickhouse-server:25.8
     restart: unless-stopped
+    logging: *default-logging
     environment:
       CLICKHOUSE_DB: vulture
       CLICKHOUSE_USER: vulture
@@ -124,7 +144,6 @@ services:
     # If you must publish a port, bind it to loopback only: ["127.0.0.1:8123:8123"].
 
 volumes:
-  vulture-data:
   redis-data:
   clickhouse-data:
   clickhouse-backups:

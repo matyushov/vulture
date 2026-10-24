@@ -2,7 +2,8 @@
 #
 # vulture-server image. Multi-stage: build with the Rust toolchain, run on a small distroless base as a
 # non-root user. Nothing secret is baked in: the configuration is mounted read-only at /etc/vulture/config.toml,
-# the access token lives in the /var/lib/vulture volume and is created only when it does not exist yet.
+# the access token lives in /var/lib/vulture (a host directory bind-mounted by the compose file) and is created only
+# when it does not exist yet.
 #
 #   docker build -t vulture-server .
 #

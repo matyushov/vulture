@@ -1,5 +1,6 @@
 //! The token a running server checks requests against.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -32,7 +33,14 @@ pub struct TokenAuthority {
     current: RwLock<Current>,
     generation_tx: watch::Sender<u64>,
     /// Whether the last refresh failed, to log a persistent problem once instead of every poll.
-    degraded: std::sync::atomic::AtomicBool,
+    degraded: AtomicBool,
+    /// Fingerprint of the last rejected file content, so one bad edit is logged and counted once, not at every
+    /// poll.
+    rejected_fingerprint: AtomicU64,
+    /// Tokens taken over from the file after startup.
+    file_changes: AtomicU64,
+    /// Edits of the file that were rejected because the content is not a valid token.
+    invalid_edits: AtomicU64,
 }
 
 impl TokenAuthority {
@@ -47,8 +55,21 @@ impl TokenAuthority {
                 generation: 1,
             }),
             generation_tx,
-            degraded: std::sync::atomic::AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
+            rejected_fingerprint: AtomicU64::new(0),
+            file_changes: AtomicU64::new(0),
+            invalid_edits: AtomicU64::new(0),
         }))
+    }
+
+    /// How many times a changed token was taken over from the file since start.
+    pub fn file_changes(&self) -> u64 {
+        self.file_changes.load(Ordering::Relaxed)
+    }
+
+    /// How many edits of the file were rejected as invalid since start.
+    pub fn invalid_edits(&self) -> u64 {
+        self.invalid_edits.load(Ordering::Relaxed)
     }
 
     /// Current generation.
@@ -79,9 +100,10 @@ impl TokenAuthority {
     /// Re-reads the file and switches to the token found there if it differs from the one in use. A missing or
     /// broken file keeps the current token (the server never invents a token at run time).
     pub fn refresh(&self) -> RefreshOutcome {
-        use std::sync::atomic::Ordering;
-        match self.store.read_required() {
-            Ok(token) => {
+        let (result, fingerprint) = self.store.read_fingerprinted();
+        match result {
+            Ok(Some(token)) => {
+                self.rejected_fingerprint.store(0, Ordering::Relaxed);
                 if self.degraded.swap(false, Ordering::Relaxed) {
                     tracing::info!("token file readable again");
                 }
@@ -93,8 +115,39 @@ impl TokenAuthority {
                     RefreshOutcome::Unchanged
                 } else {
                     self.install(token);
+                    self.file_changes.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        generation = self.generation(),
+                        "token changed from file; streams opened with the old token are ending"
+                    );
                     RefreshOutcome::Rotated
                 }
+            }
+            Ok(None) => {
+                if !self.degraded.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        path = %self.store.path().display(),
+                        "token file is missing; keeping the token in use (it is not recreated while running)"
+                    );
+                }
+                RefreshOutcome::Kept
+            }
+            Err(TokenError::Malformed(path)) => {
+                self.degraded.store(true, Ordering::Relaxed);
+                // Count and log a given bad content once, however many polls see it.
+                if self
+                    .rejected_fingerprint
+                    .swap(fingerprint, Ordering::Relaxed)
+                    != fingerprint
+                {
+                    self.invalid_edits.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        path = %path.display(),
+                        "token file edit rejected: not a valid token (at least {} characters from A-Z a-z 0-9 - _); keeping the previous token",
+                        super::store::MIN_TOKEN_LEN
+                    );
+                }
+                RefreshOutcome::Kept
             }
             Err(e) => {
                 if !self.degraded.swap(true, Ordering::Relaxed) {
@@ -118,9 +171,6 @@ impl TokenAuthority {
                     let this = self.clone();
                     // File I/O off the async worker threads.
                     match tokio::task::spawn_blocking(move || this.refresh()).await {
-                        Ok(RefreshOutcome::Rotated) => {
-                            tracing::info!(generation = self.generation(), "token rotated; streams opened with the old token are ending");
-                        }
                         Ok(_) => {}
                         Err(e) => tracing::error!(error = %e, "token refresh task failed"),
                     }

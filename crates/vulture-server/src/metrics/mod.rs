@@ -17,7 +17,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub use families::Families;
 pub use server::{MetricsError, Readiness, bind, healthcheck, serve};
-pub use sources::{AuthMetrics, GrpcMetrics, RedisSampler, WriterMetrics};
+pub use sources::{AuthMetrics, GrpcMetrics, RedisSampler, TokenFileMetrics, WriterMetrics};
 
 /// Something that can report its counters.
 pub trait MetricSource: Send + Sync {

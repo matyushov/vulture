@@ -14,8 +14,9 @@ pub const TOKEN_FILE: &str = "token";
 
 /// Number of random bytes in a generated token.
 const TOKEN_BYTES: usize = 32;
-/// Shortest token accepted from the file (a hand-written token is allowed, a trivial one is not).
-const MIN_TOKEN_LEN: usize = 16;
+/// Shortest token accepted from the file or from `token set` (a hand-written token is allowed, a trivial one
+/// is not). Generated tokens are 43 characters.
+pub const MIN_TOKEN_LEN: usize = 32;
 
 /// Failure of a token file operation. Messages never contain the token.
 #[derive(Debug, thiserror::Error)]
@@ -25,7 +26,7 @@ pub enum TokenError {
     Missing(PathBuf),
     /// The file exists but does not hold a usable token.
     #[error(
-        "the token file {0} is empty or malformed (expected at least {MIN_TOKEN_LEN} URL-safe characters)"
+        "the token in {0} is empty or malformed (expected at least {MIN_TOKEN_LEN} characters from A-Z a-z 0-9 - _)"
     )]
     Malformed(PathBuf),
     /// The OS random generator failed.
@@ -73,7 +74,9 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-fn valid_token(text: &str) -> bool {
+/// Whether `text` (already trimmed) is an acceptable token: at least [`MIN_TOKEN_LEN`] characters, only
+/// base64url characters (`A-Z a-z 0-9 - _`).
+pub fn valid_token(text: &str) -> bool {
     text.len() >= MIN_TOKEN_LEN
         && text
             .bytes()
@@ -103,16 +106,27 @@ impl TokenStore {
 
     /// The stored token, or `None` when there is no file.
     pub fn read(&self) -> Result<Option<Secret>, TokenError> {
+        self.read_fingerprinted().0
+    }
+
+    /// Like [`TokenStore::read`], plus a fingerprint of the file content (0 when there is none), so that a
+    /// watcher can tell a new bad edit from the same bad content seen again. The fingerprint is not
+    /// cryptographic and is never logged.
+    pub(crate) fn read_fingerprinted(&self) -> (Result<Option<Secret>, TokenError>, u64) {
+        use std::hash::{Hash, Hasher};
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(self.io("cannot read", source)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Ok(None), 0),
+            Err(source) => return (Err(self.io("cannot read", source)), 0),
         };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let fingerprint = hasher.finish();
         let token = text.trim();
         if !valid_token(token) {
-            return Err(TokenError::Malformed(self.path.clone()));
+            return (Err(TokenError::Malformed(self.path.clone())), fingerprint);
         }
-        Ok(Some(Secret::new(token)))
+        (Ok(Some(Secret::new(token))), fingerprint)
     }
 
     /// The stored token; [`TokenError::Missing`] when there is none.
@@ -145,14 +159,25 @@ impl TokenStore {
     /// Replaces the token with a new one (creating the file if needed) and returns it. The replacement is an
     /// atomic rename, so readers see either the old or the new token, never a partial file.
     pub fn rotate(&self) -> Result<Secret, TokenError> {
-        self.ensure_dir()?;
         let token = generate_token()?;
-        let tmp = self.write_temp(&token)?;
+        self.set(&token)?;
+        Ok(token)
+    }
+
+    /// Stores `token` (creating the file if needed) with an atomic rename and mode `0600`. The value is
+    /// validated first with the same rules as a hand edit; an invalid value is refused and the file stays as
+    /// it was. The error never contains the value.
+    pub fn set(&self, token: &Secret) -> Result<(), TokenError> {
+        if !valid_token(token.expose()) {
+            return Err(TokenError::Malformed(self.path.clone()));
+        }
+        self.ensure_dir()?;
+        let tmp = self.write_temp(token)?;
         if let Err(source) = std::fs::rename(&tmp, &self.path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(self.io("cannot replace", source));
         }
-        Ok(token)
+        Ok(())
     }
 
     /// A description of too wide permissions (Unix), for a startup warning; `None` when fine or unknown.
@@ -327,11 +352,107 @@ mod tests {
             }
         }
         // A hand-written token of acceptable shape works; surrounding whitespace is ignored.
-        std::fs::write(store.path(), "  my-own_token-0123456789  \n").unwrap();
+        std::fs::write(store.path(), "  my-own_token-0123456789-abcdefghij  \n").unwrap();
         assert_eq!(
             store.read_required().unwrap().expose(),
-            "my-own_token-0123456789"
+            "my-own_token-0123456789-abcdefghij"
         );
+    }
+
+    #[test]
+    fn an_existing_token_is_never_overwritten_by_create() {
+        let dir = temp();
+        let store = TokenStore::new(dir.path());
+        let mine = "owner-chosen_token-0123456789-ABCDEFGHIJ\n";
+        std::fs::write(store.path(), mine).unwrap();
+        let Created::Existing(token) = store.create_if_missing().unwrap() else {
+            panic!("expected the existing token");
+        };
+        assert_eq!(token.expose(), mine.trim());
+        assert_eq!(std::fs::read_to_string(store.path()).unwrap(), mine);
+    }
+
+    #[test]
+    fn an_invalid_existing_file_is_an_error_and_stays_untouched() {
+        let dir = temp();
+        let store = TokenStore::new(dir.path());
+        for bad in [
+            "",
+            "tooshort",
+            "contains spaces inside the token value 1234",
+        ] {
+            std::fs::write(store.path(), bad).unwrap();
+            let err = store.create_if_missing().unwrap_err();
+            assert!(matches!(err, TokenError::Malformed(_)));
+            assert!(!err.to_string().contains(bad) || bad.is_empty());
+            assert_eq!(std::fs::read_to_string(store.path()).unwrap(), bad);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_an_error_not_a_new_token() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp();
+        let store = TokenStore::new(dir.path());
+        let content = "unreadable_token-0123456789-ABCDEFGHIJKLMN";
+        std::fs::write(store.path(), content).unwrap();
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(store.path()).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        let err = store.create_if_missing().unwrap_err();
+        assert!(matches!(err, TokenError::Io { .. }), "{err}");
+        assert!(!err.to_string().contains(content));
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(store.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn set_validates_and_writes_atomically() {
+        let dir = temp();
+        let store = TokenStore::new(&dir.path().join("data"));
+        let good = Secret::new("set-by-owner_0123456789-ABCDEFGHIJKLMNOP");
+        store.set(&good).unwrap();
+        assert_eq!(store.read_required().unwrap(), good);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        for bad in [
+            "",
+            "short",
+            "has a space inside but is long enough to pass",
+            "slash/in/the/middle-0123456789ABCDEFGH",
+            "padding=0123456789012345678901234567890",
+        ] {
+            let err = store.set(&Secret::new(bad)).unwrap_err();
+            assert!(matches!(err, TokenError::Malformed(_)));
+            assert!(!err.to_string().contains(bad) || bad.is_empty());
+            assert_eq!(
+                store.read_required().unwrap(),
+                good,
+                "the file is untouched"
+            );
+        }
+        let names: Vec<_> = std::fs::read_dir(store.path().parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["token".to_string()], "no temporary files");
+    }
+
+    #[test]
+    fn length_boundary_is_32_characters() {
+        assert!(!valid_token(&"a".repeat(31)));
+        assert!(valid_token(&"a".repeat(32)));
+        assert!(valid_token(&format!("{}-_", "A9".repeat(15))));
     }
 
     #[test]

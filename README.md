@@ -401,16 +401,28 @@ CSPRNG, base64url (43 characters), stored in `<server.data_dir>/token` (file mod
   The trade-off: anyone who can read the file (or a backup or image containing `data_dir`) can use the service, so the
   file is protected like a TLS private key. If it leaks, run `token rotate`.
 - `vulture-server token show --config <file>` prints the token to stdout (only the token, so `$(...)` is safe).
-  `token rotate` writes a new one and prints it; the old one stops working at once. A running server notices a
-  rotation done by the CLI within `server.token_check_interval_ms` (1 s) and ends the open streams that used the old
-  token with `UNAUTHENTICATED`. `token create` creates the token only if there is none and prints it once to stderr.
-  A deleted file is never regenerated silently: only `token create` or the first start of the server do that.
+  `token rotate` writes a new random one and prints it; `token set` reads a token of your choice from **stdin** (never
+  from the command line) and stores it atomically with mode `0600`. The old token stops working at once.
+- **The file is the interface.** In Docker the data directory is a host directory (`deploy/data` by default,
+  `VULTURE_DATA_DIR`), so the owner reads the token with `cat data/token` and changes it by editing the file. A
+  running server polls the file every `server.token_check_interval_ms` (1 s). New content is trimmed (whitespace and
+  the trailing newline) and must have at least 32 characters from `A-Z a-z 0-9 - _`; then the server switches to it,
+  ends the open streams that used the old token with `UNAUTHENTICATED` and logs `token changed from file` (never the
+  value). An invalid edit is rejected: the previous token stays active, the error is logged and
+  `vulture_token_file_invalid_edits_total` counts it (`vulture_token_file_changes_total` counts accepted changes).
+- **Start and deletion.** A missing file is created at start (`token create` does the same on demand). An existing
+  file is used as is and never overwritten; an unreadable or invalid one stops the start with a message that does not
+  show its content. A file deleted while the server runs does not disable authentication: the last good token stays
+  in memory, a warning is logged and the file is not recreated until the next start.
+- **Banner only on a terminal.** The one-time banner with the token goes to stderr only when stderr is an interactive
+  terminal. In Docker or systemd the log has a single line with the file's path and no value.
+- `vulture-server config check` also validates `state.json` and, when present, the token file (valid content, a
+  warning if group or others can read it), without printing secrets.
 - Clients send `authorization: Bearer <token>`. The comparison is constant-time. A missing, malformed or wrong
   token gives `UNAUTHENTICATED`; after 10 failures per minute from one peer address, further *failed* attempts from
   it get `RESOURCE_EXHAUSTED` until the failures age out. The limiter only slows down guessing: **a correct token is
   never refused**, not even from an address that has failed before (the owner cannot be locked out). Failures are
-  logged with the peer address and the reason, never with the presented value. The token never appears in logs, errors or panics; the first
-  creation prints it once to stderr in a banner.
+  logged with the peer address and the reason, never with the presented value. The token never appears in logs, errors or panics.
 
 ### `Stream.Subscribe`
 

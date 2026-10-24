@@ -27,23 +27,97 @@ docker compose ps                 # both services become healthy
 By default both ports are published to `127.0.0.1` of the host only: gRPC `50051` (plaintext, see below) and
 metrics `9100`. Redis is not published at all; only the vulture container reaches it.
 
-### The access token
+### The data directory and the access token
 
-On the first start the server creates the token in the `vulture-data` volume (`/var/lib/vulture/token`, mode `0600`)
-and prints it once to the container log. Show it again at any time (the image has no shell, so call the binary):
+The server keeps its state in one host directory, bind-mounted at `/var/lib/vulture` (`VULTURE_DATA_DIR` in `.env`,
+default `./data` next to the compose file). Create it before the first start, otherwise Docker creates it owned by
+root and the server cannot write to it:
+
+```sh
+cd deploy
+mkdir -p data
+# Default: the container user (65532) owns it. Reading data/token then needs sudo.
+sudo chown 65532:65532 data && sudo chmod 700 data
+# Or run the container as yourself, then no sudo is needed to read or edit the token. In .env:
+#   VULTURE_UID=<output of `id -u`>   VULTURE_GID=<output of `id -g`>
+# and no chown at all (a directory you created is already yours).
+```
+
+| file in the data directory | what it is | mode |
+|---|---|---|
+| `token` | the access token, one line, clear text | `0600` |
+| `state.json` | symbol policies set at runtime (versioned) | `0600` |
+| `audit.log`, `audit.log.1` | JSON lines of every policy change, rotated at 4 MiB | `0600` |
+
+**First start.** If `data/token` does not exist the server creates it (32 random bytes, base64url, 43 characters,
+mode `0600`). If it exists it is used as it is and **never overwritten**. A file that is unreadable or not a valid
+token stops the start with a message that names the file and never shows its content. Without a terminal (Docker,
+systemd) the token is not printed anywhere: the log has one line saying where the file is. Only a run on an
+interactive terminal (`token create`, or the server started by hand) prints a one-time banner.
+
+**Read it.** On the host: `cat data/token`. Or through the container, which needs no host permissions:
 
 ```sh
 docker compose exec vulture vulture-server token show --config /etc/vulture/config.toml
 ```
 
-Treat the token like a password; the volume and its backups are secret too. `token rotate` replaces it (the old
-one stops working at once). The image never contains a token and the server never overwrites an existing one, so
-upgrades keep it.
+**Change it.** Any of these; a running server notices within `server.token_check_interval_ms` (1 s by default),
+switches to the new token and ends the streams opened with the old one (clients get `UNAUTHENTICATED`):
+
+```sh
+# 1. Edit the file (the permissions the editor leaves are not important for the server, but keep 0600):
+$EDITOR data/token
+# 2. Set a token you chose, read from stdin (it never appears on a command line):
+printf '%s' 'your-own-token-at-least-32-chars-A-Za-z0-9_-' | docker compose exec -T vulture vulture-server token set --config /etc/vulture/config.toml
+# 3. Generate a new random one and print it:
+docker compose exec vulture vulture-server token rotate --config /etc/vulture/config.toml
+```
+
+An edited token is trimmed (surrounding whitespace and the trailing newline are ignored) and must have at least 32
+characters from `A-Z a-z 0-9 - _`. Anything else is rejected: the previous token stays active, the server logs
+`token file edit rejected` (without the content) and `vulture_token_file_invalid_edits_total` counts it. A
+successful change is logged as `token changed from file` and counted in `vulture_token_file_changes_total`. If the
+file is deleted while the server runs, authentication keeps working with the last good token (a warning is
+logged) and the file is not recreated until the next start.
+
+**Permissions and backups.** The token is a bearer credential stored in clear text: treat `data/` like a TLS
+private key. Keep it `0600` in a `0700` directory; `vulture-server config check` warns when the token file is
+readable by group or others. Back up the whole directory (the token with `state.json`) with the same care as any
+secret, and rotate the token if a backup leaks. The image never contains a token.
+
+### Migrating from the named volume (`vulture_vulture-data`)
+
+Earlier versions kept these files in the Docker volume `vulture_vulture-data` (the project name `vulture` plus the
+volume name). To move them to a host directory, run on the server, from `deploy/`. Add the same `-f` arguments to
+every `docker compose` command if you use the TLS override. Nothing is deleted until step 7.
+
+1. Remember the token to compare later and see what is there:
+   `docker compose exec -T vulture vulture-server token show --config /etc/vulture/config.toml | sha256sum`
+   and `docker run --rm -v vulture_vulture-data:/v:ro alpine:3 ls -la /v`.
+2. Pull the new compose files and `.env.example`; add `VULTURE_DATA_DIR`, `VULTURE_UID` and `VULTURE_GID` to your
+   `.env` (see below for the values). Check: `docker compose config -q`.
+3. Stop the stack, keeping the volumes (never `-v`): `docker compose down`.
+4. Create the target and copy with ownership and modes preserved (the helper runs as root inside the container):
+   ```sh
+   mkdir -p data
+   docker run --rm -v vulture_vulture-data:/from:ro -v "$PWD/data":/to alpine:3 cp -a /from/. /to/
+   ```
+5. Decide who owns `data/` and say so in `.env`. Either keep the container user: leave `VULTURE_UID=65532` and
+   `VULTURE_GID=65532` (the copied files already belong to it; read the token with sudo). Or use your own user:
+   `sudo chown -R "$(id -u):$(id -g)" data`, then set `VULTURE_UID` and `VULTURE_GID` to `id -u` and `id -g`. In
+   the second case the TLS files must be readable by the same ids: `sudo chown <uid>:<gid> <tls dir>/*.pem` (or
+   renew once with `VULTURE_TLS_OWNER=<uid>:<gid>` set for the certbot hook; see `certbot/README.md`).
+6. Start and verify: `docker compose up -d`, `docker compose ps` (healthy), then `sha256sum < data/token` equals the
+   hash from step 1 (use `sudo` if the directory is not yours), `ls -la data` shows `token`, `state.json` and
+   `audit.log`, and a client with the old token still connects. The log shows no `token file created` line.
+7. Only after you have checked that everything works, remove the old volume: `docker volume rm vulture_vulture-data`.
+   To go back before this step, restore the previous compose files and `.env` and `docker compose up -d`; the old
+   volume is untouched.
 
 ### Try it
 
 ```sh
-export VULTURE_TOKEN=$(docker compose exec -T vulture vulture-server token show --config /etc/vulture/config.toml)
+export VULTURE_TOKEN=$(cat data/token)
 cargo run -p vulture-server --example stream_client -- --endpoint http://127.0.0.1:50051 --resume-from 0 --max-events 10
 ```
 
@@ -53,8 +127,8 @@ cargo run -p vulture-server --example stream_client -- --endpoint http://127.0.0
 git pull && docker compose build && docker compose up -d
 ```
 
-Only the image changes. The volumes (`vulture-data` with the token, `redis-data` with the stream) are kept, so the
-token and the 24-hour hot window survive. Open streams end with `UNAVAILABLE` during the restart and clients resume
+Only the image changes. The data directory (`data/` with the token) and the `redis-data` volume with the stream are
+kept, so the token and the 24-hour hot window survive. Open streams end with `UNAVAILABLE` during the restart and clients resume
 from their last event id.
 
 ## TLS
@@ -63,7 +137,7 @@ Without `[tls]` the gRPC connection is plaintext: the compose setup keeps it on 
 tunnel or a TLS-terminating proxy to reach it from elsewhere). To serve TLS directly:
 
 1. Get a certificate (`certbot/README.md`), so that `fullchain.pem` and `privkey.pem` are in a directory readable by
-   uid `65532` (the container user), for example `/etc/vulture/tls` (the certbot hook maintains it).
+   `VULTURE_UID:VULTURE_GID` (65532 by default, the container user; with your own ids set `VULTURE_TLS_OWNER` for the hook), for example `/etc/vulture/tls` (the certbot hook maintains it).
 2. In `.env` set `VULTURE_TLS_DIR=/etc/vulture/tls`.
 3. Start with the TLS override: `docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d`. It mounts
    `config.docker.tls.toml` (`[tls]` enabled, `allow_plaintext = false`; uncomment `client_ca` there for mTLS) and
@@ -89,6 +163,11 @@ Manual reload: `docker compose kill -s HUP vulture` (compose; add `-f docker-com
 docker-compose.tls.yml` and `--project-directory <dir>` when you run it from another directory, as the certbot hook
 does through `VULTURE_COMPOSE_FILE` and `VULTURE_COMPOSE_DIR`) or `systemctl reload vulture` (systemd). A `SIGHUP`
 is harmless when TLS is off.
+
+## Container logs
+
+Every service in the compose files logs with the `json-file` driver limited to 5 files of 50 MB, so Docker's logs
+cannot fill the disk. The access token is never logged. `docker compose logs -f vulture` follows the server.
 
 ## Metrics
 
@@ -116,9 +195,9 @@ Set `VULTURE_RELOAD=systemd` for the certbot hook.
 The `symbols` list of an `[[exchanges]]` entry is only the **default** policy (empty = every symbol). The owner
 changes it at runtime with the `Control` gRPC service (`ListSymbolPolicies`, `SetSymbolPolicy`; try
 `cargo run -p vulture-server --example control_client -- --endpoint ... list`). What the owner sets is stored in
-`/var/lib/vulture/state.json` (mode `0600`, versioned) in the data volume and overrides the configuration default
+`/var/lib/vulture/state.json` (`data/state.json` on the host, mode `0600`, versioned) in the data directory and overrides the configuration default
 of that exchange from then on; every change is also appended to `/var/lib/vulture/audit.log` (JSON lines, rotated
-at 4 MiB to `audit.log.1`). Both files live in the `vulture-data` volume next to the token: they survive upgrades
+at 4 MiB to `audit.log.1`). Both files live in the data directory next to the token: they survive upgrades
 and are never overwritten by the image, and they belong in the backups. A damaged or unknown-version
 `state.json` stops the server from starting with an explanatory message (it does not fall back to the
 configuration, which could re-enable symbols you removed): fix or delete the file deliberately.

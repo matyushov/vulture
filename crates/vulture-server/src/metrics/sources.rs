@@ -152,6 +152,26 @@ impl MetricSource for AuthMetrics {
     }
 }
 
+/// The token file watcher's counters.
+pub struct TokenFileMetrics(pub Arc<crate::auth::TokenAuthority>);
+
+impl MetricSource for TokenFileMetrics {
+    fn collect(&self, out: &mut Families) {
+        out.counter(
+            "vulture_token_file_changes_total",
+            "Tokens taken over from the token file after start (a hand edit or `token set`/`token rotate` run elsewhere).",
+            &[],
+            self.0.file_changes(),
+        );
+        out.counter(
+            "vulture_token_file_invalid_edits_total",
+            "Edits of the token file rejected because the content is not a valid token; the previous token stays active.",
+            &[],
+            self.0.invalid_edits(),
+        );
+    }
+}
+
 /// Length and age of the Redis stream, sampled periodically (these need Redis round trips, so they are not
 /// done at scrape time).
 #[derive(Default)]

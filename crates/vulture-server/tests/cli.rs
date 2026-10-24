@@ -159,17 +159,20 @@ fn run_without_exchanges_stops_on_sigterm() {
     assert!(stdout.contains("metrics endpoint listening"), "{stdout}");
     assert!(stdout.contains("SIGHUP received"), "{stdout}");
 
-    // First start: the token was created, shown once on stderr and never logged.
+    // First start without a terminal (the test captures stderr): the token file is created, the value is
+    // neither printed nor logged, and one line says where the file is.
     let token = std::fs::read_to_string(std::path::Path::new(&data).join("token")).unwrap();
     let token = token.trim();
     assert_eq!(token.len(), 43);
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
     assert!(
-        stderr.contains(token),
-        "the first-start banner shows the token: {stderr}"
+        !stderr.contains(token),
+        "no banner without a terminal: {stderr}"
     );
     assert!(!stdout.contains(token), "the token must not be logged");
+    assert!(stdout.contains("access token file created"), "{stdout}");
+    assert!(stdout.contains(&data), "the path is logged: {stdout}");
 }
 
 #[test]
@@ -247,7 +250,9 @@ fn token_commands_create_show_and_rotate() {
     assert!(out.stdout.is_empty());
     let on_disk = std::fs::read_to_string(&file).unwrap();
     let token = on_disk.trim().to_string();
-    assert!(String::from_utf8_lossy(&out.stderr).contains(&token));
+    // Not a terminal here: the path is announced, the value is not.
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&token));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(file.to_str().unwrap()));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -408,4 +413,192 @@ fn healthcheck_fails_when_nothing_listens_and_succeeds_against_the_endpoint() {
     });
     assert!(run_bin(&["healthcheck"], &cfg).status.success());
     assert!(server.join().unwrap().starts_with("GET /healthz "));
+}
+
+fn token_set(config: &std::path::Path, input: &str) -> std::process::Output {
+    let mut child = Command::new(BIN)
+        .args(["token", "set", "--config"])
+        .arg(config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn token_set_reads_stdin_validates_and_writes_privately() {
+    let (cfg, file) = token_config("token-set");
+    let mine = "owner-chosen_token-0123456789-ABCDEFGHIJ";
+
+    // Valid: stored with a newline, mode 0600, nothing echoed.
+    let out = token_set(&cfg, &format!("{mine}\n"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(mine));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(mine));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{mine}\n"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&token_cmd("show", &cfg).stdout),
+        format!("{mine}\n")
+    );
+
+    // Invalid input fails, says why without the value, and leaves the file alone.
+    for bad in [
+        "",
+        "\n",
+        "short",
+        "contains spaces, which are not allowed here at all",
+    ] {
+        let out = token_set(&cfg, bad);
+        assert!(!out.status.success(), "{bad:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("not valid"), "{err}");
+        assert!(bad.trim().is_empty() || !err.contains(bad.trim()), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{mine}\n"));
+    }
+}
+
+fn server_config(name: &str, data: &str) -> PathBuf {
+    temp_file(
+        name,
+        &format!(
+            "[server]\nlisten_addr = \"127.0.0.1:0\"\ndata_dir = {data:?}\n\
+             [metrics]\nlisten_addr = \"127.0.0.1:0\"\n[redis]\nurl = \"redis://127.0.0.1:1\"\n"
+        ),
+    )
+}
+
+#[test]
+fn run_refuses_to_start_with_an_invalid_token_file_and_leaves_it_alone() {
+    let data = data_dir("bad-token-run");
+    std::fs::create_dir_all(&data).unwrap();
+    let file = std::path::Path::new(&data).join("token");
+    for content in [
+        "",
+        "short",
+        "has spaces inside but is certainly long enough",
+    ] {
+        std::fs::write(&file, content).unwrap();
+        let out = Command::new(BIN)
+            .args(["run", "--config"])
+            .arg(server_config("bad_token_run.toml", &data))
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("malformed"), "{err}");
+        assert!(content.is_empty() || !err.contains(content), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+    }
+}
+
+fn config_check(config: &std::path::Path) -> std::process::Output {
+    Command::new(BIN)
+        .args(["config", "check", "--config"])
+        .arg(config)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn config_check_validates_state_json_and_the_token_file() {
+    let data = data_dir("check-files");
+    std::fs::create_dir_all(&data).unwrap();
+    let dir = std::path::Path::new(&data);
+    let cfg = server_config("check_files.toml", &data);
+
+    // Empty data directory: fine, nothing is created.
+    let out = config_check(&cfg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(std::fs::read_dir(dir).unwrap().next().is_none());
+
+    // Good state and token.
+    std::fs::write(
+        dir.join("state.json"),
+        r#"{"version":1,"exchanges":{"binance":{"mode":"whitelist","symbols":["BTC-USDT-PERP"]}}}"#,
+    )
+    .unwrap();
+    let secret = "check-token_0123456789-ABCDEFGHIJKLMNOP";
+    std::fs::write(dir.join("token"), format!("{secret}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("token"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    let out = config_check(&cfg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("state OK") && stdout.contains("token OK"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(secret));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("warning"));
+
+    // A token readable by others is a warning, not an error, and the value is not printed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("token"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let out = config_check(&cfg);
+        assert!(out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("warning") && err.contains("644"), "{err}");
+        assert!(!err.contains(secret));
+    }
+
+    // Broken state files and tokens fail with a readable message.
+    for content in [
+        "{ not json",
+        r#"{"version":2,"exchanges":{}}"#,
+        r#"{"exchanges":{}}"#,
+        r#"{"version":1,"exchanges":{"binance":{"mode":"sometimes","symbols":[]}}}"#,
+        r#"{"version":1,"exchanges":{"binance":{"mode":"whitelist","symbols":["not a symbol!"]}}}"#,
+    ] {
+        std::fs::write(dir.join("state.json"), content).unwrap();
+        let out = config_check(&cfg);
+        assert!(!out.status.success(), "{content}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("state file"),
+            "{content}"
+        );
+    }
+    std::fs::remove_file(dir.join("state.json")).unwrap();
+    for bad in ["", "short", "bad token with spaces, long enough though!"] {
+        std::fs::write(dir.join("token"), bad).unwrap();
+        let out = config_check(&cfg);
+        assert!(!out.status.success(), "{bad:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("malformed"), "{err}");
+        assert!(bad.is_empty() || !err.contains(bad), "{err}");
+    }
 }

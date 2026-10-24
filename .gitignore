@@ -22,3 +22,5 @@ __pycache__/
 !.env.example
 !deploy/.env.example
 deploy/tls/
+# the access token and the server state live here when the compose default is used
+deploy/data/

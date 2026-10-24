@@ -53,6 +53,21 @@ service is addressed by its compose name `vulture` (`VULTURE_SERVICE` to change 
 'VULTURE_RELOAD=systemd /etc/letsencrypt/renewal-hooks/deploy/vulture-deploy-hook.sh'` or export them in a
 wrapper.
 
+### Ownership checklist (compose)
+
+The container reads the TLS files as `VULTURE_UID:VULTURE_GID` from `deploy/.env` (65532 by default). Whatever
+those ids are, the hook must write the files with the same ids, otherwise the server cannot read them:
+
+1. Pick the ids: the defaults `65532:65532`, or your own (`id -u`, `id -g`) if you want to read and edit
+   `data/token` without sudo.
+2. Put them in `deploy/.env` as `VULTURE_UID` and `VULTURE_GID`.
+3. Give the hook the same pair: `VULTURE_TLS_OWNER=<uid>:<gid>` (default `65532:65532`), for example in the
+   `--deploy-hook` command or the wrapper script.
+4. Fix the files that exist now: `sudo chown <uid>:<gid> /etc/vulture/tls/*.pem` (the hook does this on the next
+   renewal; run `sudo certbot renew --force-renewal --deploy-hook ...` once if you do not want to wait).
+5. Restart the container so it runs as the new user: `docker compose up -d` (the user is part of the container
+   configuration), then `docker compose run --rm --no-deps vulture tls check --config /etc/vulture/config.toml`.
+
 ## 3. Check
 
 ```sh

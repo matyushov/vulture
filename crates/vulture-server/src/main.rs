@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use std::io::Read as _;
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
@@ -84,6 +86,14 @@ enum TokenCommand {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Replace the token with one read from stdin (never from the command line, so it stays out of the shell
+    /// history and the process list). Validated like a hand edit; written atomically with mode 0600. A running
+    /// server notices within `server.token_check_interval_ms`.
+    Set {
+        /// Path to the TOML configuration file (for `server.data_dir`).
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Create the token if it does not exist yet (and print it once, to stderr). Does nothing if it exists.
     Create {
         /// Path to the TOML configuration file (for `server.data_dir`).
@@ -119,9 +129,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn token(command: TokenCommand) -> anyhow::Result<()> {
-    use vulture_server::auth::{Created, TokenStore, print_created_banner};
+    use vulture_server::auth::{Created, TokenStore, announce_created};
     let (TokenCommand::Show { config }
     | TokenCommand::Rotate { config }
+    | TokenCommand::Set { config }
     | TokenCommand::Create { config }) = &command;
     let config = Config::load(config)?;
     let store = TokenStore::new(&config.server.data_dir);
@@ -134,8 +145,27 @@ fn token(command: TokenCommand) -> anyhow::Result<()> {
             println!("{}", store.rotate()?.expose());
             eprintln!("token rotated; the previous token no longer works");
         }
+        TokenCommand::Set { .. } => {
+            let token = read_token_from(&mut std::io::stdin().lock())?;
+            store.set(&token)?;
+            eprintln!(
+                "token stored in {}; a running server switches to it within its check interval",
+                store.path().display()
+            );
+        }
         TokenCommand::Create { .. } => match store.create_if_missing()? {
-            Created::New(token) => print_created_banner(&token, store.path()),
+            Created::New(token) => {
+                let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+                if tty {
+                    announce_created(&token, store.path(), true, &mut std::io::stderr());
+                } else {
+                    // No terminal: never print the value into a log; say where it is.
+                    eprintln!(
+                        "token file created at {}; read it with `token show` or `cat` on the host",
+                        store.path().display()
+                    );
+                }
+            }
             Created::Existing(_) => eprintln!(
                 "a token already exists at {}; use `token show` to read it or `token rotate` to replace it",
                 store.path().display()
@@ -143,6 +173,25 @@ fn token(command: TokenCommand) -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+/// Reads a new token from `input` (at most 4 KiB; surrounding whitespace is dropped) and validates it. The
+/// error never contains what was read.
+fn read_token_from(
+    input: &mut dyn std::io::Read,
+) -> anyhow::Result<vulture_server::config::Secret> {
+    use vulture_server::auth::{MIN_TOKEN_LEN, valid_token};
+    let mut text = String::new();
+    input
+        .take(4096)
+        .read_to_string(&mut text)
+        .context("cannot read the token from stdin")?;
+    let token = text.trim();
+    anyhow::ensure!(
+        valid_token(token),
+        "the token read from stdin is not valid (expected at least {MIN_TOKEN_LEN} characters from A-Z a-z 0-9 - _); the token file was not changed"
+    );
+    Ok(vulture_server::config::Secret::new(token))
 }
 
 fn check(path: PathBuf) -> anyhow::Result<()> {
@@ -161,11 +210,36 @@ fn check(path: PathBuf) -> anyhow::Result<()> {
     if config.tls.is_some() {
         tls_report(&config)?;
     }
+    data_dir_report(&config)?;
     println!(
         "config OK: {} exchange(s), {} enabled",
         config.exchanges.len(),
         config.enabled_exchanges().count()
     );
+    Ok(())
+}
+
+/// Checks the files in `server.data_dir` that already exist: `state.json` must be readable, of a known version
+/// and hold valid policies; the token file must hold a valid token and should not be readable by others. A
+/// missing file is fine (the server creates it). Nothing secret is printed: only paths and reasons.
+fn data_dir_report(config: &Config) -> anyhow::Result<()> {
+    let dir = &config.server.data_dir;
+    let state = vulture_server::symbols::StateStore::new(dir);
+    let policies = state.load()?;
+    if state.path().exists() {
+        println!(
+            "state OK: {} with {} exchange polic(ies)",
+            state.path().display(),
+            policies.policies.len()
+        );
+    }
+    let token = vulture_server::auth::TokenStore::new(dir);
+    if token.read()?.is_some() {
+        println!("token OK: {}", token.path().display());
+        if let Some(problem) = token.permission_problem() {
+            eprintln!("warning: {problem}");
+        }
+    }
     Ok(())
 }
 

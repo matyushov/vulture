@@ -7,7 +7,8 @@
 #
 # Configuration through the environment (defaults in brackets):
 #   VULTURE_TLS_DIR    directory the server reads cert and key from       [/etc/vulture/tls]
-#   VULTURE_TLS_OWNER  owner of the copied files, user:group or uid:gid   [65532:65532, the container user]
+#   VULTURE_TLS_OWNER  owner of the copied files, user:group or uid:gid   [65532:65532, the default container user;
+#                     use the same ids as VULTURE_UID:VULTURE_GID in deploy/.env]
 #   VULTURE_RELOAD     "docker" (compose) or "systemd"                     [docker]
 #   VULTURE_COMPOSE_FILE  compose file(s) for docker mode, space-separated  [docker compose default lookup]
 #   VULTURE_COMPOSE_DIR   --project-directory for docker mode (where .env lives) [unset]

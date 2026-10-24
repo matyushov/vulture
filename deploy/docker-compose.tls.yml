@@ -3,14 +3,14 @@
 #   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
 #
 # It switches the server to config.docker.tls.toml (TLS enabled, plaintext off), mounts the certificate directory
-# (VULTURE_TLS_DIR in .env, readable by uid 65532; deploy/certbot maintains it) and publishes the gRPC port on
+# (VULTURE_TLS_DIR in .env, readable by VULTURE_UID:VULTURE_GID, 65532 by default; deploy/certbot maintains it) and publishes the gRPC port on
 # VULTURE_GRPC_BIND, which defaults to all interfaces here because the port is encrypted. Open it in your firewall
 # deliberately. Metrics stay on loopback unless VULTURE_METRICS_BIND says otherwise. Needs Docker Compose 2.24+
 # (the !override tag).
 services:
   vulture:
     volumes:
-      - vulture-data:/var/lib/vulture
+      - ${VULTURE_DATA_DIR:-./data}:/var/lib/vulture
       - ./config.docker.tls.toml:/etc/vulture/config.toml:ro
       - ${VULTURE_TLS_DIR:-./tls}:/etc/vulture/tls:ro
     ports: !override

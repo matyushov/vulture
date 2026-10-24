@@ -13,7 +13,7 @@ use crate::history::{
     ClickHouseMonitor, FlusherMetrics, FlusherStatus, HistorySetup, Watermark, build_client,
 };
 use crate::metrics::{
-    AuthMetrics, GrpcMetrics, MetricsHub, Readiness, RedisSampler, WriterMetrics,
+    AuthMetrics, GrpcMetrics, MetricsHub, Readiness, RedisSampler, TokenFileMetrics, WriterMetrics,
 };
 use crate::normalize::{AliasError, BaseAliases};
 use crate::store::{RedisClientStore, RedisStore, RedisWriter, WriterConfig};
@@ -155,10 +155,12 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
     // Token first (a broken data_dir should stop the start), then the listener (a refused bind as well).
     let (authority, created) = crate::grpc::open_token(&ctx.config.server)?;
     if let Some(token) = created {
-        tracing::info!(path = %TokenStore::new(&ctx.config.server.data_dir).path().display(), "access token created on first start");
-        crate::auth::print_created_banner(
+        let path = TokenStore::new(&ctx.config.server.data_dir);
+        crate::auth::announce_created(
             &token,
-            TokenStore::new(&ctx.config.server.data_dir).path(),
+            path.path(),
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+            &mut std::io::stderr(),
         );
     }
     let tls = match &ctx.config.tls {
@@ -189,6 +191,7 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
     .await?;
     hub.register(Arc::new(GrpcMetrics(grpc.stats.clone())));
     hub.register(Arc::new(AuthMetrics(grpc.auth_stats.clone())));
+    hub.register(Arc::new(TokenFileMetrics(grpc.authority.clone())));
     match &tls {
         Some(tls) => {
             hub.register(tls.clone());

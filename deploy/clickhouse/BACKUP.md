@@ -16,7 +16,7 @@ keys come from the environment or secret files, never from files in the reposito
 ## What to back up
 
 1. **The ClickHouse database** (`vulture`): the history. This is the part that matters.
-2. **The `vulture-data` volume** (`/var/lib/vulture`): `token` (the owner's access token), `state.json` (the symbol
+2. **The data directory** (`data/` next to the compose file, or `VULTURE_DATA_DIR`; `/var/lib/vulture` in the container): `token` (the owner's access token), `state.json` (the symbol
    policies set at runtime) and `audit.log` (their history). Losing the token only means issuing a new one; losing
    `state.json` resets the tracked symbols to the configuration default. These files are secrets or owner decisions:
    back them up encrypted and keep them apart from the ClickHouse backups if those go to a third party.

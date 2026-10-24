@@ -283,6 +283,130 @@ async fn rotation_by_another_process_is_picked_up_from_the_file() {
     server.stop().await;
 }
 
+const HAND_TOKEN: &str = "hand-written_token-0123456789-ABCDEFGHIJ";
+
+#[tokio::test]
+async fn a_hand_edit_of_the_file_applies_and_ends_old_streams() {
+    let backend = Backend::memory();
+    let server = Server::start(&backend, test_stream_config()).await;
+    let old = server.token.clone();
+    let mut client = server.client().await;
+    let mut stream = client.subscribe(request("")).await.unwrap().into_inner();
+
+    // The owner edits the file with an editor: surrounding whitespace and a trailing newline are ignored.
+    std::fs::write(server.token_store.path(), format!("  {HAND_TOKEN} \n\n")).unwrap();
+    let (_, status) = final_status(&mut stream).await;
+    assert_eq!(status.code(), Code::Unauthenticated);
+    assert_eq!(
+        server
+            .client_with(Auth::bearer(&old))
+            .await
+            .subscribe(request(""))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    assert!(
+        server
+            .client_with(Auth::bearer(HAND_TOKEN))
+            .await
+            .subscribe(request(""))
+            .await
+            .is_ok()
+    );
+    assert_eq!(server.authority.file_changes(), 1);
+    assert_eq!(server.authority.invalid_edits(), 0);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_invalid_edit_is_rejected_counted_once_and_the_old_token_stays() {
+    let backend = Backend::memory();
+    let server = Server::start(&backend, test_stream_config()).await;
+    let old = server.token.clone();
+    let mut client = server.client().await;
+    let mut stream = client.subscribe(request("")).await.unwrap().into_inner();
+
+    // Too short, then forbidden characters. Each distinct bad content is counted once however often it is polled.
+    std::fs::write(server.token_store.path(), "short").unwrap();
+    wait_until("the bad edit to be counted", || {
+        server.authority.invalid_edits() == 1
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await; // several polls (20 ms each)
+    assert_eq!(server.authority.invalid_edits(), 1);
+    std::fs::write(
+        server.token_store.path(),
+        "has spaces inside and is long enough to pass the length rule",
+    )
+    .unwrap();
+    wait_until("the second bad edit to be counted", || {
+        server.authority.invalid_edits() == 2
+    })
+    .await;
+
+    // Nothing changed for clients: the old token works and the open stream is alive.
+    assert_eq!(server.authority.generation(), 1);
+    assert!(
+        server
+            .client_with(Auth::bearer(&old))
+            .await
+            .subscribe(request(""))
+            .await
+            .is_ok()
+    );
+    backend.append(&numbered(1)).await;
+    recv(&mut stream, 1).await;
+
+    // Fixing the file takes effect.
+    std::fs::write(server.token_store.path(), HAND_TOKEN).unwrap();
+    let (_, status) = final_status(&mut stream).await;
+    assert_eq!(status.code(), Code::Unauthenticated);
+    assert_eq!(server.authority.file_changes(), 1);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_file_deleted_while_running_keeps_authentication_and_is_not_recreated() {
+    let backend = Backend::memory();
+    let server = Server::start(&backend, test_stream_config()).await;
+    let old = server.token.clone();
+    std::fs::remove_file(server.token_store.path()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !server.token_store.path().exists(),
+        "never recreated at run time"
+    );
+    assert!(
+        server
+            .client_with(Auth::bearer(&old))
+            .await
+            .subscribe(request(""))
+            .await
+            .is_ok(),
+        "the last good token still works"
+    );
+    assert_eq!(
+        server
+            .client_with(Auth::bearer("wrong"))
+            .await
+            .subscribe(request(""))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated,
+        "authentication is not disabled"
+    );
+    // Writing the file back (a new token) is picked up.
+    std::fs::write(server.token_store.path(), HAND_TOKEN).unwrap();
+    wait_until("the new file to be used", || {
+        server.authority.generation() == 2
+    })
+    .await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn repeated_failures_from_one_address_are_limited() {
     let backend = Backend::memory();
@@ -436,6 +560,16 @@ async fn no_token_reaches_the_logs() {
     let valid = server.token.clone();
     let rotated = server.authority.rotate().unwrap();
     final_status(&mut stream).await;
+    // A hand edit and a rejected edit, with values unique to this test.
+    let hand = "LOGCHECK-hand-edited-token-0123456789-abcdef";
+    let bad = "LOGCHECK bad edit with spaces that is long enough";
+    std::fs::write(server.token_store.path(), hand).unwrap();
+    wait_until("the hand edit", || server.authority.generation() == 3).await;
+    std::fs::write(server.token_store.path(), bad).unwrap();
+    wait_until("the rejected edit", || {
+        server.authority.invalid_edits() == 1
+    })
+    .await;
     server.stop().await;
 
     let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
@@ -444,6 +578,8 @@ async fn no_token_reaches_the_logs() {
         "failures are logged:\n{logs}"
     );
     assert!(logs.contains("127.0.0.1"), "with the peer address:\n{logs}");
+    assert!(logs.contains("token changed from file"), "{logs}");
+    assert!(logs.contains("token file edit rejected"), "{logs}");
     assert!(logs.contains("missing") && logs.contains("wrong") && logs.contains("malformed"));
     for secret in [
         wrong,
@@ -451,6 +587,8 @@ async fn no_token_reaches_the_logs() {
         valid.as_str(),
         rotated.expose(),
         created.expose(),
+        hand,
+        "LOGCHECK",
     ] {
         assert!(
             !logs.contains(secret),
