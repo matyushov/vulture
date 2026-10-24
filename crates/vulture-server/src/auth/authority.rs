@@ -114,8 +114,10 @@ impl TokenAuthority {
                 if same {
                     RefreshOutcome::Unchanged
                 } else {
-                    self.install(token);
+                    // Count first: installing the token ends the open streams, and an observer that sees
+                    // a stream end must already see the change counted.
                     self.file_changes.fetch_add(1, Ordering::Relaxed);
+                    self.install(token);
                     tracing::info!(
                         generation = self.generation(),
                         "token changed from file; streams opened with the old token are ending"
