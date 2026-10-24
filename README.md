@@ -8,10 +8,10 @@ open interest normalization, reconnecting WebSocket manager), the Binance USDT-M
 writer (24-hour hot window), the gRPC `Stream.Subscribe` with resume and the owner token, TLS with certificate hot
 reload, Prometheus metrics, tracked symbols managed at runtime (`Control.ListSymbolPolicies` /
 `SetSymbolPolicy`), and a Dockerfile with compose, certbot, systemd and Prometheus templates in `deploy/`.
-The Bybit linear connector (V2a) with runtime subscriptions and a connection budget in the WebSocket manager is
-implemented. ClickHouse history (schema, migrations, the Redis-to-ClickHouse flusher, disk monitoring, backups) is implemented;
+The Bybit linear connector (V2a) with runtime subscriptions and a connection budget in the WebSocket manager, and the
+OKX linear swap connector (V2b), are implemented. ClickHouse history (schema, migrations, the Redis-to-ClickHouse flusher, disk monitoring, backups) is implemented;
 `History.Query`/`Aggregate` and the rest of `Control` are in the contract but answer `UNIMPLEMENTED`, and the other
-exchanges except Bybit are not implemented yet. The server needs a Redis instance (`redis.url`); ClickHouse is optional
+exchanges except Bybit and OKX are not implemented yet. The server needs a Redis instance (`redis.url`); ClickHouse is optional
 (`[clickhouse]`). Deployment is described in [deploy/README.md](deploy/README.md).
 
 ## Components
@@ -196,6 +196,58 @@ overrides `ws_url` / `rest_url`. Formats and units were checked against the live
   `vulture_ws_connections_open`, `vulture_oi_samples_skipped_total`.
 - **Live check:** `cargo test -p vulture-server --test bybit -- --ignored bybit_live --nocapture` (about 75 s,
   not run in CI).
+
+### OKX connector (`exchange::okx`)
+
+Public data only, no keys. Settings in `[[exchanges]] name = "okx"`: `enabled`, `symbols` (default policy, as for
+Binance), `oi_poll_interval_secs` (default 30) and the optional test overrides `ws_url` / `rest_url`. The documentation
+was read in full and the formats checked against the live exchange on 2026-10-24 (`research/okx-live.md`, which also
+lists what is still unconfirmed).
+- **Symbols:** REST `GET /api/v5/public/instruments?instType=SWAP` (one response), at start and every hour:
+  `ctType = linear`, `state = live`, settled in USDT or USDC. The USD-margined `*-USD_UM-SWAP` family and the inverse
+  `*-USD-SWAP` contracts are excluded. `BTC-USDT-SWAP` becomes `BTC-USDT-PERP`, `BTC-USDC-SWAP` becomes
+  `BTC-USDC-PERP`. OKX names real coins (`PEPE`, with `ctVal` 10 000 000), so no price multiplier applies unless the
+  alias table (section `okx`) says so. An instrument whose contract size is missing, not positive or not expressed in the base
+  coin is dropped and logged (`vulture_unusable_instruments`). A 403 pauses REST for 10 minutes.
+- **WebSocket:** `wss://ws.okx.com/ws/v5/public` (port 443; OKX stops port 8443 on 2026-10-31). The channel
+  `liquidation-orders` is subscribed once with `instType = SWAP` on the first connection and covers every swap of the
+  exchange; records of untracked instruments are filtered here and counted. Per tracked instrument the channels
+  `mark-price` and `open-interest` are subscribed and unsubscribed at runtime as the policy changes (100 arguments per
+  request) and re-sent in full after every reconnect. One connection carries everything (OKX documents no cap per
+  connection); more are opened only above `max_topics_per_connection` (2 000 topics), within a connection budget of
+  half of OKX's 3 new connections per second. Keepalive: the text `ping` every 20 s, `pong` expected within 5 s; the
+  `mark-price` stream is the liveness stream (30 s of silence ends the session; OKX itself cuts after 30 s without data).
+- **Subscription budget:** OKX allows 480 subscribe/unsubscribe requests per hour and connection. Changes of the tracked
+  set wait 2 s for further changes and are then applied only if a sliding one-hour budget of 240 requests covers them,
+  otherwise they are postponed (`vulture_ws_changes_deferred_total`, gauge `vulture_ws_request_budget_spent`).
+  OKX answers a bad argument with an error naming it (code 60018) while the good ones of the same request are
+  subscribed; the connector rejects that topic only. Rejected topics are reported as for Bybit.
+- **Liquidations:** `sz` is in **contracts**: quantity = `sz x ctVal x ctMult` base coins, `price` = `bkPx`
+  ("liquidation mark price", OKX's price of the transaction with its liquidation account, not a fill price of the
+  user), `notional_usd = bkPx x quantity`, `exchange_ts` = `ts`. The side is the side of the liquidated position:
+  `posSide long`/`short` (hedge mode) gives `Long`/`Short`; in net mode (`posSide net`) the closing order tells: `sell`
+  closes a long (`Long`), `buy` closes a short. Details of one frame are separate events; repeated records (key
+  `instId|ts|side|posSide|sz|bkPx`) are dropped. **OKX states that the feed is not the total number of liquidations and
+  not in chronological order:** treat it as a lower bound.
+- **Open interest:** `open-interest` pushes `oi` (contracts), `oiCcy` (base coin) and `oiUsd` when the value changes
+  (the first push comes on subscribe); `mark-price` pushes `markPx`. The connector keeps the latest of each per
+  instrument and an interval sampler publishes one `OpenInterest` per tracked instrument every `oi_poll_interval_secs`,
+  spread evenly over the interval: `oi_base = oiCcy`, `oi_usd = oiUsd`, `mark_price` = the last `markPx`. A sample
+  whose `oiCcy` differs from `oi x ctVal x ctMult` by more than 1% is still published but counted
+  (`vulture_oi_unit_mismatch_total`; none in the live run). Instruments without data, or whose connection is down, are
+  skipped.
+- **Gaps:** as for Bybit: `Gap` events with the streams `liquidations` and `open_interest` after a connection loss,
+  never for a change of the tracked set.
+- **Status and metrics:** `OkxConnector::status()`; the series of the other connectors with `exchange="okx"`,
+  including `vulture_ws_*` (connections, topics, requests, budget) and `vulture_mark_price_age_seconds`.
+- **Live check:** `cargo test -p vulture-server --test okx -- --ignored okx_live --nocapture` (about 75 s, not run in
+  CI).
+
+### Choosing exchanges in a deployment
+
+The Docker configs enable Binance and carry commented `bybit` and `okx` entries. Keep an untracked copy
+(`deploy/config.local.toml`, ignored by git) and point `VULTURE_CONFIG_FILE` at it in `deploy/.env`; see
+[deploy/README.md](deploy/README.md).
 
 ## Redis storage
 

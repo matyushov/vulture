@@ -31,3 +31,18 @@ name = "binance"
 enabled = true
 symbols = []            # empty = every linear USDT/USDC perpetual
 oi_poll_interval_secs = 30
+
+# Optional exchanges. Uncomment and set enabled = true here, or (better) keep an untracked copy of this file, for
+# example config.local.toml, and point VULTURE_CONFIG_FILE at it in .env. Both exchanges are public-data only (no keys).
+#
+# [[exchanges]]
+# name = "bybit"
+# enabled = false
+# symbols = []            # empty = every linear USDT/USDC perpetual
+# oi_poll_interval_secs = 30
+#
+# [[exchanges]]
+# name = "okx"
+# enabled = false
+# symbols = []            # empty = every linear USDT/USDC swap
+# oi_poll_interval_secs = 30

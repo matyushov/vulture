@@ -7,7 +7,7 @@ git ignores (`*.example` templates are committed).
 | Path | What |
 |---|---|
 | `../Dockerfile` | multi-stage image of `vulture-server` (distroless, non-root) |
-| `docker-compose.yml`, `.env.example`, `config.docker.toml` | vulture + Redis (+ optional ClickHouse, profile `clickhouse`) |
+| `docker-compose.yml`, `.env.example`, `config.docker.toml` (`VULTURE_CONFIG_FILE` swaps the config) | vulture + Redis (+ optional ClickHouse, profile `clickhouse`) |
 | `clickhouse/` | ClickHouse server config, backup and restore scripts, `BACKUP.md` |
 | `docker-compose.tls.yml`, `config.docker.tls.toml` | override that turns TLS on (certificate mount, published gRPC port) |
 | `certbot/` | DNS-01 certificate with certbot and a deploy hook that reloads the server |
@@ -120,6 +120,24 @@ every `docker compose` command if you use the TLS override. Nothing is deleted u
 export VULTURE_TOKEN=$(cat data/token)
 cargo run -p vulture-server --example stream_client -- --endpoint http://127.0.0.1:50051 --resume-from 0 --max-events 10
 ```
+
+### Choosing the exchanges
+
+`config.docker.toml` enables Binance only and lists `bybit` and `okx` as commented, disabled entries. Do not edit the
+tracked file on a server (a `git pull` would conflict). Keep a local copy instead:
+
+```sh
+cp config.docker.toml config.local.toml     # matches deploy/config.local*.toml, which git ignores
+$EDITOR config.local.toml                   # uncomment the exchanges you want, enabled = true
+echo 'VULTURE_CONFIG_FILE=./config.local.toml' >> .env
+docker compose up -d
+```
+
+`VULTURE_CONFIG_FILE` is the path of the file mounted at `/etc/vulture/config.toml` (relative to the `deploy`
+directory, default `./config.docker.toml`; `./config.docker.tls.toml` with the TLS override, where your copy must keep
+the `[tls]` section). The file must exist before `up`, otherwise Docker creates a directory in its place. Which
+symbols are tracked can be changed later without restarting (section "Tracked symbols"); enabling or disabling an
+exchange itself needs a restart. Check what compose will mount: `docker compose config | grep config.toml`.
 
 ### Upgrade
 

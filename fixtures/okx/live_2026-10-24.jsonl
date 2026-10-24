@@ -1,0 +1,6 @@
+{"code":"0","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","oi":"3037369.61000001111","oiCcy":"30373.6961000001111","oiUsd":"2444201698.8631089403281","ts":"1792871723522"}],"msg":""}
+{"arg":{"channel":"mark-price","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","markPx":"80471.0","ts":"1792871725200"}]}
+{"arg":{"channel":"open-interest","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","oi":"3037354.33000001112","oiCcy":"30373.5433000001112","oiUsd":"2444186365.53997894836408","ts":"1792871730072"}]}
+{"arg":{"channel":"liquidation-orders","instType":"SWAP"},"data":[{"details":[{"bkLoss":"0","bkPx":"3.1994","ccy":"","posSide":"short","side":"buy","sz":"158","ts":"1792871748133"}],"instFamily":"LIT-USDT","instId":"LIT-USDT-SWAP","instType":"SWAP","uly":"LIT-USDT"}]}
+{"id":"p1","event":"subscribe","arg":{"channel":"mark-price","instId":"BTC-USDT-SWAP"},"connId":"40330d1e"}
+{"event":"error","msg":"Subscribe failed, wrong URL or channel:open-interest,instId:NOSUCHCOIN-USDT-SWAP doesn't exist. Please use the correct URL, channel and parameters referring to API document.","code":"60018","connId":"40330d1e","id":"p1"}

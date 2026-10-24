@@ -19,7 +19,6 @@
 
 mod info;
 mod metrics;
-mod shards;
 mod status;
 mod stream;
 mod tickers;
@@ -36,8 +35,8 @@ use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 use vulture_proto::v1::{Event, Gap, OpenInterest, event::Payload};
 
+pub use crate::ws::{ShardView, Shards};
 pub use info::INSTRUMENTS_PATH;
-pub use shards::{ShardView, Shards};
 pub use status::BybitStatus;
 pub use stream::{
     BybitHandler, DEFAULT_ARGS_LIMIT, LIQUIDATION_PREFIX, Liq, PING, TICKER_PREFIX,
@@ -53,8 +52,8 @@ use crate::config::ExchangeConfig;
 use crate::symbols::{SymbolChannel, SymbolPolicy};
 use crate::ws::{
     Clock, ConnectionLimiter, DEFAULT_BUDGET_FRACTION, LimiterConfig, PingConfig, PingMessage,
-    SystemClock, TopicControl, TungsteniteConnector, WsConnector, WsOptions, WsOutput, WsProfile,
-    spawn_ws_with,
+    ShardParts, SystemClock, TopicControl, TungsteniteConnector, WsConnector, WsOptions, WsOutput,
+    WsProfile, spawn_ws_with,
 };
 
 /// Exchange name in the configuration and in events.
@@ -228,7 +227,9 @@ impl BybitConnector {
         let tickers = Arc::new(Tickers::default());
         let limiter = ConnectionLimiter::new(self.tuning.limiter);
         let _ = status.limiter.set(limiter.clone());
-        let shards = Shards::new(self.tuning.max_topics_per_connection);
+        let shards = Shards::new(self.tuning.max_topics_per_connection, |raw| {
+            topics_of(raw).to_vec()
+        });
         *status.shards.lock().unwrap_or_else(|e| e.into_inner()) = Some(shards.clone());
         let (table_tx, mut table_rx) = watch::channel::<Option<Arc<SymbolTable>>>(None);
         let mut policy_rx = self.symbols.subscribe_policy();
@@ -286,7 +287,7 @@ impl BybitConnector {
                     }
                 }
             });
-            Ok(shards::ShardParts { handle })
+            Ok(ShardParts { handle })
         };
 
         let mut dedup = RecentKeys::new(self.tuning.dedup_capacity);
@@ -350,7 +351,7 @@ impl BybitConnector {
         shards: &Shards,
         table: &watch::Receiver<Option<Arc<SymbolTable>>>,
         policy: &watch::Receiver<Arc<SymbolPolicy>>,
-        spawn: &mut dyn FnMut(usize, Arc<TopicControl>) -> Result<shards::ShardParts, String>,
+        spawn: &mut dyn FnMut(usize, Arc<TopicControl>) -> Result<ShardParts, String>,
         tickers: &Tickers,
         result: &mut Result<(), ExchangeError>,
         stop: &CancellationToken,
@@ -376,7 +377,7 @@ impl BybitConnector {
         shards: &Shards,
         table: &watch::Receiver<Option<Arc<SymbolTable>>>,
         policy: &watch::Receiver<Arc<SymbolPolicy>>,
-        spawn: &mut dyn FnMut(usize, Arc<TopicControl>) -> Result<shards::ShardParts, String>,
+        spawn: &mut dyn FnMut(usize, Arc<TopicControl>) -> Result<ShardParts, String>,
     ) -> Result<(), String> {
         let wanted: BTreeSet<String> = match table.borrow().as_ref() {
             Some(t) => {

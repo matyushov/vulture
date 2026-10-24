@@ -74,10 +74,18 @@ oi_poll_interval_secs = 30
 # ws_url = "wss://stream.bybit.com/v5/public/linear"   # defaults; override only for tests
 # rest_url = "https://api.bybit.com"
 
+# OKX linear swaps (USDT and USDC margined). Public data only. `symbols` is the default tracked-symbol policy as
+# above. One WebSocket carries the liquidation feed of all swaps (filtered here) plus the mark-price and open-interest
+# channels of every tracked instrument; tracked-set changes are applied without reconnecting, in batches that respect
+# OKX's 480 subscription requests per hour and connection.
+# `oi_poll_interval_secs` is the interval of the open interest samples (taken from the latest pushes).
 [[exchanges]]
 name = "okx"
 enabled = false
+symbols = []
 oi_poll_interval_secs = 30
+# ws_url = "wss://ws.okx.com/ws/v5/public"   # defaults; override only for tests (port 443, not 8443)
+# rest_url = "https://www.okx.com"
 
 [metrics]
 # /metrics (Prometheus), /healthz (process up), /readyz (Redis reachable and gRPC running). Not authenticated:

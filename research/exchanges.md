@@ -100,6 +100,14 @@ to Bybit EU. NOT CONFIRMED for the planned server location; test from the server
 
 ### 3.2 OKX (V2-2)
 
+> **Update 2026-10-24 (V2b).** The Public Data sections were read in full (the whole page downloaded with `curl`)
+> and a live run was made; the results are in `research/okx-live.md`. Resolved: `sz` is in contracts; `side` and
+> `posSide` semantics (hedge and net mode); `bkPx` wording ("Liquidation mark price... the system's liquidation
+> account"); the 3 s cadence of `open-interest` (pushes on change, first push at once); `oiCcy` equals `oi x ctVal x
+> ctMult`; the public instruments endpoint is `GET /api/v5/public/instruments`; the text `ping`/`pong`; errors per
+> argument (code 60018). Still open: completeness of the liquidation feed, net-mode samples, USDC swaps (none in the
+> list on that day). The text below is the state of 2026-10-23.
+
 Sources: `https://www.okx.com/docs-v5/en/` (overview and REST Get instruments readable), changelog
 `https://www.okx.com/docs-v5/log_en/`, third-party: Tardis OKX Swap page, ccxt issue #23969.
 Checked 2026-10-23.
@@ -339,7 +347,7 @@ real coins (divide by the prefix) or sum by a per-exchange alias table. Open que
 
 ## 7. Open items (not confirmed)
 
-- OKX Public Data section text (liquidation completeness, `sz` unit, `side/posSide`, 3 s OI cadence).
+- OKX liquidation completeness, a net-mode (`posSide=net`) sample and USDC swaps (resolved on 2026-10-24: `sz` unit, `side`/`posSide`, OI cadence; see `research/okx-live.md`).
 - BitMEX official WS and REST pages (ping, limits, liquidation semantics, `openValue` unit, current linear list).
 - Bybit `allLiquidation.v` unit; USDC perpetual naming.
 - Region blocking for the deploy server for Bybit, OKX, BitMEX, Deribit.

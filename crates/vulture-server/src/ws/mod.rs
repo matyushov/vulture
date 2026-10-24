@@ -26,6 +26,7 @@ mod manager;
 pub mod metrics;
 mod profile;
 mod session;
+mod shards;
 mod status;
 mod topics;
 
@@ -42,5 +43,6 @@ pub use limiter::{
 pub use manager::{WsHandle, WsOptions, spawn_ws, spawn_ws_with};
 pub use profile::{MaxAge, PingConfig, PingMessage, WsProfile};
 pub use session::{ConnectFailure, WsMessage, WsOutput};
+pub use shards::{ShardParts, ShardView, Shards, TopicsOf};
 pub use status::{ConnectionState, WsCounters, WsStatus};
 pub use topics::{TopicControl, TopicOp, TopicRequest, chunk_topics};

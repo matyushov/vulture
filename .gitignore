@@ -22,5 +22,7 @@ __pycache__/
 !.env.example
 !deploy/.env.example
 deploy/tls/
+# local server configs (which exchanges to enable) stay with the deployment, not in the repository
+deploy/config.local*.toml
 # the access token and the server state live here when the compose default is used
 deploy/data/

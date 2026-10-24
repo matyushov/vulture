@@ -50,6 +50,16 @@ pub enum FrameClass {
         /// The exchange's message (used to find the offending topic).
         detail: String,
     },
+    /// The exchange refused individual topics of a request it otherwise processed (some exchanges answer per
+    /// argument: the others of the same request are subscribed and acknowledged). Swallowed; the named topics
+    /// are rejected and nothing is resent. Use [`FrameClass::TopicResponse`] with `ok: false` when the whole
+    /// request fails.
+    TopicRefused {
+        /// The refused topics.
+        topics: Vec<String>,
+        /// The exchange's message.
+        detail: String,
+    },
     /// Not interesting (welcome banners, info notices); swallowed.
     Ignore,
 }

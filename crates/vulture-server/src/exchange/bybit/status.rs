@@ -3,8 +3,7 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::shards::ShardView;
-use crate::ws::ConnectionLimiter;
+use crate::ws::{ConnectionLimiter, ShardView};
 
 /// All counters are monotonic unless stated otherwise. Relaxed ordering: they are statistics.
 #[derive(Debug, Default)]
@@ -56,7 +55,7 @@ pub struct BybitStatus {
     /// Wall-clock ms until which REST is paused after a 403/429; 0 when not paused (gauge).
     pub paused_until_ms: AtomicI64,
     /// The WebSocket connections, available once the connector runs.
-    pub shards: Mutex<Option<Arc<super::shards::Shards>>>,
+    pub shards: Mutex<Option<Arc<crate::ws::Shards>>>,
     /// The connection budget, available once the connector runs.
     pub limiter: OnceLock<Arc<ConnectionLimiter>>,
 }

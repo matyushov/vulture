@@ -161,6 +161,133 @@ pub fn parse_bybit_instruments(json: &str) -> Result<BybitInstrumentsPage, Strin
     })
 }
 
+/// Result of parsing OKX `GET /api/v5/public/instruments?instType=SWAP`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxInstruments {
+    /// Swap instruments (unfiltered; unusable ones carry [`ContractKind::Other`]).
+    pub metas: Vec<InstrumentMeta>,
+    /// Contract size per `instId`, for the instruments that are usable.
+    pub sizes: std::collections::HashMap<String, super::oi::ContractSize>,
+    /// Instruments that look collectable but have an unusable contract size or names; they are dropped.
+    pub unusable: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct OkxEnvelope {
+    code: String,
+    #[serde(default)]
+    msg: String,
+    #[serde(default)]
+    data: Vec<OkxInstrument>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OkxInstrument {
+    inst_id: String,
+    #[serde(default)]
+    inst_type: String,
+    #[serde(default)]
+    inst_family: String,
+    #[serde(default)]
+    ct_type: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    settle_ccy: String,
+    #[serde(default)]
+    ct_val: String,
+    #[serde(default)]
+    ct_mult: String,
+    #[serde(default)]
+    ct_val_ccy: String,
+}
+
+fn positive_number(text: &str) -> Option<f64> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// Parses an OKX swap instrument list. A response code other than `"0"` is an error.
+///
+/// Only `ctType = linear` is a perpetual we collect; the USD-margined `*-USD_UM-SWAP` family (settled in USD
+/// stablecoins) is excluded by decision, as are inverse contracts. Base and quote come from the `instId`
+/// (`BASE-QUOTE-SWAP`) with `settleCcy` as the quote; the contract size (`ctVal x ctMult` in `ctValCcy`) must be
+/// positive and expressed in the base coin, otherwise the instrument is reported as unusable.
+pub fn parse_okx_instruments(json: &str) -> Result<OkxInstruments, String> {
+    let env: OkxEnvelope = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    if env.code != "0" {
+        return Err(format!("code {}: {}", env.code, env.msg));
+    }
+    let mut out = OkxInstruments {
+        metas: Vec::new(),
+        sizes: std::collections::HashMap::new(),
+        unusable: Vec::new(),
+    };
+    for i in env.data {
+        if !i.inst_type.is_empty() && i.inst_type != "SWAP" {
+            continue;
+        }
+        let trading = i.state == "live";
+        let parts: Vec<&str> = i.inst_id.split('-').collect();
+        let base = match parts.as_slice() {
+            [base, _, "SWAP"] if !base.is_empty() => (*base).to_string(),
+            _ => {
+                out.metas.push(InstrumentMeta {
+                    raw: i.inst_id,
+                    base: String::new(),
+                    quote: i.settle_ccy,
+                    kind: ContractKind::Other("unrecognized instId".into()),
+                    trading,
+                });
+                continue;
+            }
+        };
+        let mut kind = match i.ct_type.as_str() {
+            "linear" => ContractKind::Perpetual,
+            "inverse" => ContractKind::Other("inverse".into()),
+            other => ContractKind::Other(other.to_string()),
+        };
+        if i.inst_family.ends_with("_UM") || i.inst_id.contains("_UM-") {
+            kind = ContractKind::Other("USD_UM".into());
+        }
+        let wanted_shape = kind == ContractKind::Perpetual
+            && trading
+            && QUOTES.contains(&i.settle_ccy.as_str())
+            && parts[1] == i.settle_ccy;
+        if wanted_shape {
+            let val = positive_number(&i.ct_val);
+            let mult = positive_number(&i.ct_mult);
+            match (val, mult) {
+                (Some(ct_val), Some(ct_mult)) if i.ct_val_ccy.eq_ignore_ascii_case(&base) => {
+                    out.sizes.insert(
+                        i.inst_id.clone(),
+                        super::oi::ContractSize {
+                            ct_val,
+                            ct_mult,
+                            ct_val_ccy: i.ct_val_ccy.clone(),
+                        },
+                    );
+                }
+                _ => {
+                    out.unusable.push(i.inst_id.clone());
+                    kind = ContractKind::Other("unusable contract size".into());
+                }
+            }
+        }
+        out.metas.push(InstrumentMeta {
+            raw: i.inst_id,
+            base,
+            quote: i.settle_ccy,
+            kind,
+            trading,
+        });
+    }
+    out.unusable.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +396,56 @@ mod tests {
         );
         assert!(parse_bybit_instruments(r#"{"retCode":10001,"retMsg":"bad"}"#).is_err());
         assert!(parse_bybit_instruments("nope").is_err());
+    }
+
+    /// Shape of `GET /api/v5/public/instruments?instType=SWAP` (fields as documented 2026-10-24; values
+    /// constructed, `ctVal` of PEPE per the research notes).
+    const OKX_LIST: &str = r#"{"code":"0","msg":"","data":[
+        {"instType":"SWAP","instId":"BTC-USDT-SWAP","instFamily":"BTC-USDT","ctType":"linear","state":"live","settleCcy":"USDT","ctVal":"0.01","ctMult":"1","ctValCcy":"BTC"},
+        {"instType":"SWAP","instId":"BTC-USDC-SWAP","instFamily":"BTC-USDC","ctType":"linear","state":"live","settleCcy":"USDC","ctVal":"0.0001","ctMult":"1","ctValCcy":"BTC"},
+        {"instType":"SWAP","instId":"PEPE-USDT-SWAP","instFamily":"PEPE-USDT","ctType":"linear","state":"live","settleCcy":"USDT","ctVal":"10000000","ctMult":"1","ctValCcy":"PEPE"},
+        {"instType":"SWAP","instId":"BTC-USD-SWAP","instFamily":"BTC-USD","ctType":"inverse","state":"live","settleCcy":"BTC","ctVal":"100","ctMult":"1","ctValCcy":"USD"},
+        {"instType":"SWAP","instId":"BTC-USD_UM-SWAP","instFamily":"BTC-USD_UM","ctType":"linear","state":"live","settleCcy":"USD","ctVal":"0.01","ctMult":"1","ctValCcy":"BTC"},
+        {"instType":"SWAP","instId":"NEW-USDT-SWAP","instFamily":"NEW-USDT","ctType":"linear","state":"preopen","settleCcy":"USDT","ctVal":"1","ctMult":"1","ctValCcy":"NEW"},
+        {"instType":"SWAP","instId":"ODD-USDT-SWAP","instFamily":"ODD-USDT","ctType":"linear","state":"live","settleCcy":"USDT","ctVal":"","ctMult":"1","ctValCcy":"ODD"},
+        {"instType":"SWAP","instId":"WRONG-USDT-SWAP","instFamily":"WRONG-USDT","ctType":"linear","state":"live","settleCcy":"USDT","ctVal":"1","ctMult":"1","ctValCcy":"USD"}
+        ]}"#;
+
+    #[test]
+    fn okx_selection_and_contract_sizes() {
+        let list = parse_okx_instruments(OKX_LIST).unwrap();
+        let wanted: Vec<&str> = list
+            .metas
+            .iter()
+            .filter(|m| is_wanted_market(m))
+            .map(|m| m.raw.as_str())
+            .collect();
+        assert_eq!(wanted, ["BTC-USDT-SWAP", "BTC-USDC-SWAP", "PEPE-USDT-SWAP"]);
+        assert_eq!(list.unusable, ["ODD-USDT-SWAP", "WRONG-USDT-SWAP"]);
+        let pepe = &list.sizes["PEPE-USDT-SWAP"];
+        assert_eq!((pepe.ct_val, pepe.ct_mult), (10_000_000.0, 1.0));
+        assert_eq!(list.sizes["BTC-USDC-SWAP"].ct_val_ccy, "BTC");
+        assert!(!list.sizes.contains_key("BTC-USD_UM-SWAP"));
+        assert!(!list.sizes.contains_key("BTC-USD-SWAP"));
+        assert!(
+            parse_okx_instruments(r#"{"code":"50011","msg":"Too many requests","data":[]}"#)
+                .is_err()
+        );
+        assert!(parse_okx_instruments("nope").is_err());
+    }
+
+    #[test]
+    fn okx_fixture_selection() {
+        let json = include_str!("../../../../fixtures/okx/instruments_swap_doc.json");
+        let list = parse_okx_instruments(json).unwrap();
+        let wanted: Vec<&str> = list
+            .metas
+            .iter()
+            .filter(|m| is_wanted_market(m))
+            .map(|m| m.raw.as_str())
+            .collect();
+        assert_eq!(wanted, ["BTC-USDT-SWAP", "BTC-USDC-SWAP", "PEPE-USDT-SWAP"]);
+        assert!(list.unusable.is_empty());
     }
 
     #[test]

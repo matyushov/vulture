@@ -12,8 +12,8 @@ pub mod symbol;
 
 pub use aliases::{AliasError, BaseAliases, ResolvedBase};
 pub use market::{
-    BybitInstrumentsPage, ContractKind, InstrumentMeta, is_wanted_market,
-    parse_binance_exchange_info, parse_bybit_instruments,
+    BybitInstrumentsPage, ContractKind, InstrumentMeta, OkxInstruments, is_wanted_market,
+    parse_binance_exchange_info, parse_bybit_instruments, parse_okx_instruments,
 };
 pub use oi::{ContractSize, DeribitContract, OiError, OiValues};
 pub use symbol::{NormalizeError, Normalized, Venue, normalize_instrument, normalize_symbol};

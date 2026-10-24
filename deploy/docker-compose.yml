@@ -55,7 +55,9 @@ services:
       # A host directory, not a named volume, and the directory, not the single file: Docker would create a
       # directory for a missing file. Create it yourself (see deploy/README.md) or Docker creates it as root.
       - ${VULTURE_DATA_DIR:-./data}:/var/lib/vulture
-      - ./config.docker.toml:/etc/vulture/config.toml:ro
+      # VULTURE_CONFIG_FILE selects another file, for example an untracked config.local.toml that enables more
+      # exchanges (see deploy/README.md, "Choosing the exchanges").
+      - ${VULTURE_CONFIG_FILE:-./config.docker.toml}:/etc/vulture/config.toml:ro
       - ${VULTURE_TLS_DIR:-./tls}:/etc/vulture/tls:ro
     ports:
       # gRPC. With plaintext (the default config) keep it on loopback. With [tls] you may publish it wider.

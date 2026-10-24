@@ -6,6 +6,7 @@
 
 pub mod binance;
 pub mod bybit;
+pub mod okx;
 
 use std::sync::Arc;
 
@@ -86,7 +87,7 @@ impl crate::metrics::MetricSource for ExchangeMetrics {
 
 /// Builds the connectors for the enabled exchanges of the configuration.
 ///
-/// Binance (V1-4) and Bybit (V2a) exist so far; other configured names are reported and skipped so the server
+/// Binance (V1-4), Bybit (V2a) and OKX (V2b) exist so far; other configured names are reported and skipped so the server
 /// still starts.
 pub fn build_connectors(ctx: &AppContext) -> Vec<Box<dyn Exchange>> {
     let mut connectors: Vec<Box<dyn Exchange>> = Vec::new();
@@ -110,6 +111,12 @@ pub fn build_connectors(ctx: &AppContext) -> Vec<Box<dyn Exchange>> {
                     }
                 }
             }
+            okx::NAME => match okx::OkxConnector::new(okx::OkxConfig::from_exchange_config(ex)) {
+                Ok(c) => connectors.push(Box::new(c)),
+                Err(e) => {
+                    tracing::error!(exchange = %ex.name, error = %e, "cannot create the connector; skipped");
+                }
+            },
             _ => {
                 tracing::warn!(exchange = %ex.name, "no connector implementation for this exchange yet; skipped");
             }
@@ -185,7 +192,7 @@ mod tests {
     async fn only_enabled_known_exchanges_are_built() {
         let mut cfg = Config::default();
         cfg.exchanges.push(entry("binance", true));
-        cfg.exchanges.push(entry("okx", true));
+        cfg.exchanges.push(entry("bitmex", true));
         cfg.exchanges.push(entry("bybit", false));
         let ctx = AppContext::new(cfg, CancellationToken::new());
         let connectors = build_connectors(&ctx);
@@ -201,6 +208,17 @@ mod tests {
         let connectors = build_connectors(&ctx);
         assert_eq!(connectors.len(), 1);
         assert_eq!(connectors[0].name(), "bybit");
+        assert!(connectors[0].symbols().is_some());
+    }
+
+    #[tokio::test]
+    async fn enabled_okx_is_built() {
+        let mut cfg = Config::default();
+        cfg.exchanges.push(entry("okx", true));
+        let ctx = AppContext::new(cfg, CancellationToken::new());
+        let connectors = build_connectors(&ctx);
+        assert_eq!(connectors.len(), 1);
+        assert_eq!(connectors[0].name(), "okx");
         assert!(connectors[0].symbols().is_some());
     }
 

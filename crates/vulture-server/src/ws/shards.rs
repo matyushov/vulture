@@ -1,7 +1,7 @@
-//! The WebSocket connections of the Bybit connector.
+//! The WebSocket connections of a connector that follows a tracked-symbol set (Bybit, OKX).
 //!
-//! Bybit documents no limit on the number of topics of a linear connection (only the size of one request),
-//! so one connection normally carries everything. When the topic count would exceed a configured cap, symbols
+//! The exchanges documented so far limit the number of topics of a connection loosely or not at all (only the
+//! size and the rate of requests), so one connection normally carries everything. When the topic count would exceed a configured cap, symbols
 //! are spread over several connections ("shards"). A symbol keeps its shard as long as it is tracked; new
 //! symbols go to the first shard with room, and a new shard is opened only when all are full. Shards are never
 //! closed: an empty one costs one idle socket.
@@ -11,8 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 
-use super::stream::topics_of;
-use crate::ws::{ConnectionState, TopicControl, WsCounters, WsHandle, WsStatus};
+use super::{ConnectionState, TopicControl, WsCounters, WsHandle, WsStatus};
 
 /// What the spawner returns for a new shard.
 pub struct ShardParts {
@@ -48,7 +47,11 @@ struct Inner {
 pub struct Shards {
     inner: Mutex<Inner>,
     max_symbols: usize,
+    topics_of: TopicsOf,
 }
+
+/// The topics a connection carries for one raw symbol.
+pub type TopicsOf = fn(&str) -> Vec<String>;
 
 impl std::fmt::Debug for Shards {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -59,14 +62,15 @@ impl std::fmt::Debug for Shards {
 }
 
 impl Shards {
-    /// `max_topics` is the cap per connection (two topics per symbol).
-    pub fn new(max_topics: usize) -> Arc<Self> {
+    /// `max_topics` is the cap per connection (two topics per symbol); `topics_of` names the topics of a symbol.
+    pub fn new(max_topics: usize, topics_of: TopicsOf) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 shards: Vec::new(),
                 assigned: HashMap::new(),
             }),
             max_symbols: (max_topics / 2).max(1),
+            topics_of,
         })
     }
 
@@ -123,7 +127,11 @@ impl Shards {
         }
         let mut changed = Vec::new();
         for (i, sh) in inner.shards.iter().enumerate() {
-            let topics: BTreeSet<String> = sh.symbols.iter().flat_map(|s| topics_of(s)).collect();
+            let topics: BTreeSet<String> = sh
+                .symbols
+                .iter()
+                .flat_map(|s| (self.topics_of)(s))
+                .collect();
             sh.control.set(topics);
             if added[i] + removed[i] > 0 {
                 changed.push((i, added[i], removed[i]));
@@ -147,6 +155,26 @@ impl Shards {
             handle: Some(parts.handle),
         });
         Ok(index)
+    }
+
+    /// How many symbols `wanted` would add to and remove from the current assignment (no changes made).
+    pub fn diff_counts(&self, wanted: &BTreeSet<String>) -> (usize, usize) {
+        let inner = self.lock();
+        let added = wanted
+            .iter()
+            .filter(|s| !inner.assigned.contains_key(*s))
+            .count();
+        let removed = inner
+            .assigned
+            .keys()
+            .filter(|s| !wanted.contains(*s))
+            .count();
+        (added, removed)
+    }
+
+    /// Number of symbols currently assigned.
+    pub fn assigned_count(&self) -> usize {
+        self.lock().assigned.len()
     }
 
     /// Whether the connection carrying `raw` has a live session.

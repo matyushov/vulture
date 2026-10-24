@@ -309,6 +309,19 @@ async fn drive(p: &SessionParams, conn: &mut BoxedConnection) -> Outcome {
                             }
                         }
                     }
+                    FrameClass::TopicRefused { topics, detail } => {
+                        if let Some(tr) = tracker.as_mut() {
+                            let was_empty = tr.known.is_empty();
+                            for topic in topics {
+                                if tr.known.contains(&topic) {
+                                    tr.reject(p, &topic, &detail);
+                                }
+                            }
+                            if tr.known.is_empty() && !was_empty {
+                                liveness_deadline = None;
+                            }
+                        }
+                    }
                     FrameClass::Reply(text) => {
                         if let Err(o) = send(conn, Message::text(text), prof.write_timeout).await {
                             break o;
