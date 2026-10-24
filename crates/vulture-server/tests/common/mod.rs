@@ -3,6 +3,8 @@
 #![allow(dead_code)]
 
 pub mod certs;
+pub mod log_capture;
+pub mod mock_http;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -326,6 +328,17 @@ impl Server {
         limiter: LimiterConfig,
         symbols: Option<Arc<vulture_server::symbols::SymbolManager>>,
     ) -> Self {
+        Self::start_all(backend, stream, limiter, symbols, None).await
+    }
+
+    /// Like `start_full`, with the rules and channels backend as well.
+    pub async fn start_all(
+        backend: &Backend,
+        stream: StreamConfig,
+        limiter: LimiterConfig,
+        symbols: Option<Arc<vulture_server::symbols::SymbolManager>>,
+        alerts: Option<Arc<vulture_server::alerts::AlertsManager>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let token_store = TokenStore::new(dir.path());
         let token = token_store.create_if_missing().unwrap().into_secret();
@@ -346,6 +359,7 @@ impl Server {
             limiter,
             stream,
             symbols,
+            alerts,
         };
         let task = tokio::spawn({
             let (store, authority, stats, auth_stats, shutdown) = (

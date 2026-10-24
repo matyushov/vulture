@@ -8,7 +8,7 @@
 [server]
 listen_addr = "127.0.0.1:50051"  # gRPC. A non-loopback address needs [tls] (or allow_plaintext = true, see below)
 # allow_plaintext = false         # accept a non-loopback bind without [tls]: the token travels unencrypted
-# data_dir = "/var/lib/vulture"   # token, state.json (symbol policies set at runtime), audit.log
+# data_dir = "/var/lib/vulture"   # token, state.json (symbol policies), alerts.json (rules and channels), audit.log
 
 # TLS for the gRPC listener. Uncomment to enable; paths are placeholders. The files are PEM; the certificate
 # file may hold the whole chain (certbot's fullchain.pem). Certificate and key are reloaded without dropping open
@@ -86,6 +86,83 @@ symbols = []
 oi_poll_interval_secs = 30
 # ws_url = "wss://ws.okx.com/ws/v5/public"   # defaults; override only for tests (port 443, not 8443)
 # rest_url = "https://www.okx.com"
+
+# Signals, rules and delivery (V4a). The analytics engine runs inside the server: it watches the event flow, writes
+# `Signal` events (OI spikes up and down, liquidation cascades) into the same stream, and sends messages to
+# Telegram and Discord according to the rules you set through Control. Rules and channels live in
+# <data_dir>/alerts.json (mode 0600, may hold bot tokens: never commit it); the [[alerts.rules]] and
+# [[alerts.channels]] entries below are only DEFAULTS that seed that file while it does not exist. A corrupt
+# alerts.json stops the start. Reference: README, "Signals and alerts".
+[alerts]
+enabled = true
+warmup_secs = 14400            # replay this much of the Redis stream at start (4 h = the longest OI window)
+input_queue = 100000           # the engine's own input queue; when full it drops ITS input, never the writer's
+max_symbols = 5000             # most symbols the engine tracks (about 15 KB each)
+series_max_samples = 1024      # hard cap of OI samples per symbol (4 h at 30 s = 480)
+sample_spacing_secs = 15       # samples closer than this to the previous one are ignored
+hole_secs = 300                # a longer pause between two samples of a symbol is a hole; windows spanning it are skipped
+
+[alerts.oi_spike]
+enabled = true
+min_oi_usd = 1000000.0         # symbols with less open interest than this are ignored (dust)
+z_min = 4.0                    # the move must also be this many robust sigmas unusual for the symbol itself
+min_baseline_points = 60       # earlier window changes needed to judge "unusual"
+require_baseline = true        # no baseline, no signal
+cooldown_secs = 900            # per exchange, symbol, window and direction
+extension_factor = 1.5         # inside the cooldown a move that grows by this factor signals again
+# Windows replace the whole default list when given. threshold_pct applies to |change of oi_base|.
+# [[alerts.oi_spike.windows]]
+# secs = 300
+# threshold_pct = 3.0
+# min_change_usd = 500000.0
+# enabled = true
+
+[alerts.liq_cascade]
+enabled = true
+per_exchange = true            # besides market-wide, detect on each exchange
+baseline_secs = 86400          # per-minute notional of the previous day (median and MAD)
+min_baseline_minutes = 120     # before this much baseline the trigger is 3 x floor
+k_mad = 8.0                    # trigger: median + k x 1.4826 x MAD of the per-minute notional ...
+floor_usd = 2000000.0          # ... and at least this much market-wide in the last 60 s
+floor_usd_exchange = 1000000.0 # ... and at least this much on one exchange
+min_count = 5                  # ... and at least this many liquidations
+quiet_secs = 120               # a cascade ends after this long without being hot
+end_ratio = 0.5                # hot = the last minute is at least this fraction of the trigger
+top_symbols = 5                # symbols in the closing summary
+
+[alerts.delivery]
+telegram_base_url = "https://api.telegram.org"   # tests point it at a mock server
+allow_custom_endpoints = false # accept Discord webhooks outside discord.com (tests only)
+telegram_min_interval_ms = 1100  # at most about one message per second to a chat ...
+telegram_max_per_minute = 20     # ... and 20 per minute (the group limit)
+discord_min_interval_ms = 2000
+discord_max_per_minute = 20
+batch_window_ms = 3000         # alerts produced within this window are merged into one digest
+digest_max_items = 12          # alerts listed in a digest; the rest are counted ("and N more")
+queue_limit = 500              # alerts queued per channel; above it the oldest are dropped and summarized
+retry_min_ms = 1000            # exponential backoff of failed messages
+retry_max_ms = 60000
+max_attempts = 8
+request_timeout_secs = 10
+
+# Default channel and rule (seed for alerts.json). Secrets: prefer secret_env or secret_file; an inline `secret`
+# would sit in this file. Remove the comment marks to use them.
+# [[alerts.channels]]
+# id = "telegram-main"
+# name = "Main Telegram chat"
+# kind = "telegram"            # or "discord" (then no chat_id, and the secret is the webhook URL)
+# chat_id = "-1001234567890"
+# secret_env = "VULTURE_TELEGRAM_TOKEN"   # or secret_file = "/run/secrets/telegram_token"
+# dry_run = true               # log instead of sending until you have checked the rules
+#
+# [[alerts.rules]]
+# id = "all-signals"
+# name = "OI spikes and cascades"
+# channels = ["telegram-main"]
+# cooldown_secs = 0
+# [alerts.rules.kind]
+# type = "signal"              # also: "liquidation" (min_notional_usd, sides) and "oi_change" (window_secs, min_change_pct)
+# min_severity = "info"
 
 [metrics]
 # /metrics (Prometheus), /healthz (process up), /readyz (Redis reachable and gRPC running). Not authenticated:

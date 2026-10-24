@@ -49,6 +49,7 @@ impl TlsServer {
             limiter: LimiterConfig::default(),
             stream: test_stream_config(),
             symbols: None,
+            alerts: None,
         };
         let task = tokio::spawn({
             let (store, reloader, shutdown) = (backend.store(), reloader.clone(), shutdown.clone());

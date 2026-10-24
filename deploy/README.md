@@ -47,7 +47,8 @@ sudo chown 65532:65532 data && sudo chmod 700 data
 |---|---|---|
 | `token` | the access token, one line, clear text | `0600` |
 | `state.json` | symbol policies set at runtime (versioned) | `0600` |
-| `audit.log`, `audit.log.1` | JSON lines of every policy change, rotated at 4 MiB | `0600` |
+| `alerts.json` | alert rules and delivery channels set through `Control` (versioned); **may hold bot tokens and webhook URLs**, so back it up like the token and never commit it | `0600` |
+| `audit.log`, `audit.log.1` | JSON lines of every policy, rule and channel change (no secrets), rotated at 4 MiB | `0600` |
 
 **First start.** If `data/token` does not exist the server creates it (32 random bytes, base64url, 43 characters,
 mode `0600`). If it exists it is used as it is and **never overwritten**. A file that is unreadable or not a valid

@@ -488,6 +488,7 @@ async fn the_other_control_rpcs_stay_unimplemented() {
         list_channels(ListChannelsRequest),
         upsert_channel(UpsertChannelRequest),
         delete_channel(DeleteChannelRequest),
+        send_test_message(SendTestMessageRequest),
         get_storage_status(GetStorageStatusRequest),
         rotate_token(RotateTokenRequest),
     );

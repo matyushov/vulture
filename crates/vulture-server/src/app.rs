@@ -107,6 +107,9 @@ pub enum AppError {
     /// The state file of the symbol policies is unusable; the server refuses to start rather than guess.
     #[error(transparent)]
     State(#[from] crate::symbols::StateError),
+    /// `alerts.json` is unusable or the alerts subsystem cannot be set up; the server refuses to start rather than guess.
+    #[error(transparent)]
+    Alerts(#[from] crate::alerts::SetupError),
     /// The ClickHouse client could not be built from `[clickhouse]`.
     #[error("clickhouse: {0}")]
     ClickHouse(String),
@@ -177,8 +180,22 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
             .filter_map(|c| c.symbols().map(|ch| (c.name().to_string(), ch)))
             .collect(),
     )?;
+    // The alert rules and channels: configuration defaults overridden by <data_dir>/alerts.json; a broken file
+    // stops the start here as well.
+    let alerts = if ctx.config.alerts.enabled {
+        Some(crate::alerts::Alerts::open(
+            &ctx.config,
+            ctx.shutdown.clone(),
+        )?)
+    } else {
+        tracing::info!("[alerts] is disabled: no signals, no rules, no delivery");
+        None
+    };
     let hub = Arc::new(MetricsHub::new());
     hub.register(symbols.clone());
+    if let Some(a) = &alerts {
+        a.register_metrics(&hub);
+    }
     let metrics_listener = crate::metrics::bind(&ctx.config.metrics.listen_addr).await?;
     let grpc = crate::grpc::start(
         &ctx.config.server,
@@ -186,6 +203,7 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
         store.clone(),
         authority,
         Some(symbols),
+        alerts.as_ref().map(|a| a.manager.clone()),
         ctx.shutdown.clone(),
     )
     .await?;
@@ -243,7 +261,7 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
             None
         }
     };
-    run_with_history(ctx.clone(), store, connectors, Some(hub), history).await;
+    run_with_alerts(ctx.clone(), store, connectors, Some(hub), history, alerts).await;
     grpc.wait(deadline * 2).await;
     let _ = metrics_task.await;
     Ok(())
@@ -284,8 +302,50 @@ pub async fn run_with_history(
     hub: Option<Arc<MetricsHub>>,
     history: Option<HistorySetup>,
 ) {
+    run_with_alerts(ctx, store, connectors, hub, history, None).await;
+}
+
+/// Like [`run_with_history`] with the analytics engine: a tap between the connectors and the writer copies each
+/// event into the engine's bounded queue (dropping its own input when full, never delaying the writer), and the
+/// engine's signals go into the writer's channel like any other event.
+pub async fn run_with_alerts(
+    ctx: AppContext,
+    store: Arc<dyn RedisStore>,
+    connectors: Vec<Box<dyn Exchange>>,
+    hub: Option<Arc<MetricsHub>>,
+    history: Option<HistorySetup>,
+    alerts: Option<Arc<crate::alerts::Alerts>>,
+) {
     let connectors: Vec<Arc<dyn Exchange>> = connectors.into_iter().map(Arc::from).collect();
     let (sink, events) = mpsc::channel::<vulture_proto::v1::Event>(EVENT_CHANNEL_CAPACITY);
+    // With the engine, connectors write into the tap; a forwarder passes every event on to the writer (with
+    // backpressure, as before) after offering a copy to the engine.
+    let mut engine_tasks = Vec::new();
+    let connector_sink = match alerts {
+        Some(alerts) => {
+            let (input, engine) = alerts.spawn_engine(
+                store.clone(),
+                sink.clone(),
+                Arc::new(SystemClock),
+                ctx.shutdown.clone(),
+            );
+            let (tap_tx, mut tap_rx) =
+                mpsc::channel::<vulture_proto::v1::Event>(EVENT_CHANNEL_CAPACITY);
+            let writer_tx = sink.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(event) = tap_rx.recv().await {
+                    input.offer(&event);
+                    if writer_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            engine_tasks.push(forwarder);
+            engine_tasks.push(engine);
+            tap_tx
+        }
+        None => sink.clone(),
+    };
 
     let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
     let mut writer_cfg = WriterConfig::from_redis(&ctx.config.redis, deadline);
@@ -327,7 +387,7 @@ pub async fn run_with_history(
     let mut tasks = Vec::new();
     for connector in connectors {
         let ctx = ctx.clone();
-        let sink = sink.clone();
+        let sink = connector_sink.clone();
         tasks.push(tokio::spawn(async move {
             let name = connector.name().to_string();
             match connector.run(ctx, sink).await {
@@ -337,12 +397,18 @@ pub async fn run_with_history(
         }));
     }
     drop(sink);
+    drop(connector_sink);
 
     tracing::info!(connectors = tasks.len(), "vulture-server running");
     ctx.shutdown.cancelled().await;
 
     let stop = async {
         for task in tasks {
+            let _ = task.await;
+        }
+        // The tap closes once the connectors are gone, then the engine; the writer ends when its last sender
+        // (forwarder or engine) is dropped.
+        for task in engine_tasks {
             let _ = task.await;
         }
         let _ = writer_task.await;

@@ -602,3 +602,72 @@ fn config_check_validates_state_json_and_the_token_file() {
         assert!(bad.is_empty() || !err.contains(bad), "{err}");
     }
 }
+
+#[test]
+fn a_corrupt_alerts_file_refuses_to_start_and_config_check_reports_it() {
+    let data = data_dir("corrupt-alerts");
+    std::fs::create_dir_all(&data).unwrap();
+    let secret = "123456:SECRETtokenABCdef_ghi-JKL";
+    for content in [
+        "{ not json".to_string(),
+        r#"{"version": 7}"#.to_string(),
+        format!(
+            r#"{{"version":1,"channels":[{{"id":"tg","kind":"telegram","chat_id":"1","secret":"{secret}/slash"}}]}}"#
+        ),
+    ] {
+        std::fs::write(std::path::Path::new(&data).join("alerts.json"), &content).unwrap();
+        let cfg = temp_file(
+            "corrupt_alerts.toml",
+            &format!(
+                "[server]\nlisten_addr = \"127.0.0.1:0\"\ndata_dir = {data:?}\n\
+                 [metrics]\nlisten_addr = \"127.0.0.1:0\"\n[redis]\nurl = \"redis://127.0.0.1:1\"\n"
+            ),
+        );
+        let out = Command::new(BIN)
+            .args(["run", "--config"])
+            .arg(&cfg)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{content}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("alerts file"), "{err}");
+        assert!(!err.contains("SECRETtoken"), "{err}");
+        let check = config_check(&cfg);
+        assert!(!check.status.success());
+        let err = String::from_utf8_lossy(&check.stderr);
+        assert!(
+            err.contains("alerts file") && !err.contains("SECRETtoken"),
+            "{err}"
+        );
+        // The file is left exactly as it was.
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&data).join("alerts.json")).unwrap(),
+            content
+        );
+    }
+    // A good file is reported as OK, without its secrets.
+    std::fs::write(
+        std::path::Path::new(&data).join("alerts.json"),
+        format!(
+            r#"{{"version":1,"channels":[{{"id":"tg","kind":"telegram","chat_id":"1","secret":"{secret}"}}],"rules":[]}}"#
+        ),
+    )
+    .unwrap();
+    let cfg = temp_file(
+        "good_alerts.toml",
+        &format!(
+            "[server]\nlisten_addr = \"127.0.0.1:0\"\ndata_dir = {data:?}\n[metrics]\nlisten_addr = \"127.0.0.1:0\"\n"
+        ),
+    );
+    let out = config_check(&cfg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("alerts OK") && !stdout.contains("SECRETtoken"),
+        "{stdout}"
+    );
+}

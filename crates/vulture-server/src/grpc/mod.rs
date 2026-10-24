@@ -31,6 +31,7 @@ pub use stream::{
 };
 pub use stub::HistoryStub;
 
+use crate::alerts::AlertsManager;
 use crate::auth::{
     AuthInterceptor, AuthStats, FailureLimiter, LimiterConfig, TokenAuthority, TokenError,
     TokenStore,
@@ -123,6 +124,8 @@ pub struct ServeOptions {
     pub stream: StreamConfig,
     /// Backend of the symbol RPCs of `Control`; without it they answer `UNIMPLEMENTED` like the rest.
     pub symbols: Option<Arc<SymbolManager>>,
+    /// Backend of the rule and channel RPCs of `Control`; without it they answer `UNIMPLEMENTED`.
+    pub alerts: Option<Arc<AlertsManager>>,
 }
 
 impl ServeOptions {
@@ -134,6 +137,7 @@ impl ServeOptions {
             limiter: LimiterConfig::default(),
             stream: StreamConfig::from_server(server),
             symbols: None,
+            alerts: None,
         }
     }
 }
@@ -217,9 +221,9 @@ where
         .layer(InterceptorLayer::new(interceptor))
         .add_service(StreamServer::new(stream))
         .add_service(HistoryServer::new(HistoryStub))
-        .add_service(ControlServer::new(ControlService::new(
-            options.symbols.clone(),
-        )))
+        .add_service(ControlServer::new(
+            ControlService::new(options.symbols.clone()).with_alerts(options.alerts.clone()),
+        ))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
         .await?;
     Ok(())
@@ -258,6 +262,7 @@ pub async fn start(
     store: Arc<dyn RedisStore>,
     authority: Arc<TokenAuthority>,
     symbols: Option<Arc<SymbolManager>>,
+    alerts: Option<Arc<AlertsManager>>,
     shutdown: CancellationToken,
 ) -> Result<GrpcHandle, GrpcError> {
     let tls_enabled = tls.is_some();
@@ -286,6 +291,7 @@ pub async fn start(
         );
         let mut options = ServeOptions::from_server(server);
         options.symbols = symbols;
+        options.alerts = alerts;
         async move {
             let result = match tls {
                 Some(tls) => {

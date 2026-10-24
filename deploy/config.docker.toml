@@ -41,3 +41,12 @@ oi_poll_interval_secs = 30
 # enabled = false
 # symbols = []            # empty = every linear USDT/USDC swap
 # oi_poll_interval_secs = 30
+
+# Signals and alerts (V4a). The engine is on by default; with no channel configured it only writes Signal events
+# into the stream. Rules and channels are set at runtime through Control and kept in /var/lib/vulture/alerts.json
+# (mode 0600, may hold secrets). Reference: config.example.toml, section [alerts], and the README, "Signals and
+# alerts". Put bot tokens and webhook URLs into files mounted read-only and reference them with secret_file, or
+# into the environment (secret_env); do not write them into this file.
+# [alerts]
+# enabled = true
+# warmup_secs = 14400

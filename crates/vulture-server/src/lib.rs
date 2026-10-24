@@ -3,6 +3,7 @@
 //! The binary (`vulture-server`) is a thin command-line wrapper; everything testable lives here.
 //!
 //! - [`config`]: TOML file plus environment overrides, secrets kept out of logs.
+//! - [`alerts`]: the analytics engine, OI spike and liquidation cascade signals, rules, Telegram and Discord delivery.
 //! - [`app`]: shared application context, signal handling, the run loop.
 //! - [`auth`]: the owner token (file, rotation), the interceptor and the failure limiter.
 //! - [`grpc`]: the tonic server: `Stream.Subscribe` with resume, stubs for `History` and `Control`.
@@ -16,6 +17,7 @@
 //! - [`metrics`]: Prometheus exposition, `/healthz` and `/readyz`.
 //! - [`logging`]: `tracing` setup.
 
+pub mod alerts;
 pub mod app;
 pub mod auth;
 pub mod config;

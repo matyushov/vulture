@@ -4,6 +4,8 @@ syntax = "proto3";
 
 package vulture.v1;
 
+import "vulture/v1/common.proto";
+
 service Control {
   // Subscriptions: exchanges and symbols.
   // Decision (v0.2): kept for compatibility but superseded by ListSymbolPolicies/SetSymbolPolicy,
@@ -32,6 +34,8 @@ service Control {
   rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
   rpc UpsertChannel(UpsertChannelRequest) returns (UpsertChannelResponse);
   rpc DeleteChannel(DeleteChannelRequest) returns (DeleteChannelResponse);
+  // Sends a test message to one channel right away, bypassing the queue and the batching (v0.4).
+  rpc SendTestMessage(SendTestMessageRequest) returns (SendTestMessageResponse);
   // Redis and flusher status.
   rpc GetStorageStatus(GetStorageStatusRequest) returns (GetStorageStatusResponse);
   // Token rotation; the new token is returned once.
@@ -177,11 +181,34 @@ message SetOiIntervalResponse {}
 
 message LiquidationRule {
   double min_notional_usd = 1;
+  // Liquidated side filter (added in v0.4); an empty list = both sides.
+  repeated Side sides = 2;
 }
 
+// Direct OI rule: |change of oi_base| over the window reaches min_change_pct (both directions).
 message OiChangeRule {
   double min_change_pct = 1;
   uint32 window_seconds = 2;
+  // Added in v0.4. Minimum absolute change in USD (change of oi_base times the mark price); 0 = no floor.
+  double min_change_usd = 3;
+  // Added in v0.4. When true the rule sends no message: it overrides the thresholds of the OI spike detector
+  // (min_change_pct and min_change_usd) for the window and for the exchanges/symbols the rule filters on.
+  bool detector_override = 4;
+}
+
+// Signal pass-through (added in v0.4): forwards the server's own signals to the channels.
+message SignalRule {
+  // An empty list = every signal type.
+  repeated SignalType types = 1;
+  // Signals below this severity are not forwarded; UNSPECIFIED = no minimum.
+  Severity min_severity = 2;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO = 1;
+  SEVERITY_WARNING = 2;
+  SEVERITY_CRITICAL = 3;
 }
 
 message GapRule {
@@ -197,6 +224,8 @@ message Rule {
     LiquidationRule liquidation = 10;
     OiChangeRule oi_change = 11;
     GapRule gap = 12;
+    // Added in v0.4.
+    SignalRule signal = 13;
   }
   // Filters; an empty list = no filter.
   repeated string exchanges = 4;
@@ -244,6 +273,19 @@ message Channel {
   // Responses only: a secret mask, for example "****abcd". The secret itself is never returned.
   string secret_mask = 6;
   reserved 7 to 9;
+  // Fields below were added in v0.4.
+  // Telegram: the chat id (or @channel name). Not a secret. Empty for Discord.
+  string chat_id = 10;
+  // Log the messages instead of sending them.
+  bool dry_run = 11;
+  // Where the secret comes from when it is not stored in alerts.json: a file or an environment variable on
+  // the server. Responses only report them; at most one of secret, secret_file, secret_env is set per channel.
+  string secret_file = 12;
+  string secret_env = 13;
+  // Delivery tuning; 0 = the server default for the channel kind.
+  uint32 min_interval_ms = 14;
+  uint32 batch_window_ms = 15;
+  uint32 queue_limit = 16;
 }
 
 message ListChannelsRequest {}
@@ -267,6 +309,19 @@ message DeleteChannelRequest {
 }
 
 message DeleteChannelResponse {}
+
+message SendTestMessageRequest {
+  string channel_id = 1;
+}
+
+message SendTestMessageResponse {
+  // The platform accepted the message (always false in dry-run mode).
+  bool delivered = 1;
+  // The channel is in dry-run mode: the message was only logged.
+  bool dry_run = 2;
+  // Short outcome without secrets, for example "ok", "HTTP 401" or "dry run".
+  string detail = 3;
+}
 
 // --- Storage ---
 

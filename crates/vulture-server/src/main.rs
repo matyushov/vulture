@@ -220,7 +220,7 @@ fn check(path: PathBuf) -> anyhow::Result<()> {
 }
 
 /// Checks the files in `server.data_dir` that already exist: `state.json` must be readable, of a known version
-/// and hold valid policies; the token file must hold a valid token and should not be readable by others. A
+/// and hold valid policies; `alerts.json` must be valid (it holds secrets, which are never printed); the token file must hold a valid token and should not be readable by others. A
 /// missing file is fine (the server creates it). Nothing secret is printed: only paths and reasons.
 fn data_dir_report(config: &Config) -> anyhow::Result<()> {
     let dir = &config.server.data_dir;
@@ -232,6 +232,26 @@ fn data_dir_report(config: &Config) -> anyhow::Result<()> {
             state.path().display(),
             policies.policies.len()
         );
+    }
+    let alerts = vulture_server::alerts::AlertsFile::new(dir);
+    let allow_custom = config.alerts.delivery.allow_custom_endpoints;
+    match alerts.load(allow_custom)? {
+        Some(doc) => println!(
+            "alerts OK: {} with {} rule(s), {} channel(s)",
+            alerts.path().display(),
+            doc.rules.len(),
+            doc.channels.len()
+        ),
+        None => {
+            // No file yet: the defaults of [[alerts.rules]] and [[alerts.channels]] are in force.
+            let mut doc = vulture_server::alerts::file::AlertsDoc {
+                version: vulture_server::alerts::file::ALERTS_VERSION,
+                rules: config.alerts.rules.clone(),
+                channels: config.alerts.channels.clone(),
+            };
+            vulture_server::alerts::file::validate_doc(&mut doc, allow_custom)
+                .map_err(|m| anyhow::anyhow!("alerts defaults in the configuration: {m}"))?;
+        }
     }
     let token = vulture_server::auth::TokenStore::new(dir);
     if token.read()?.is_some() {

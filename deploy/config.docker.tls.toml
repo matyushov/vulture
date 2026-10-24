@@ -46,3 +46,6 @@ oi_poll_interval_secs = 30
 # enabled = false
 # symbols = []            # empty = every linear USDT/USDC swap
 # oi_poll_interval_secs = 30
+
+# Signals and alerts (V4a): see config.docker.toml and config.example.toml, section [alerts]. Rules and channels live
+# in /var/lib/vulture/alerts.json (mode 0600, may hold secrets) and are managed through Control.

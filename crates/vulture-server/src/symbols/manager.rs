@@ -121,7 +121,7 @@ impl SymbolManager {
     ) -> Result<Arc<Self>, StateError> {
         let store = StateStore::new(&config.server.data_dir);
         let state = store.load()?;
-        let audit = Arc::new(AuditLog::new(&config.server.data_dir));
+        let audit = AuditLog::shared(&config.server.data_dir);
         let mut entries = BTreeMap::new();
         for (name, channel) in channels {
             if let Some(policy) = state.policies.get(&name) {

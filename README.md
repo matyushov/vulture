@@ -59,6 +59,9 @@ added to the repository.
   `RedisWriter` that batches, survives outages and records gaps (see "Redis storage").
 - `auth`: the owner token (file, rotation), the interceptor and the failure limiter; `grpc`: the tonic server with
   `Stream.Subscribe` and the `History`/`Control` stubs (see "gRPC API and token").
+- `alerts`: the analytics engine in the server process: per-symbol OI ring buffers, the OI spike and liquidation
+  cascade detectors, rules and channels (`alerts.json`), and delivery to Telegram and Discord (see "Signals and
+  alerts").
 - `tls`: rustls (ring) for the gRPC listener with hot reload of the certificate (see "TLS"); `metrics`: Prometheus
   exposition, `/healthz` and `/readyz` (see "Metrics").
 - `exchange`: the `Exchange` trait (`name()`, `run(ctx, sink)`); a connector owns its loop and pushes
@@ -92,7 +95,7 @@ excluded when it is delisted and relisted.
   typo must not silently track nothing; the check needs the symbol list, `FAILED_PRECONDITION` until it is loaded).
   `ALL` ignores the list. It is idempotent (a repeat answers `changed = false`), returns the tracked count and the
   added/removed diff, and stores the state before answering. Per-symbol OI interval overrides (`oi_intervals`) are
-  not supported: a non-empty list is refused with `UNIMPLEMENTED`. All other `Control` RPCs stay `UNIMPLEMENTED`.
+  not supported: a non-empty list is refused with `UNIMPLEMENTED`. The rule and channel RPCs are described in "Signals and alerts"; all other `Control` RPCs stay `UNIMPLEMENTED`.
   `cargo run -p vulture-server --example control_client -- --help` is a small client (TLS and token flags as in
   `stream_client`); the proper CLI comes in V5.
 - **Applied on the fly.** The connector receives the policy through `Exchange::symbols()` (a `SymbolChannel`, two
@@ -537,6 +540,235 @@ from that CA (mTLS); a client without one is refused at the handshake. The token
 Certificates in tests are generated on the fly (`rcgen`); `tests/tls.rs` covers handshake, reload by poll with an open
 stream, rejected replacements, mTLS and the file validation errors, `tests/tls_sighup.rs` a real `SIGHUP`.
 
+## Signals and alerts (V4a)
+
+An analytics engine runs **inside the server process**. It watches the event flow, publishes its own `Signal`
+events into the same stream (so the writer, Redis, the gRPC `Stream` and the ClickHouse flusher treat them like any
+other event) and sends messages to Telegram and Discord according to the owner's rules.
+
+```
+connectors ──► tap ──► Redis writer ──► Redis Stream ──► gRPC Stream, flusher
+                │                           ▲
+                └──► engine (own bounded queue)
+                       │  OI ring buffers, spike detector, cascade detector, rules
+                       ├──► Signal events ─────┘  (same channel as every event)
+                       └──► alerts ──► one queue per channel ──► Telegram / Discord
+```
+
+- **Never in the writer's way.** A forwarder task between the connectors and the writer offers a copy of each event
+  to the engine with `try_send`. If the engine's queue (`alerts.input_queue`) is full it drops *its own* input,
+  counts it (`vulture_alerts_engine_input_dropped_total`) and logs at most every 10 s; the writer receives every
+  event exactly as before. `[alerts] enabled = false` removes the tap entirely (and the rule and channel RPCs of
+  `Control` answer `UNIMPLEMENTED` again).
+- **Warm-up.** At start the engine replays the last `alerts.warmup_secs` (4 h) of the Redis stream through the
+  existing reader API (`bounds` and paged `read_range`), so a restart does not blind the detectors. The replay only
+  rebuilds state: no signal, no message. Stored `sig` entries restore the OI cooldowns, so a restart does not repeat
+  a signal. Live events that arrive during the replay wait in the engine's queue; samples are de-duplicated by
+  time, and liquidations at or before the replay's last timestamp are not counted twice.
+- **`Gap` events.** A `Gap` of an exchange (any stream except `liquidations`) or of the writer (`exchange = "*"`) marks
+  the open interest as discontinuous until its `to_ts`: windows whose reference point lies before that moment are
+  not evaluated. A pause longer than `alerts.hole_secs` (300 s) between two samples of one symbol (for example a
+  symbol that was untracked for a while) is treated the same way, because the change across a hole is not a market move. `hole_secs` must be at least twice the OI poll interval of every enabled exchange (`config
+check` enforces it), otherwise every window would look like it spans a hole.
+
+### OI spike detector (`OI_SPIKE_UP`, `OI_SPIKE_DOWN`)
+
+Per symbol of every exchange the engine keeps a ring buffer of `(ts, oi_base, oi_usd, mark_price)` for the last
+4 h plus 10 min (a sample is 32 bytes; at most `alerts.series_max_samples` = 1024 per symbol; samples closer than
+15 s to the previous one are ignored). **Memory bound:** one 512-slot buffer (16 KiB) per symbol in the usual
+case, at most `series_max_samples` x 32 B = 32 KiB when a connector samples every 15 s, and at most
+`alerts.max_symbols` (5000) symbols: about 31 MiB for 2000 symbols, 80 MiB at the symbol limit, 160 MiB in the
+absolute worst case; buffers of symbols that stopped reporting are dropped after the retention. The allocated bytes
+are exported as `vulture_alerts_engine_memory_bytes`. On every new sample, for each enabled window `w` (1m, 5m, 15m, 1h, 4h):
+
+1. `change_pct = 100 x (oi_base_now - oi_base_ref) / oi_base_ref`, the reference being the sample nearest to
+   `now - w` within a tolerance of `w/8` (15 s to 300 s; the 1 m window works with 30 s sampling). **`oi_base`**,
+   not `oi_usd`, is compared, so a price move alone never looks like a spike. `change_abs` is the change in base
+   units; `change_usd = change_abs x mark_price`.
+2. All of these must hold: `|change_pct| >= threshold_pct(w)`, `|change_usd| >= min_change_usd(w)`,
+   `oi_usd_now >= min_oi_usd` (dust is ignored).
+3. **Unusual for the symbol.** `|change_pct - median| >= z_min x sigma`, where `median` and `sigma` describe the
+   symbol's own earlier changes over the same window (evaluated at up to 200 earlier points of the retained
+   history, before the current window): `sigma = max(1.4826 x MAD, (p90 - p10) / 2.563)`, floored at
+   `threshold_pct / 8`. The second term keeps a restless symbol (one that jumps in more than half of the
+   samples, which collapses the MAD) from alarming at its usual size. The 4 h window has no earlier history; it
+   uses the symbol's step-to-step volatility scaled by `sqrt(steps in the window)`. At least
+   `min_baseline_points` (60) points are needed; without them nothing is signalled (`require_baseline = true`),
+   so a symbol that has just appeared is silent for about 30 minutes after a cold start.
+4. **Cooldown** per (exchange, symbol, window, direction): `cooldown_secs` (15 min). Inside it a move still
+   signals when it reaches `extension_factor` (1.5) times the last signalled one.
+5. **Overlapping windows** of one direction become one signal: the window with the largest
+   `|change_pct| / threshold` is reported (`window_secs`, `change_pct`, `change_abs`, `threshold`), the others are
+   listed in `details["windows"]`.
+
+Defaults (`[alerts.oi_spike]`, replaceable with `[[alerts.oi_spike.windows]]`):
+
+| window | threshold_pct | min_change_usd |
+|---|---|---|
+| 1m | 1.5 | 250 000 |
+| 5m | 3 | 500 000 |
+| 15m | 5 | 1 000 000 |
+| 1h | 8 | 2 000 000 |
+| 4h | 12 | 3 000 000 |
+
+`min_oi_usd = 1 000 000`, `z_min = 4`. **Per-exchange and per-symbol overrides** are stored with the rules: an
+`OiChange` rule with `detector_override = true` replaces `min_change_pct` and `min_change_usd` of the detector for
+its window and its exchange/symbol filters (a symbol rule beats an exchange rule beats the default) and sends
+nothing itself.
+
+`Signal.details` carries `key` (a deterministic identity, `type:exchange:symbol:window:ts`), `severity`
+(`|change_pct| / threshold` below 2 is `info`, below 4 `warning`, otherwise `critical`), `windows`,
+`window_secs_all`, `oi_base`, `oi_base_ref`, `oi_usd`, `change_usd`, `mark_price`, `ref_ts`, `z` and `baseline`.
+V3-8a's `History.Aggregate` ranking of OI moves must use the same change formula (reference sample nearest to
+`now - w`, `oi_base`, gaps excluded); the arithmetic is `alerts::series::Series::change`.
+
+### Liquidation cascade detector (`LIQ_CASCADE`)
+
+Scopes: market-wide (`exchange = "*"`) and, with `per_exchange`, each exchange. Per scope:
+
+- **Baseline:** the notional per clock-aligned minute over the previous `baseline_secs` (24 h), completed minutes
+  only; a minute in which the process saw any event but no liquidation counts as zero, a minute it did not see is
+  absent. `median` and `MAD` of those values, `sigma = max(1.4826 x MAD, 0.1 x median)`, recomputed when the minute
+  changes. At least `min_baseline_minutes` (120) are required; before that the trigger is `3 x floor`. The baseline
+  covers as much as the warm-up replayed (4 h by default) plus the uptime, up to 24 h; set `alerts.warmup_secs =
+  86400` to replay the whole day at start (the replay costs about 10 s per 6 million entries, measured below).
+- **Start:** the notional of the last 60 s (a sliding window, evaluated at every liquidation) is at least
+  `max(floor, median + k_mad x sigma)` (`floor_usd` 2 M market-wide, `floor_usd_exchange` 1 M; `k_mad` 8) and the
+  window holds at least `min_count` (5) liquidations. A signal with `details["phase"] = "start"` carries the
+  running totals.
+- **End:** the cascade is *hot* while the last `min(quiet_secs, 60)` seconds hold at least `end_ratio x trigger x
+  min(quiet_secs, 60) / 60`; it ends after `quiet_secs` (120) without being hot. A closing signal
+  (`phase = "end"`) carries `duration_secs`, `total_usd`, `count`, `long_usd`, `short_usd`, `long_share`,
+  `peak_usd_per_min`, `top_symbols` and `price_low` / `price_high` of the top symbol.
+- Signal fields: `symbol` empty, `window_secs` 60, `change_pct` the intensity relative to the baseline
+  (`100 x value / max(median, 1000)`), `change_abs` the notional in USD (the window at the start, the total at the
+  end), `threshold` the trigger in the same unit; severity `critical` at 3x the trigger, otherwise `warning`.
+
+### Rules and channels
+
+State file `<data_dir>/alerts.json`: versioned (`"version": 1`), written atomically (temporary file, `fsync`,
+rename) with mode `0600`, and **a corrupt or unknown-version file stops the start** with a message that never quotes
+the file's content (same policy as `state.json`; `vulture-server config check` validates it). While the file does
+not exist, `[[alerts.rules]]` and `[[alerts.channels]]` of the configuration are in force; the first change through
+`Control` writes the file with those defaults and the change, and from then on the file alone decides. Layout:
+
+```json
+{
+  "version": 1,
+  "channels": [
+    {"id": "tg-main", "name": "Main chat", "kind": "telegram", "enabled": true,
+     "chat_id": "-1001234567890", "secret": "<bot token>"},
+    {"id": "dc-main", "name": "Discord", "kind": "discord", "enabled": true,
+     "secret_env": "VULTURE_DISCORD_WEBHOOK"}
+  ],
+  "rules": [
+    {"id": "big-liq", "name": "Liquidations over 500k", "enabled": true, "cooldown_secs": 60,
+     "exchanges": [], "symbols": [], "channels": ["tg-main"],
+     "kind": {"type": "liquidation", "min_notional_usd": 500000, "sides": []}},
+    {"id": "signals", "name": "Spikes and cascades", "enabled": true, "channels": ["tg-main", "dc-main"],
+     "kind": {"type": "signal", "types": [], "min_severity": "warning"}}
+  ]
+}
+```
+
+| rule `kind.type` | fields | meaning |
+|---|---|---|
+| `liquidation` | `min_notional_usd`, `sides` (`long`/`short`, empty = both) | one liquidation of at least that notional |
+| `oi_change` | `window_secs` (30 to 14400), `min_change_pct`, `min_change_usd`, `detector_override` | `|change of oi_base|` over the window (both directions, no z-score); with `detector_override` it only retunes the detector |
+| `signal` | `types` (`oi_spike_up`, `oi_spike_down`, `liq_cascade`; empty = all), `min_severity` | pass the server's own signals on |
+
+Every rule has `exchanges` and `symbols` filters (empty = all; symbols are normalized, `BTC-USDT-PERP`), `channels`,
+`cooldown_secs` and `enabled`. The cooldown is per (rule, exchange, symbol); for signals it also includes the
+cascade phase, so a closing summary is never swallowed by the cooldown of the start. Rules are evaluated on the live
+flow only (not during the warm-up) and swapped atomically: a change takes effect for the next event.
+
+A channel's secret (bot token, or the whole webhook URL) comes from exactly one of `secret` (stored in
+`alerts.json`), `secret_file` or `secret_env`, resolved each time a message is sent (so a rotated file is picked up).
+**Secrets never leave the server**: API replies carry a mask (`****` and the last four characters, nothing for short
+secrets), errors and logs never quote them (transport errors are logged without the URL, which holds the Telegram
+token), the audit line records only `secret_changed`. Discord webhooks must be `https://discord.com/api/webhooks/...`
+(also `discordapp.com`, `ptb.` and `canary.`) unless `alerts.delivery.allow_custom_endpoints` is set (tests).
+
+`Control` RPCs (behind the token): `ListRules`, `UpsertRule`, `DeleteRule`, `ListChannels`, `UpsertChannel`,
+`DeleteChannel` and the new `SendTestMessage`. Validation answers `INVALID_ARGUMENT` (unknown channel in a rule,
+bad id or symbol, missing kind, malformed secret, ...), deleting a channel that rules use `FAILED_PRECONDITION`,
+`SendTestMessage` on an unknown channel `NOT_FOUND`, gap rules `UNIMPLEMENTED` (system alerts, V4-5), a failed write
+`INTERNAL` (nothing changed). Upserts are idempotent (a repeat writes nothing and leaves no audit line), an empty
+`id` creates a rule or channel with a server-assigned one, an empty `secret` keeps the current one, deleting what does
+not exist succeeds. Every change is one JSON line in `<data_dir>/audit.log` (the file the symbol policies use) and one
+log line. `SendTestMessage` sends at once, without queue, batching or retry, and answers `delivered`, `dry_run` and a
+short `detail` (`ok`, `HTTP 401 ...`, `dry run`). Per-channel `dry_run` logs the message instead of sending it.
+
+### Delivery
+
+One task and one bounded queue per channel. The task takes the first alert, waits `batch_window_ms` (3 s) for the
+rest of the burst, and sends everything queued as **one message**: a single alert gets the full form, several a
+compact digest ("12 alerts", the first `digest_max_items` listed, "and N more"). Telegram uses the Bot API
+`sendMessage` with HTML parse mode (`<`, `>` and `&` escaped, timestamps in UTC); Discord a webhook POST with one
+embed, markdown escaped and mentions switched off (`allowed_mentions.parse = []`). Compact numbers (`$1.23M`).
+
+- **Rate limit** per channel: at least `telegram_min_interval_ms` (1100) / `discord_min_interval_ms` (2000) between
+  messages and at most `*_max_per_minute` (20) per minute; per channel `min_interval_ms` overrides. A cascade of
+  thousands of liquidations therefore becomes a few messages with correct totals.
+- **429:** the wait is the platform's `retry_after` (Telegram `parameters.retry_after`, Discord JSON `retry_after`
+  or `Retry-After`; capped at one hour), then the same message is sent again. Discord's
+  `X-RateLimit-Remaining: 0` makes the task wait `X-RateLimit-Reset-After` before the next call.
+- **Failures** (connection errors, timeouts, 5xx): exponential backoff with jitter from `retry_min_ms` (1 s) to
+  `retry_max_ms` (60 s), `max_attempts` (8) per message; other 4xx are not retried. A message given up is counted
+  as dropped and announced in the next one ("N messages dropped").
+- **Overflow:** a queue above `queue_limit` (500) drops its oldest alerts; the next message says how many.
+
+### Metrics
+
+| series | content |
+|---|---|
+| `vulture_alerts_engine_events_total{type}`, `_engine_input_dropped_total`, `_engine_symbols_rejected_total` | events seen, the engine's own input drops |
+| `vulture_alerts_signals_total{type}`, `_suppressed_total{detector,reason}`, `_cascades_total{phase}` | signals by type; candidates suppressed by cooldown, "usual for the symbol", missing baseline, dust (`oi_spike`) and by rule cooldown (`rules`) |
+| `vulture_alerts_evaluations_total`, `_evaluation_seconds_sum`, `_evaluation_seconds_max` | evaluation time per event |
+| `vulture_alerts_series`, `_samples`, `_engine_memory_bytes` | ring buffers: symbols, samples, allocated bytes |
+| `vulture_alerts_warmup_seconds`, `_warmup_entries`, `_warmed_up` | the last warm-up |
+| `vulture_alerts_queued_total`, `_rules_active`, `_config_changes_total`, `_config_rejected_total` | alerts handed to queues, rules in force, `Control` changes |
+| `vulture_alerts_channel_{sent,alerts_sent,failed,dropped,retries,rate_limited,dry_run,disabled_skipped}_total{channel,kind}`, `_channel_queue_depth`, `_channel_last_success_age_seconds` | per channel (the age is absent before the first success) |
+
+### Enabling real delivery
+
+Delivery to the real services is switched on by the owner, never by the repository's tests (they use local mock
+servers only). Telegram: create a bot with @BotFather, put the bot into the chat or channel and note its id; Discord:
+create a webhook in the channel settings. Keep the secrets out of the configuration file, for example in files that
+the container mounts read-only. Then, with a token from `vulture-server token show` and
+[grpcurl](https://github.com/fullstorydev/grpcurl):
+
+```sh
+H="authorization: Bearer $VULTURE_TOKEN"; P="-import-path proto -proto vulture/v1/control.proto"
+# 1. A channel in dry-run mode first (secret goes into alerts.json; or use secret_file / secret_env):
+grpcurl -plaintext $P -H "$H" -d '{"channel": {"id": "tg-main", "name": "Main chat", "kind": "CHANNEL_KIND_TELEGRAM",
+  "enabled": true, "chat_id": "-1001234567890", "dry_run": true}, "secret": "<bot token>"}' \
+  127.0.0.1:50051 vulture.v1.Control/UpsertChannel
+# 2. A rule that forwards warning signals:
+grpcurl -plaintext $P -H "$H" -d '{"rule": {"id": "signals", "enabled": true, "channel_ids": ["tg-main"],
+  "signal": {"min_severity": "SEVERITY_WARNING"}}}' 127.0.0.1:50051 vulture.v1.Control/UpsertRule
+# 3. Watch the dry-run lines in the server log, then switch dry_run off (same call, "dry_run": false, empty secret
+#    keeps the stored one) and send a test message:
+grpcurl -plaintext $P -H "$H" -d '{"channel_id": "tg-main"}' 127.0.0.1:50051 vulture.v1.Control/SendTestMessage
+```
+
+(With TLS, drop `-plaintext` and pass the CA as in the examples above.) `delivered: true` means the platform accepted
+the message. Editing `alerts.json` by hand while the server is stopped works as well.
+
+### Measurements (2026-10-25, Apple M5 Pro, release build, synthetic data)
+
+`cargo run --release -p vulture-server --example synth_alerts -- memory|load|warmup`:
+
+| what | result |
+|---|---|
+| memory, 2000 symbols x 480 samples (4 h at 30 s) | ring buffers 31.3 MiB allocated (32 B per sample, 512 slots per symbol); process RSS grows by 32.5 MiB |
+| CPU at 3 500 events/s (95 % open interest, each one a full five-window evaluation, 5 % liquidations; 30 s through the real tap and engine task) | mean 4.1 us per event, 14 ms of evaluation per second of load (1.4 % of one core); whole process 0.85 s CPU in 30 s including the generator (generator alone 0.31 s); maximum single evaluation 0.11 ms, no input dropped |
+| the same with every symbol falling 8 % in one round (the detector's expensive path) | mean 3.9 us, 2 111 down signals, max 0.16 ms |
+| warm-up from a 4 h stream on a local Redis (2000 symbols, 998 400 entries) | 1.58 s (630 000 entries/s), +42 MiB RSS while replaying; extrapolated to a full 24 h stream (about 6 million entries) roughly 10 s |
+
+The synthetic market is a quiet random walk; real data will differ in how often candidates reach the baseline step.
+Re-measure on the server with the metrics above.
+
 ## Metrics
 
 A separate listener, `metrics.listen_addr` (default `127.0.0.1:9100`), serves `/metrics` (Prometheus text format),
@@ -560,6 +792,7 @@ atomic counters and reports them at scrape time. Labels are low-cardinality on p
 | `vulture_grpc_*`, `vulture_auth_*` | clients, subscriptions, events sent, slow-client disconnects, resumes, out-of-range, failed and rate-limited authentications |
 | `vulture_flusher_*`, `vulture_clickhouse_*` | ClickHouse flusher and storage (see "ClickHouse history"): rows, failures, lag, backlog, reachability, disk, parts |
 | `vulture_tls_*` | enabled, seconds until expiry, reloads by `result`, last reload ok, handshake failures |
+| `vulture_alerts_*` | analytics engine, detectors, rules and per-channel delivery (see "Signals and alerts") |
 
 The Redis stream length and entry ages are sampled every 15 s (they need round trips to Redis), the rest is read at
 scrape time. `deploy/prometheus/` has a sample scrape configuration and alert rules (writer buffer growing, Redis

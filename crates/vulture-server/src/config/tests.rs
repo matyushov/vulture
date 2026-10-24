@@ -375,3 +375,136 @@ fn clickhouse_password_comes_from_a_file() {
         ""
     );
 }
+
+#[test]
+fn alerts_defaults_are_the_documented_ones() {
+    let cfg = parse("", no_env()).unwrap();
+    let a = &cfg.alerts;
+    assert!(a.enabled);
+    assert_eq!(a.warmup_secs, 14_400);
+    assert_eq!(
+        a.oi_spike
+            .windows
+            .iter()
+            .map(|w| w.secs)
+            .collect::<Vec<_>>(),
+        [60, 300, 900, 3600, 14_400]
+    );
+    assert_eq!(a.oi_spike.windows[1].threshold_pct, 3.0);
+    assert_eq!(a.liq_cascade.baseline_secs, 86_400);
+    assert_eq!(a.delivery.telegram_base_url, "https://api.telegram.org");
+    assert!(!a.delivery.allow_custom_endpoints);
+    assert!(a.channels.is_empty() && a.rules.is_empty());
+}
+
+#[test]
+fn alerts_defaults_for_rules_and_channels_parse() {
+    let cfg = parse(
+        r#"
+        [[alerts.channels]]
+        id = "tg"
+        kind = "telegram"
+        chat_id = "-100"
+        secret_env = "TOKEN_VAR"
+        dry_run = true
+
+        [[alerts.rules]]
+        id = "sig"
+        channels = ["tg"]
+        [alerts.rules.kind]
+        type = "signal"
+        min_severity = "warning"
+
+        [[alerts.oi_spike.windows]]
+        secs = 300
+        threshold_pct = 2.5
+        min_change_usd = 100000.0
+        "#,
+        no_env(),
+    )
+    .unwrap();
+    assert_eq!(cfg.alerts.channels[0].id, "tg");
+    assert!(cfg.alerts.channels[0].dry_run && cfg.alerts.channels[0].enabled);
+    assert_eq!(cfg.alerts.rules.len(), 1);
+    assert_eq!(
+        cfg.alerts.oi_spike.windows.len(),
+        1,
+        "a given list replaces the defaults"
+    );
+}
+
+#[test]
+fn alerts_problems_are_listed() {
+    let err = parse(
+        r#"
+        [alerts]
+        input_queue = 0
+        hole_secs = 1
+        [alerts.liq_cascade]
+        end_ratio = 2.0
+        [alerts.delivery]
+        telegram_base_url = "ftp://x"
+        [[alerts.oi_spike.windows]]
+        secs = 5
+        threshold_pct = 1.0
+        min_change_usd = 0.0
+        "#,
+        no_env(),
+    )
+    .unwrap_err()
+    .to_string();
+    for needle in [
+        "input_queue",
+        "hole_secs",
+        "end_ratio",
+        "telegram_base_url",
+        "oi_spike.windows",
+    ] {
+        assert!(err.contains(needle), "{needle} missing in {err}");
+    }
+}
+
+#[test]
+fn alerts_unknown_keys_are_refused() {
+    assert!(parse("[alerts]\nnope = 1\n", no_env()).is_err());
+    assert!(parse("[alerts.delivery]\nnope = 1\n", no_env()).is_err());
+}
+
+#[test]
+fn alerts_environment_overrides_apply() {
+    let cfg = parse(
+        "",
+        env(&[
+            ("VULTURE__ALERTS__ENABLED", "false"),
+            ("VULTURE__ALERTS__OI_SPIKE__Z_MIN", "6.5"),
+        ]),
+    )
+    .unwrap();
+    assert!(!cfg.alerts.enabled);
+    assert_eq!(cfg.alerts.oi_spike.z_min, 6.5);
+}
+
+#[test]
+fn hole_limit_must_cover_the_oi_interval() {
+    let err = parse(
+        "[[exchanges]]\nname = \"binance\"\noi_poll_interval_secs = 200\n",
+        no_env(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("hole_secs") && err.contains("oi_poll_interval_secs"),
+        "{err}"
+    );
+    // Fine when the engine is off, or the limit is raised.
+    parse(
+        "[alerts]\nenabled = false\n[[exchanges]]\nname = \"binance\"\noi_poll_interval_secs = 200\n",
+        no_env(),
+    )
+    .unwrap();
+    parse(
+        "[alerts]\nhole_secs = 600\n[[exchanges]]\nname = \"binance\"\noi_poll_interval_secs = 200\n",
+        no_env(),
+    )
+    .unwrap();
+}

@@ -80,8 +80,26 @@ impl AuditLog {
         self.path.with_file_name(name)
     }
 
+    /// The process-wide log of `data_dir`: every component that audits into the same file shares one instance (and
+    /// one lock), so rotation cannot race between them.
+    pub fn shared(data_dir: &Path) -> std::sync::Arc<Self> {
+        static LOGS: std::sync::OnceLock<
+            Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<AuditLog>>>,
+        > = std::sync::OnceLock::new();
+        let map = LOGS.get_or_init(Default::default);
+        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(data_dir.join(AUDIT_FILE))
+            .or_insert_with(|| std::sync::Arc::new(Self::new(data_dir)))
+            .clone()
+    }
+
     /// Appends one line, rotating first when needed.
     pub fn append(&self, record: &AuditRecord) -> std::io::Result<()> {
+        self.append_any(record)
+    }
+
+    /// Appends any serializable record as one line.
+    pub fn append_any<T: Serialize>(&self, record: &T) -> std::io::Result<()> {
         let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
         line.push('\n');
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());

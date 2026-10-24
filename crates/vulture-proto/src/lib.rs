@@ -192,6 +192,7 @@ mod tests {
                 enabled: true,
                 kind: Some(rule::Kind::Liquidation(LiquidationRule {
                     min_notional_usd: 1e6,
+                    sides: vec![Side::Long as i32],
                 })),
                 exchanges: vec![],
                 symbols: vec![],
@@ -207,8 +208,35 @@ mod tests {
                 enabled: true,
                 system: false,
                 secret_mask: String::new(),
+                chat_id: "-100".into(),
+                dry_run: true,
+                secret_file: String::new(),
+                secret_env: "VULTURE_TG_TOKEN".into(),
+                min_interval_ms: 1000,
+                batch_window_ms: 2000,
+                queue_limit: 100,
             }),
             secret: "x".into(),
+        });
+        round_trip(&UpsertRuleRequest {
+            rule: Some(Rule {
+                id: "s".into(),
+                name: String::new(),
+                enabled: true,
+                kind: Some(rule::Kind::Signal(SignalRule {
+                    types: vec![SignalType::LiqCascade as i32],
+                    min_severity: Severity::Warning as i32,
+                })),
+                exchanges: vec![],
+                symbols: vec![],
+                channel_ids: vec![],
+                cooldown_seconds: 0,
+            }),
+        });
+        round_trip(&SendTestMessageResponse {
+            delivered: false,
+            dry_run: true,
+            detail: "dry run".into(),
         });
         round_trip(&GetStorageStatusResponse {
             redis_used_bytes: 1,

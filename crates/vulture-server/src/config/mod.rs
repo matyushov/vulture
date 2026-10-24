@@ -6,6 +6,7 @@
 //! `VULTURE__EXCHANGES__0__ENABLED=false`. Secrets (`redis.url`) can come from the environment or from a
 //! file (`redis.url_file`) and are wrapped in [`Secret`], which never prints its value.
 
+mod alerts;
 mod env;
 mod secret;
 
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+pub use alerts::{AlertsConfig, CascadeConfig, DeliveryConfig, OiSpikeConfig, OiWindow};
 pub use env::ENV_PREFIX;
 pub use secret::Secret;
 
@@ -74,6 +76,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     /// Normalization data.
     pub normalize: NormalizeConfig,
+    /// Analytics engine, signals, rules and delivery.
+    pub alerts: AlertsConfig,
 }
 
 /// `[server]` section.
@@ -491,6 +495,18 @@ impl Config {
                 .is_some_and(|p| p.as_os_str().is_empty())
             {
                 problems.push("tls.client_ca must not be empty when set".into());
+            }
+        }
+        self.alerts.validate(&mut problems);
+        if self.alerts.enabled {
+            for (i, ex) in self.exchanges.iter().enumerate() {
+                if ex.enabled && ex.oi_poll_interval_secs.saturating_mul(2) > self.alerts.hole_secs
+                {
+                    problems.push(format!(
+                        "alerts.hole_secs ({}) must be at least twice exchanges[{i}].oi_poll_interval_secs ({}), otherwise every window looks like it spans a hole",
+                        self.alerts.hole_secs, ex.oi_poll_interval_secs
+                    ));
+                }
             }
         }
         if tracing_subscriber::EnvFilter::try_new(&self.logging.level).is_err() {
