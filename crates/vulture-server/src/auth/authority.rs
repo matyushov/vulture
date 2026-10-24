@@ -162,18 +162,30 @@ impl TokenAuthority {
     }
 
     /// Polls the token file every `interval` until `shutdown` fires, so that `token rotate` run by another
-    /// process takes effect within one interval.
+    /// process takes effect within one interval. A changed file is judged only when two consecutive polls see the
+    /// same content: an editor or `echo > file` first truncates the file and then writes it, and a poll in
+    /// between must not count the empty (or half-written) file as a rejected edit or accept a partial token.
     pub async fn watch_file(self: Arc<Self>, interval: Duration, shutdown: CancellationToken) {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut previous: Option<u64> = None;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {
                     let this = self.clone();
+                    let seen_before = previous;
                     // File I/O off the async worker threads.
-                    match tokio::task::spawn_blocking(move || this.refresh()).await {
-                        Ok(_) => {}
+                    let polled = tokio::task::spawn_blocking(move || {
+                        let fingerprint = this.store.read_fingerprinted().1;
+                        if seen_before == Some(fingerprint) {
+                            this.refresh();
+                        }
+                        fingerprint
+                    })
+                    .await;
+                    match polled {
+                        Ok(fingerprint) => previous = Some(fingerprint),
                         Err(e) => tracing::error!(error = %e, "token refresh task failed"),
                     }
                 }
