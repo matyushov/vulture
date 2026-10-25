@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "FakeHttpServer.h"
 #include "FakeStreamServer.h"
 #include "TestUtil.h"
+#include "chart/PriceSource.h"
 #include "ui/ConnectionDialog.h"
 #include "ui/MainWindow.h"
+#include "util/SemanticColors.h"
 
 #include <QElapsedTimer>
 #include <QGuiApplication>
@@ -138,6 +141,7 @@ class TstSmoke : public QObject
     QTemporaryDir m_dir;
     std::unique_ptr<Settings> m_settings;
     std::unique_ptr<FakeStreamServer> m_server;
+    std::unique_ptr<FakeHttpServer> m_http; ///< stands in for the public kline endpoints
     std::unique_ptr<MainWindow> m_window;
     std::unique_ptr<Heartbeat> m_beat;
     std::unique_ptr<QSignalSpy> m_notify;
@@ -164,6 +168,13 @@ private slots:
         m_window->setInteractive(false);
         m_window->setSystemNotifications(false);
         m_window->setClientOptions(fastOptions());
+        // Never reach the real exchanges from tests: every kline endpoint points at a local server.
+        m_http = std::make_unique<FakeHttpServer>();
+        QVERIFY(m_http->start());
+        m_http->setReply({200, "[]", 0, false});
+        auto *source = static_cast<KlinePriceSource *>(m_window->chartController()->priceSource());
+        for (const char *ex : {"binance", "bybit", "okx"})
+            source->setBaseUrl(ex, m_http->baseUrl());
         m_window->resize(1360, 820);
         m_window->show();
         QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
@@ -189,6 +200,7 @@ private slots:
         m_notify = std::make_unique<QSignalSpy>(m_window->notifier(), &LargeLiquidationNotifier::notify);
         m_beat = std::make_unique<Heartbeat>();
 
+        m_window->setReplayLookbackMs(0); // these tests use old fake event ids; replay has its own tests
         m_window->connectTo(config());
         QTRY_COMPARE_WITH_TIMEOUT(m_window->tabs()->count(), 5, 8000);
         QStringList titles;
@@ -277,10 +289,15 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(m_window->statusIndicator()->plainText().startsWith("Live"), 5000);
         // The reconnect is visible as a row in the feed of every tab.
         ExchangeTab *tab = m_window->exchangeTab("bybit");
-        bool found = false;
-        for (int r = 0; r < tab->feed()->model()->rowCount() && !found; ++r)
-            found = tab->feed()->model()->eventAt(r).text.contains("Reconnected, resumed after event");
-        QVERIFY(found);
+        // The marker travels in the next 33 ms batch, possibly after the status change: wait for it.
+        auto hasMarker = [tab] {
+            for (int r = 0; r < tab->feed()->model()->rowCount(); ++r) {
+                if (tab->feed()->model()->eventAt(r).text.contains("Reconnected, resumed after event"))
+                    return true;
+            }
+            return false;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(hasMarker(), 10000);
     }
 
     void screenshotsInLightAndDarkThemes()
@@ -322,6 +339,90 @@ private slots:
         QApplication::setPalette(QPalette());
         Q_UNUSED(original);
         QVERIFY2(lightness[0] > lightness[1] + 0.2, "the light and dark color schemes must differ visibly");
+    }
+
+    void chartFillsFromFakeServersAndRendersInBothThemes()
+    {
+        ExchangeTab *tab = m_window->exchangeTab("binance");
+        QVERIFY(tab);
+        m_window->tabs()->setCurrentWidget(tab);
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        const qint64 bin = 300'000;
+        const qint64 cur = now - now % bin;
+        QByteArray klines = "[";
+        for (int i = 0; i < 24; ++i) {
+            const double p = 64'000 + 300 * std::sin(i / 3.0);
+            const double o = p - 40 + (i % 3) * 30;
+            const double c = p + 40 - (i % 4) * 25;
+            klines += (i ? "," : "") + QByteArray("[") + QByteArray::number(cur - (23 - i) * bin) + ",\"" +
+                      QByteArray::number(o, 'f', 1) + "\",\"" + QByteArray::number(std::max(o, c) + 35, 'f', 1) + "\",\"" +
+                      QByteArray::number(std::min(o, c) - 30, 'f', 1) + "\",\"" + QByteArray::number(c, 'f', 1) + "\",\"" +
+                      QByteArray::number(120 + i * 3) + "\"]";
+        }
+        klines += "]";
+        m_http->setReply({200, klines, 0, false});
+
+        Plan history;
+        for (int i = 0; i < 23 * 10; ++i) {
+            const qint64 ts = cur - 22 * bin + i * 30'000;
+            history.events.push_back(openInterest(std::to_string(ts) + "-0", "binance", "BTC-USDT-PERP",
+                                                  50'000 + 900 * std::sin(i / 20.0) + i * 2, -1, 64'000 + 300 * std::sin(i / 30.0), ts));
+            if (i % 7 == 0)
+                history.events.push_back(liquidation(std::to_string(ts + 1) + "-0", "binance", "BTC-USDT-PERP",
+                                                     (i / 7) % 3 ? v1::SIDE_LONG : v1::SIDE_SHORT, 64'000, 1,
+                                                     40'000.0 + 25'000.0 * ((i / 7) % 5), ts + 1));
+        }
+        history.events.push_back(gap("9-0", "binance", "open_interest", cur - 9 * bin, cur - 8 * bin));
+        m_server->pushPlan(history);
+
+        // Select BTC in the symbols list: the chart dock loads it.
+        tab->symbols()->searchEdit()->setText("BTC");
+        QTRY_VERIFY_WITH_TIMEOUT(tab->symbols()->proxy()->rowCount() >= 1, 3000);
+        tab->symbols()->view()->selectRow(0);
+        tab->symbols()->view()->setCurrentIndex(tab->symbols()->proxy()->index(0, SymbolModel::Symbol));
+        QTRY_VERIFY_WITH_TIMEOUT(tab->chart()->showing(), 3000);
+        ChartController *chart = m_window->chartController();
+        QTRY_VERIFY_WITH_TIMEOUT(chart->snapshot().price.ready() && chart->snapshot().oi.ready(), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(!chart->model()->historyLoading(), 10000);
+        QVERIFY(!chart->snapshot().approximatePrice);
+        QCOMPARE(m_server->seen().back().symbols, std::vector<std::string>{"BTC-USDT-PERP"});
+        QTest::qWait(300);
+
+        const Qt::ColorScheme schemes[2] = {Qt::ColorScheme::Light, Qt::ColorScheme::Dark};
+        const char *names[2] = {"light", "dark"};
+        for (int i = 0; i < 2; ++i) {
+            applyColorScheme(schemes[i]);
+            QTest::qWait(200);
+            tab->chart()->view()->setCursorBin(15, 1, 0.0);
+            QTest::qWait(150);
+            const QImage img = m_window->grab().toImage();
+            QVERIFY(!img.isNull());
+            const QImage plot = tab->chart()->view()->widget()->grab().toImage();
+            // The chart really drew: both candle colors and both OI colors appear in the plot.
+            const SemanticColors sc = semanticColors(tab->chart()->palette());
+            auto has = [&plot](const QColor &c) {
+                for (int y = 0; y < plot.height(); y += 1)
+                    for (int x = 0; x < plot.width(); x += 1) {
+                        const QColor p = plot.pixelColor(x, y);
+                        if (std::abs(p.red() - c.red()) < 6 && std::abs(p.green() - c.green()) < 6 && std::abs(p.blue() - c.blue()) < 6)
+                            return true;
+                    }
+                return false;
+            };
+            QVERIFY2(has(sc.candleUp) && has(sc.candleDown), names[i]);
+            QVERIFY2(has(sc.oiPositive) && has(sc.oiNegative), names[i]);
+            QVERIFY2(has(sc.liqShort) && has(sc.liqLong), names[i]);
+            QVERIFY(!tab->chart()->view()->tooltipText().isEmpty());
+            if (!shotDir().isEmpty()) {
+                QVERIFY(img.save(QStringLiteral("%1/chart-main-%2.png").arg(shotDir(), names[i])));
+                QVERIFY(plot.save(QStringLiteral("%1/chart-plot-%2.png").arg(shotDir(), names[i])));
+            }
+        }
+        QGuiApplication::styleHints()->unsetColorScheme();
+        QApplication::setPalette(QPalette());
+        tab->symbols()->searchEdit()->clear();
+        tab->symbols()->clearSelection();
+        QTRY_VERIFY_WITH_TIMEOUT(!chart->selected(), 3000);
     }
 
     void dockLayoutIsSavedAndRestored()

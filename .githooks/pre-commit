@@ -1,0 +1,11 @@
+#!/bin/sh
+# Pre-commit hook: refuse a commit whose staged changes look like they contain a secret (token, key, password).
+# Enable once per clone:   git config core.hooksPath .githooks
+# Needs gitleaks (macOS: brew install gitleaks). Without it the hook only warns, CI still scans every push.
+# Rules and exceptions: .gitleaks.toml in the repository root. To skip in an emergency: git commit --no-verify
+# (the CI "secrets" job will still check the pushed history).
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks is not installed, skipping the secret scan (brew install gitleaks)" >&2
+    exit 0
+fi
+exec gitleaks git --pre-commit --staged --redact --no-banner -v

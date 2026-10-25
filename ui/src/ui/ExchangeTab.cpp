@@ -26,25 +26,42 @@ QWidget *makePlaceholder(const QString &title, const QString &text, QWidget *par
     return w;
 }
 
-ExchangeTab::ExchangeTab(LiveData *data, const QString &exchange, QWidget *parent)
-    : QMainWindow(parent, Qt::Widget), m_exchange(exchange)
+ExchangeTab::ExchangeTab(LiveData *data, const QString &exchange, ChartController *chart, Settings *settings, QWidget *parent)
+    : QMainWindow(parent, Qt::Widget), m_exchange(exchange), m_controller(chart), m_data(data)
 {
     setDockNestingEnabled(true);
     setDocumentMode(true);
-    m_symbols = new SymbolsPanel(data, exchange, this);
-    m_feed = new FeedPanel(data, exchange, this);
+    m_symbols = new SymbolsPanel(data, exchange, this, settings);
+    m_feed = new FeedPanel(data, exchange, this, settings);
     m_summary = new SummaryPanel(data, exchange, this);
-    connect(m_symbols, &SymbolsPanel::symbolSelected, m_feed, &FeedPanel::setSymbol);
+    m_chart = new ChartPanel(chart, data->options(), exchange, this);
+    connect(m_symbols, &SymbolsPanel::symbolSelected, this, &ExchangeTab::onSymbolSelected);
 
-    const QString name = fmt::exchangeDisplay(exchange);
     m_symbolsDock = makeDock(QStringLiteral("Symbols"), QStringLiteral("dock.symbols"), m_symbols);
     m_feedDock = makeDock(QStringLiteral("Live feed"), QStringLiteral("dock.feed"), m_feed);
-    m_chartDock = makeDock(QStringLiteral("Chart"), QStringLiteral("dock.chart"),
-                           makePlaceholder(QStringLiteral("Charts arrive in stage 2"),
-                                           QStringLiteral("Open interest and liquidation charts for %1 need the History "
-                                                          "service, which does not exist yet.").arg(name)));
+    m_chartDock = makeDock(QStringLiteral("Chart"), QStringLiteral("dock.chart"), m_chart);
     m_summaryDock = makeDock(QStringLiteral("Summary"), QStringLiteral("dock.summary"), m_summary);
     resetLayout();
+}
+
+void ExchangeTab::onSymbolSelected(const QString &symbol)
+{
+    m_feed->setSymbol(symbol);
+    if (symbol.isEmpty()) {
+        // "All symbols": clear the chart only when it shows a symbol of this exchange.
+        if (m_controller->model()->exchange() == m_exchange)
+            m_controller->deselect();
+        return;
+    }
+    const SymbolModel *model = m_data->symbols(m_exchange);
+    const SymbolModel::Row *row = model ? model->find(symbol) : nullptr;
+    m_controller->select(m_exchange, symbol, row ? row->symbolRaw : QString());
+}
+
+void ExchangeTab::saveColumns()
+{
+    m_symbols->columns()->save();
+    m_feed->columns()->save();
 }
 
 QDockWidget *ExchangeTab::makeDock(const QString &title, const QString &objectName, QWidget *widget)
@@ -77,7 +94,7 @@ void ExchangeTab::applyDefaultSizes()
 {
     resizeDocks({m_symbolsDock, m_chartDock}, {420, 760}, Qt::Horizontal);
     resizeDocks({m_symbolsDock, m_summaryDock}, {470, 220}, Qt::Vertical);
-    resizeDocks({m_chartDock, m_feedDock}, {110, 560}, Qt::Vertical);
+    resizeDocks({m_chartDock, m_feedDock}, {470, 280}, Qt::Vertical);
 }
 
 void ExchangeTab::showEvent(QShowEvent *event)

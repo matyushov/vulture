@@ -44,6 +44,12 @@ public:
     void setDockLayout(const QString &exchange, const QByteArray &data);
     void clearDockLayouts();
 
+    /// QHeaderView::saveState() of one table (widths, order, visibility, sort indicator); `key` such as
+    /// "symbols.binance". Empty when nothing was saved.
+    QByteArray tableState(const QString &key) const;
+    void setTableState(const QString &key, const QByteArray &data);
+    void clearTableStates();
+
     /// Writes pending changes and re-applies the 0600 mode (QSettings replaces the file on write).
     void sync();
     /// True when the file is not readable by group/others (always true where permissions are not supported).

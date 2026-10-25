@@ -2,6 +2,7 @@
 #include "net/StreamClient.h"
 
 #include "net/ErrorText.h"
+#include "net/ReplayCursor.h"
 
 #include <QDateTime>
 #include <QFile>
@@ -63,6 +64,7 @@ bool convert(const v1::Event &ev, Interner &names, FeedEvent *out)
         out->kind = EventKind::Liquidation;
         out->exchange = names.get(l.exchange());
         out->symbol = names.get(l.symbol());
+        out->symbolRaw = names.get(l.symbol_raw());
         out->ts = l.exchange_ts();
         out->recvTs = l.recv_ts();
         out->side = convertSide(l.side());
@@ -76,6 +78,7 @@ bool convert(const v1::Event &ev, Interner &names, FeedEvent *out)
         out->kind = EventKind::OpenInterest;
         out->exchange = names.get(o.exchange());
         out->symbol = names.get(o.symbol());
+        out->symbolRaw = names.get(o.symbol_raw());
         out->ts = o.exchange_ts();
         out->recvTs = o.recv_ts();
         out->oiBase = o.oi_base();
@@ -133,6 +136,8 @@ StreamClient::StreamClient(QObject *parent) : QObject(parent)
 
 StreamClient::~StreamClient()
 {
+    // No signals from a destructor: receivers may already be gone (their owners are destroyed in any order).
+    blockSignals(true);
     stop();
 }
 
@@ -165,6 +170,14 @@ QString StreamClient::start(const ConnectionConfig &config, const Options &optio
         m_pending.clear();
     }
     ConnectionConfig cfg = config;
+    m_bounded = false;
+    if (cfg.resumeFrom.isEmpty() && options.initialReplayMs > 0) {
+        m_bounded = true;
+        const qint64 now = options.wallClock ? options.wallClock() : QDateTime::currentMSecsSinceEpoch();
+        cfg.resumeFrom = replayCursor(now, options.initialReplayMs);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_cursor = cfg.resumeFrom;
+    }
     if (cfg.tls && cfg.caFile.isEmpty())
         (void)systemRootsPem(); // load the system roots on the GUI thread
     ConnectionStatus st;
@@ -261,6 +274,12 @@ void StreamClient::run(ConnectionConfig config, Options options)
     Backoff backoff(options.backoff, options.clock, options.rng);
     Interner names;
     bool everLive = false;
+    // The cursor of the first call is a bounded replay (or an explicit one); its OUT_OF_RANGE falls back to "0".
+    bool boundedFirstCall = m_bounded.load();
+    bool firstCall = true;
+    const auto wall = [&options] {
+        return options.wallClock ? options.wallClock() : QDateTime::currentMSecsSinceEpoch();
+    };
 
     // Channel: TLS with the user's CA file or the system roots; plaintext only for loopback (validated).
     std::shared_ptr<grpc::ChannelCredentials> creds;
@@ -319,6 +338,10 @@ void StreamClient::run(ConnectionConfig config, Options options)
             cursor = m_cursor;
         }
         req.set_resume_from(cursor.toStdString());
+        // Events written before this moment (server clock, from the id) that arrive on a call that started with a
+        // cursor are history: marked replayed. Reconnects (not the first call) never mark anything.
+        const qint64 replayedBefore = (firstCall && !cursor.isEmpty()) ? wall() - options.replaySlackMs : 0;
+        firstCall = false;
 
         grpc::ClientContext ctx;
         ctx.AddMetadata("authorization", bearer);
@@ -373,6 +396,10 @@ void StreamClient::run(ConnectionConfig config, Options options)
             markLive();
             FeedEvent out;
             if (convert(ev, names, &out)) {
+                if (replayedBefore > 0) {
+                    const qint64 idMs = eventIdMs(ev.id().data(), static_cast<int>(ev.id().size()));
+                    out.replayed = idMs > 0 && idMs < replayedBefore;
+                }
                 lastTs = out.ts ? out.ts : lastTs;
                 push(std::move(out));
             }
@@ -414,7 +441,15 @@ void StreamClient::run(ConnectionConfig config, Options options)
             return;
         }
         qint64 delay;
-        if (reaction == Reaction::ResubscribeLive) {
+        if (reaction == Reaction::ResubscribeLive && boundedFirstCall && m_received.load() == 0 && cursor != QLatin1String("0")) {
+            // The server keeps less history than the requested look-back: take all it has (nothing was missed).
+            pushMarker(QStringLiteral("The server history is shorter than the requested replay; replaying all of it."), false);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_cursor = QStringLiteral("0");
+            firstCall = true;
+            boundedFirstCall = false;
+            delay = 200;
+        } else if (reaction == Reaction::ResubscribeLive) {
             const QString lost = cursor.isEmpty() ? QString() : QStringLiteral(" (cursor %1)").arg(cursor);
             pushMarker(QStringLiteral("Resume cursor too old%1: events since the last received one were missed; "
                                       "resubscribed live. Use History for the missed period.")

@@ -80,6 +80,8 @@ grpc::Status FakeStreamServer::Subscribe(grpc::ServerContext *ctx, const v1::Sub
     call.resumeFrom = request->resume_from();
     for (const auto &e : request->exchanges())
         call.exchanges.push_back(e);
+    for (const auto &sym : request->symbols())
+        call.symbols.push_back(sym);
     std::string expected;
     {
         const auto it = ctx->client_metadata().find("authorization");

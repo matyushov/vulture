@@ -10,6 +10,12 @@ namespace vulture::fmt {
 QString compactUsd(double usd);
 /// "$1,234,567.89" (tooltips).
 QString fullUsd(double usd);
+/// "1.23M", "45.6K", "789", "0.0012" for axis labels (no currency sign); "-" for NaN. The sign is kept.
+QString compactNumber(double value);
+/// "+1.25%" / "-0.40%" / "0.00%" (always with a sign when non-zero); "\u2014" for NaN.
+QString signedPercent(double pct);
+/// Like compactNumber with an explicit "+" for positive values.
+QString signedCompact(double value);
 /// Price with decimals chosen by magnitude (2 for >=1000 ... 8 for tiny prices).
 QString price(double value);
 /// Quantity in base units with up to 4 significant decimals, no trailing zeros.

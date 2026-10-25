@@ -2,6 +2,7 @@
 #pragma once
 
 #include "model/LiveData.h"
+#include "ui/TableHeader.h"
 
 #include <QLabel>
 #include <QLineEdit>
@@ -17,12 +18,13 @@ class SymbolsPanel : public QWidget
 {
     Q_OBJECT
 public:
-    SymbolsPanel(LiveData *data, const QString &exchange, QWidget *parent = nullptr);
+    SymbolsPanel(LiveData *data, const QString &exchange, QWidget *parent = nullptr, Settings *settings = nullptr);
 
     SymbolFilterProxy *proxy() { return m_proxy; }
     QTableView *view() { return m_view; }
     QLineEdit *searchEdit() { return m_search; }
     QString selectedSymbol() const { return m_selected; }
+    TableHeaderController *columns() { return m_columns; }
 
 public slots:
     void clearSelection();
@@ -43,6 +45,7 @@ private:
     QToolButton *m_all;
     QLabel *m_count;
     QTableView *m_view;
+    TableHeaderController *m_columns = nullptr;
     QString m_selected;
 };
 

@@ -3,6 +3,7 @@
 
 #include "model/FeedModel.h"
 #include "model/LiveData.h"
+#include "ui/TableHeader.h"
 
 #include <QComboBox>
 #include <QDoubleSpinBox>
@@ -21,10 +22,11 @@ class FeedPanel : public QWidget
 {
     Q_OBJECT
 public:
-    FeedPanel(LiveData *data, const QString &exchange, QWidget *parent = nullptr);
+    FeedPanel(LiveData *data, const QString &exchange, QWidget *parent = nullptr, Settings *settings = nullptr);
 
     FeedModel *model() { return m_model; }
     QTableView *view() { return m_view; }
+    TableHeaderController *columns() { return m_columns; }
     bool paused() const { return m_model->paused(); }
 
     /// Tab-separated text of the selected rows, as displayed.
@@ -54,6 +56,7 @@ private:
     QPushButton *m_copy;
     QPushButton *m_export;
     QTableView *m_view;
+    TableHeaderController *m_columns = nullptr;
     QTimer m_searchDebounce;
 };
 

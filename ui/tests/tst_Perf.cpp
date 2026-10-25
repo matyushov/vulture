@@ -93,6 +93,7 @@ private slots:
         stalls.start();
         QElapsedTimer wall;
         wall.start();
+        window.setReplayLookbackMs(0);
         window.connectTo(cfg);
         QTRY_VERIFY_WITH_TIMEOUT(window.liveData()->total().events() > 0, 5000);
         const qint64 firstEventMs = wall.elapsed();
@@ -136,6 +137,7 @@ private slots:
         stalls.start();
         QElapsedTimer wall;
         wall.start();
+        window.setReplayLookbackMs(0);
         window.connectTo(cfg);
         QTRY_VERIFY_WITH_TIMEOUT(window.liveData()->total().events() >= kEvents, 60000);
         const double seconds = wall.elapsed() / 1000.0;

@@ -45,6 +45,7 @@ struct SeenCall
     std::string resumeFrom;
     std::string authorization;
     std::vector<std::string> exchanges;
+    std::vector<std::string> symbols;
 };
 
 /// In-process Stream.Subscribe server on 127.0.0.1 for client tests (plaintext, or TLS with the test certificate).

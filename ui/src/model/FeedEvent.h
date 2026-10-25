@@ -34,9 +34,11 @@ struct FeedEvent
     EventKind kind = EventKind::Info;
     LiqSide side = LiqSide::Unspecified;
     bool warning = false; ///< Info markers that report lost data
+    bool replayed = false; ///< delivered by the bounded replay of the first subscription: history, not news
     QString id;           ///< server Event.id
     QString exchange;     ///< lower-case exchange name; "*" or empty = not tied to one exchange
     QString symbol;       ///< normalized symbol (BTC-USDT-PERP)
+    QString symbolRaw;    ///< symbol as the exchange names it (BTCUSDT, 1000PEPEUSDT, BTC-USDT-SWAP)
     QString text;         ///< Signal details, Info text, Gap stream name
     qint64 ts = 0;        ///< event time, ms (exchange time; Gap: recovery time; Info: local time)
     qint64 recvTs = 0;
@@ -49,6 +51,13 @@ struct FeedEvent
     double oiUsd = kNaN;
     double markPrice = kNaN;
 };
+
+/// Time that places an event on a time axis or in a sample series: the server receive time when known (the same
+/// clock the server uses for its own windows), otherwise the exchange time.
+inline qint64 sampleTs(const FeedEvent &e)
+{
+    return e.recvTs ? e.recvTs : e.ts;
+}
 
 using FeedBatch = QVector<FeedEvent>;
 

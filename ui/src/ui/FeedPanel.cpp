@@ -19,7 +19,8 @@
 
 namespace vulture {
 
-FeedPanel::FeedPanel(LiveData *data, const QString &exchange, QWidget *parent) : QWidget(parent), m_data(data)
+FeedPanel::FeedPanel(LiveData *data, const QString &exchange, QWidget *parent, Settings *settings)
+    : QWidget(parent), m_data(data)
 {
     m_model = new FeedModel(data->store(), data->options(), this);
     m_model->setExchange(exchange);
@@ -89,19 +90,24 @@ FeedPanel::FeedPanel(LiveData *data, const QString &exchange, QWidget *parent) :
     m_view->verticalHeader()->hide();
     m_view->verticalHeader()->setDefaultSectionSize(m_view->fontMetrics().height() + 8);
     m_view->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
-    QHeaderView *h = m_view->horizontalHeader();
-    h->setSectionResizeMode(QHeaderView::Interactive);
-    h->setStretchLastSection(false);
-    h->setSectionResizeMode(FeedModel::Symbol, QHeaderView::Stretch);
-    h->setSortIndicatorShown(false);
-    m_view->setColumnWidth(FeedModel::Time, 118);
-    m_view->setColumnWidth(FeedModel::Exchange, 76);
-    m_view->setColumnWidth(FeedModel::Kind, 84);
-    m_view->setColumnWidth(FeedModel::Side, 78);
-    m_view->setColumnWidth(FeedModel::Price, 92);
-    m_view->setColumnWidth(FeedModel::Quantity, 78);
-    m_view->setColumnWidth(FeedModel::Usd, 84);
-    m_view->setColumnHidden(FeedModel::Exchange, !exchange.isEmpty());
+    // Every column is interactive and movable; widths, order and visibility persist per exchange (and for the
+    // all-exchanges feed). The Exchange column is redundant inside an exchange tab, so it starts hidden there.
+    QList<int> widths(FeedModel::ColumnCount, 0);
+    widths[FeedModel::Time] = 118;
+    widths[FeedModel::Exchange] = 76;
+    widths[FeedModel::Symbol] = 170;
+    widths[FeedModel::Kind] = 84;
+    widths[FeedModel::Side] = 78;
+    widths[FeedModel::Price] = 92;
+    widths[FeedModel::Quantity] = 78;
+    widths[FeedModel::Usd] = 84;
+    QList<int> hidden;
+    if (!exchange.isEmpty())
+        hidden.append(FeedModel::Exchange);
+    m_view->horizontalHeader()->setSortIndicatorShown(false);
+    m_columns = new TableHeaderController(m_view, QStringLiteral("feed.") + (exchange.isEmpty() ? QStringLiteral("all") : exchange),
+                                          widths, hidden, settings, this);
+    m_columns->restore();
 
     // Keep the viewport steady when the user has scrolled away from the newest rows.
     connect(m_model, &QAbstractItemModel::rowsInserted, this, [this](const QModelIndex &, int first, int last) {

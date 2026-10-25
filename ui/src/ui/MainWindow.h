@@ -3,6 +3,8 @@
 
 #include "app/LargeLiquidationNotifier.h"
 #include "app/Settings.h"
+#include "chart/ChartController.h"
+#include "model/IngestQueue.h"
 #include "model/LiveData.h"
 #include "net/StreamClient.h"
 #include "ui/AdminPanel.h"
@@ -35,8 +37,13 @@ public:
     /// When false, notification messages are produced (notifier signal) but never handed to the operating system.
     void setSystemNotifications(bool enabled) { m_systemNotifications = enabled; }
     void setClientOptions(const StreamClient::Options &options) { m_clientOptions = options; }
+    /// Look-back of the bounded replay requested on connect, ms (default 20 minutes); 0 = live only.
+    void setReplayLookbackMs(qint64 ms) { m_replayLookbackMs = ms; }
+    qint64 replayLookbackMs() const { return m_replayLookbackMs; }
 
     LiveData *liveData() { return &m_data; }
+    IngestQueue *ingestQueue() { return &m_ingest; }
+    ChartController *chartController() { return &m_chart; }
     StreamClient *client() { return &m_client; }
     StatusIndicator *statusIndicator() { return m_status; }
     LargeLiquidationNotifier *notifier() { return &m_notifier; }
@@ -68,6 +75,8 @@ private:
     DisplayOptions m_options;
     Favorites m_favorites;
     LiveData m_data;
+    IngestQueue m_ingest;
+    ChartController m_chart;
     StreamClient m_client;
     StreamClient::Options m_clientOptions;
     LargeLiquidationNotifier m_notifier;
@@ -82,6 +91,7 @@ private:
     ConnectionConfig m_config;
     bool m_interactive = true;
     bool m_systemNotifications = true;
+    qint64 m_replayLookbackMs = 20 * 60'000;
 
     QAction *m_connectAction;
     QAction *m_disconnectAction;

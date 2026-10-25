@@ -4,6 +4,7 @@
 #include "model/DisplayOptions.h"
 #include "model/Favorites.h"
 #include "model/FeedEvent.h"
+#include "model/OiSeries.h"
 #include "util/SemanticColors.h"
 
 #include <QAbstractTableModel>
@@ -18,13 +19,21 @@ class SymbolModel : public QAbstractTableModel
 {
     Q_OBJECT
 public:
-    enum Column { Star, Symbol, OiUsd, MarkPrice, LiqCount, LiqUsd, LastEvent, ColumnCount };
+    enum Column { Star, Symbol, OiUsd, OiChange5, OiChange15, MarkPrice, LiqCount, LiqUsd, LastEvent, ColumnCount };
+    /// Windows of the OI change columns, ms (INTERIM, measured by the client; see OiSeries).
+    static constexpr qint64 kWindow5Ms = 5 * 60'000;
+    static constexpr qint64 kWindow15Ms = 15 * 60'000;
     static constexpr int SortRole = Qt::UserRole + 1;
     static constexpr int SymbolRole = Qt::UserRole + 2;
 
     struct Row
     {
         QString symbol;
+        QString symbolRaw; ///< the exchange's own name of the symbol (empty until an event carried it)
+        OiSeries oi;
+        OiChange change5;
+        OiChange change15;
+        double oiBase = kNaN;
         double oiUsd = kNaN;
         double markPrice = kNaN;
         qint64 liqCount = 0;
@@ -46,17 +55,25 @@ public:
     const Row *find(const QString &symbol) const;
     const Row &row(int i) const { return m_rows.at(i); }
     void refreshPalette(const QPalette &palette);
+    /// Latest break caused by a Gap of this exchange (ms; 0 = none): OI windows reaching back before it are invalid.
+    qint64 exchangeBreak() const { return m_break; }
+    /// Receive time of the newest OI sample of the exchange (the stream clock used for staleness).
+    qint64 streamNow() const { return m_streamNow; }
 
 private slots:
     void onFavoriteChanged(const QString &exchange, const QString &symbol);
 
 private:
+    QString changeTooltip(const Row &r, const OiChange &c, int minutes) const;
+
     QString m_exchange;
     Favorites *m_favorites;
     const DisplayOptions *m_options;
     QVector<Row> m_rows;
     QHash<QString, int> m_index;
     SemanticColors m_colors;
+    qint64 m_break = 0;
+    qint64 m_streamNow = 0;
 };
 
 /// Search, favorites-only filter and sorting by the raw values (SortRole).

@@ -1,0 +1,10 @@
+# gitleaks configuration (used automatically by `gitleaks detect --source .`, see the `secrets` job in
+# .github/workflows/ci.yml). It extends the default rules and adds one narrow exception.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Throwaway self-signed key and certificate used only by the loopback TLS tests of the UI client"
+paths = [
+  '''ui/tests/TestCerts\.h''',
+]

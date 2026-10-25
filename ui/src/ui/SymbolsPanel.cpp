@@ -8,7 +8,7 @@
 
 namespace vulture {
 
-SymbolsPanel::SymbolsPanel(LiveData *data, const QString &exchange, QWidget *parent)
+SymbolsPanel::SymbolsPanel(LiveData *data, const QString &exchange, QWidget *parent, Settings *settings)
     : QWidget(parent), m_data(data), m_exchange(exchange), m_model(data->symbols(exchange))
 {
     m_proxy = new SymbolFilterProxy(this);
@@ -49,17 +49,23 @@ SymbolsPanel::SymbolsPanel(LiveData *data, const QString &exchange, QWidget *par
     m_view->verticalHeader()->hide();
     m_view->verticalHeader()->setDefaultSectionSize(m_view->fontMetrics().height() + 8);
     m_view->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
-    QHeaderView *h = m_view->horizontalHeader();
-    h->setSectionResizeMode(QHeaderView::Interactive);
-    h->setStretchLastSection(false);
-    h->setSectionResizeMode(SymbolModel::Symbol, QHeaderView::Stretch);
-    m_view->setColumnWidth(SymbolModel::Star, 34);
-    m_view->setColumnWidth(SymbolModel::OiUsd, 84);
-    m_view->setColumnWidth(SymbolModel::MarkPrice, 84);
-    m_view->setColumnWidth(SymbolModel::LiqCount, 48);
-    m_view->setColumnWidth(SymbolModel::LiqUsd, 72);
-    m_view->setColumnWidth(SymbolModel::LastEvent, 92);
+    // Every column is interactive and movable; widths, order and visibility persist per exchange.
+    QList<int> widths(SymbolModel::ColumnCount, 0);
+    widths[SymbolModel::Star] = 34;
+    widths[SymbolModel::Symbol] = 150;
+    widths[SymbolModel::OiUsd] = 84;
+    widths[SymbolModel::OiChange5] = 72;
+    widths[SymbolModel::OiChange15] = 78;
+    widths[SymbolModel::MarkPrice] = 84;
+    widths[SymbolModel::LiqCount] = 48;
+    widths[SymbolModel::LiqUsd] = 72;
+    widths[SymbolModel::LastEvent] = 92;
+    m_columns = new TableHeaderController(m_view, QStringLiteral("symbols.") + exchange, widths, {}, settings, this);
     m_view->sortByColumn(SymbolModel::OiUsd, Qt::DescendingOrder);
+    if (m_columns->restore()) {
+        QHeaderView *h = m_view->horizontalHeader();
+        m_view->sortByColumn(h->sortIndicatorSection(), h->sortIndicatorOrder());
+    }
 
     connect(m_view, &QTableView::clicked, this, [this](const QModelIndex &idx) {
         if (idx.column() != SymbolModel::Star)

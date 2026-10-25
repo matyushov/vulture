@@ -90,7 +90,7 @@ const FeedEvent &FeedModel::eventAt(int row) const
 
 bool FeedModel::isLarge(const FeedEvent &e) const
 {
-    return e.kind == EventKind::Liquidation && !std::isnan(e.usd) && e.usd >= m_options->largeThresholdUsd();
+    return e.kind == EventKind::Liquidation && !e.replayed && !std::isnan(e.usd) && e.usd >= m_options->largeThresholdUsd();
 }
 
 QString FeedModel::cellText(const FeedEvent &e, int column) const
@@ -145,6 +145,8 @@ QString FeedModel::rowTooltip(const FeedEvent &e) const
 {
     QStringList lines;
     lines << QStringLiteral("%1  %2").arg(kindText(e), fmt::dateTime(e.ts, m_options->utc()));
+    if (e.replayed)
+        lines << QStringLiteral("Replayed history (delivered when connecting): no highlight, no notification");
     if (!e.exchange.isEmpty())
         lines << QStringLiteral("Exchange: %1").arg(fmt::exchangeDisplay(e.exchange));
     if (!e.symbol.isEmpty())
@@ -198,6 +200,8 @@ QVariant FeedModel::data(const QModelIndex &index, int role) const
         if (e.kind == EventKind::Gap || (e.kind == EventKind::Info && e.warning))
             return m_colors.warningText;
         if (e.kind == EventKind::Info)
+            return m_colors.neutralText;
+        if (e.replayed && e.kind == EventKind::Liquidation && col != Side && col != Usd)
             return m_colors.neutralText;
         if (e.kind == EventKind::Liquidation && (col == Side || col == Usd || col == Kind)) {
             return e.side == LiqSide::Long ? m_colors.longText : m_colors.shortText;

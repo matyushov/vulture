@@ -38,6 +38,52 @@ QString compactUsd(double usd)
     return sign + QLatin1Char('$') + QString::number(a, 'f', a >= 99.5 ? 0 : 2);
 }
 
+QString compactNumber(double value)
+{
+    if (std::isnan(value))
+        return QStringLiteral("-");
+    const double a = std::fabs(value);
+    const QString sign = value < 0 ? QStringLiteral("-") : QString();
+    auto scaled = [&](double div, const char *suffix) {
+        const double v = a / div;
+        const int decimals = v >= 99.95 ? 0 : (v >= 9.995 ? 1 : 2);
+        return sign + QString::number(v, 'f', decimals) + QLatin1String(suffix);
+    };
+    if (a >= 999.5e9)
+        return scaled(1e12, "T");
+    if (a >= 999.5e6)
+        return scaled(1e9, "B");
+    if (a >= 999.5e3)
+        return scaled(1e6, "M");
+    if (a >= 999.5)
+        return scaled(1e3, "K");
+    if (a == 0)
+        return QStringLiteral("0");
+    if (a >= 99.5)
+        return sign + QString::number(a, 'f', 0);
+    if (a >= 1)
+        return sign + QString::number(a, 'f', a >= 9.995 ? 1 : 2);
+    return sign + QString::number(a, 'g', 2);
+}
+
+QString signedCompact(double value)
+{
+    if (std::isnan(value))
+        return QStringLiteral("\u2014");
+    const QString s = compactNumber(value);
+    return value > 0 ? QLatin1Char('+') + s : s;
+}
+
+QString signedPercent(double pct)
+{
+    if (std::isnan(pct) || std::isinf(pct))
+        return QStringLiteral("\u2014");
+    QString s = QString::number(pct, 'f', 2);
+    if (s == QLatin1String("0.00") || s == QLatin1String("-0.00"))
+        return QStringLiteral("0.00%");
+    return (pct > 0 ? QStringLiteral("+") : QString()) + s + QLatin1Char('%');
+}
+
 QString fullUsd(double usd)
 {
     if (std::isnan(usd))

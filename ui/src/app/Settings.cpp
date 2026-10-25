@@ -19,7 +19,11 @@ constexpr auto kNotify = "display/notifications";
 constexpr auto kFavorites = "favorites/list";
 constexpr auto kGeometry = "window/geometry";
 constexpr auto kState = "window/state";
-constexpr auto kLayoutGroup = "layout";
+// "layout_v2": the stage 1.1 chart dock needs far more room than the stage 1 placeholder, so layouts saved by
+// stage 1 ("layout") are ignored.
+constexpr auto kLayoutGroup = "layout_v2";
+constexpr auto kLayoutGroupV1 = "layout";
+constexpr auto kTableGroup = "tables";
 } // namespace
 
 Settings::Settings(const QString &path)
@@ -134,9 +138,30 @@ void Settings::setDockLayout(const QString &exchange, const QByteArray &d)
     flush();
 }
 
+QByteArray Settings::tableState(const QString &key) const
+{
+    return m_settings->value(QStringLiteral("%1/%2").arg(kTableGroup, key)).toByteArray();
+}
+
+void Settings::setTableState(const QString &key, const QByteArray &d)
+{
+    const QString path = QStringLiteral("%1/%2").arg(kTableGroup, key);
+    if (m_settings->value(path).toByteArray() == d)
+        return;
+    m_settings->setValue(path, d);
+    flush();
+}
+
+void Settings::clearTableStates()
+{
+    m_settings->remove(kTableGroup);
+    flush();
+}
+
 void Settings::clearDockLayouts()
 {
     m_settings->remove(kLayoutGroup);
+    m_settings->remove(kLayoutGroupV1);
     flush();
 }
 

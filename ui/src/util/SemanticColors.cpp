@@ -27,6 +27,21 @@ SemanticColors semanticColors(const QPalette &palette)
     c.shortTint = blend(base, c.shortText, 0.14);
     c.warningTint = blend(base, c.warningText, 0.18);
     c.largeTint = blend(base, c.warningText, 0.30);
+
+    c.candleUp = c.shortText;
+    c.candleDown = c.longText;
+    c.liqShort = c.shortText;
+    c.liqLong = c.longText;
+    c.oiPositive = QColor::fromHslF(0.59, 0.78, c.dark ? 0.66 : 0.40);   // blue
+    c.oiNegative = QColor::fromHslF(0.80, 0.55, c.dark ? 0.72 : 0.42);   // violet
+    c.oiLine = blend(text, base, 0.15);
+    c.gapBand = c.warningText;
+    c.gapBand.setAlphaF(0.17);
+    c.chartGrid = blend(base, text, 0.12);
+    c.chartAxis = blend(text, base, 0.20);
+    c.crosshair = blend(base, text, 0.70);
+    c.tooltipBg = palette.color(QPalette::ToolTipBase);
+    c.tooltipText = palette.color(QPalette::ToolTipText);
     return c;
 }
 

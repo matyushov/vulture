@@ -53,7 +53,9 @@ QT_QPA_PLATFORM=offscreen ctest --test-dir ui/build/b --output-on-failure -E tst
 ui/build/b/vulture-ui
 ```
 
-Without conan or Qt the UI targets are disabled with a warning.
+Without conan or Qt the UI targets are disabled with a warning. Besides grpc++, the UI vendors QCustomPlot (GPLv3) in
+`ui/third_party/qcustomplot/` for the symbol chart; it adds no conan dependency. Tests never leave the machine: the fake
+gRPC and HTTP servers listen on 127.0.0.1 (`QT_QPA_PLATFORM=offscreen`; screenshots with `VULTURE_UI_SHOT_DIR=<dir>`).
 
 Example configuration: [config.example.toml](config.example.toml). Secrets are not
 added to the repository.
@@ -878,6 +880,22 @@ numbers are `double`. Evolution rules: fields may only be added, numbers are not
 removed fields are marked `reserved`. Checks: `cd proto && buf lint`, and `buf breaking --against "../.git#ref=<base>,subdir=proto"` against the previous revision. Rust code is generated in
 `build.rs` (vendored protoc, tonic server+client); C++ for the UI uses `protoc` and `grpc_cpp_plugin` from
 conan (`ui/CMakeLists.txt`, target `vulture-proto-cpp`).
+
+## Git hooks (secret scan)
+
+The repository is public, so a leaked token or key would be public too. The CI job `secrets` scans the whole history
+with [gitleaks](https://github.com/gitleaks/gitleaks) on every push (rules and exceptions: `.gitleaks.toml`). To stop a
+secret before it is even committed, enable the pre-commit hook once per clone:
+
+```sh
+scripts/setup-hooks.sh        # git config core.hooksPath .githooks
+brew install gitleaks         # macOS; see the gitleaks page for other systems
+```
+
+The hook (`.githooks/pre-commit`) runs `gitleaks git --pre-commit --staged --redact` and refuses a commit whose staged
+changes look like a secret (the value is hidden in the output). Without gitleaks it only warns. `git commit
+--no-verify` skips it; CI still checks the pushed history. A secret that was already pushed must be treated as leaked and
+revoked: deleting it in a new commit does not remove it from the history.
 
 ## CI
 

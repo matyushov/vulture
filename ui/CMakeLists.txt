@@ -65,12 +65,35 @@ if(NOT TARGET vulture-proto-cpp)
     return()
 endif()
 
+# --- Vendored QCustomPlot (GPLv3), warnings silenced for this directory only ---
+add_library(vulture-qcustomplot STATIC third_party/qcustomplot/qcustomplot.cpp third_party/qcustomplot/qcustomplot.h)
+set_target_properties(vulture-qcustomplot PROPERTIES AUTOMOC ON)
+target_include_directories(vulture-qcustomplot SYSTEM PUBLIC third_party/qcustomplot)
+# QT_NO_PRINTER: the bundled header then does not need Qt PrintSupport (see third_party/qcustomplot/README.md).
+target_compile_definitions(vulture-qcustomplot PUBLIC QT_NO_PRINTER)
+target_link_libraries(vulture-qcustomplot PUBLIC Qt6::Widgets)
+target_compile_options(vulture-qcustomplot PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/w>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-w>)
+
 # --- Application core: everything except main(), so the tests can link it ---
 set(VULTURE_UI_CORE_SOURCES
     src/util/RingBuffer.h
     src/util/Format.h src/util/Format.cpp
     src/util/Backoff.h src/util/Backoff.cpp
     src/util/SemanticColors.h src/util/SemanticColors.cpp
+    src/net/ReplayCursor.h src/net/ReplayCursor.cpp
+    src/model/OiSeries.h src/model/OiSeries.cpp
+    src/model/IngestQueue.h src/model/IngestQueue.cpp
+    src/chart/Timeframe.h
+    src/chart/Klines.h src/chart/Klines.cpp
+    src/chart/PriceSource.h src/chart/PriceSource.cpp
+    src/chart/ChartModel.h src/chart/ChartModel.cpp
+    src/chart/ChartController.h src/chart/ChartController.cpp
+    src/chart/ChartView.h
+    src/chart/QcpChartView.h src/chart/QcpChartView.cpp
+    src/ui/TableHeader.h src/ui/TableHeader.cpp
+    src/ui/ChartPanel.h src/ui/ChartPanel.cpp
     src/model/FeedEvent.h
     src/model/DisplayOptions.h
     src/model/FeedStore.h src/model/FeedStore.cpp
@@ -99,7 +122,7 @@ set(VULTURE_UI_CORE_SOURCES
 add_library(vulture-ui-core STATIC ${VULTURE_UI_CORE_SOURCES})
 target_include_directories(vulture-ui-core PUBLIC src)
 target_compile_definitions(vulture-ui-core PUBLIC VULTURE_UI_VERSION="${PROJECT_VERSION}")
-target_link_libraries(vulture-ui-core PUBLIC Qt6::Widgets Qt6::Network vulture-proto-cpp)
+target_link_libraries(vulture-ui-core PUBLIC Qt6::Widgets Qt6::Network vulture-proto-cpp vulture-qcustomplot)
 target_compile_options(vulture-ui-core PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/W4>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>)

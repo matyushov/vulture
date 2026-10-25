@@ -21,6 +21,8 @@ MainWindow::MainWindow(Settings *settings, QWidget *parent)
     : QMainWindow(parent),
       m_settings(settings),
       m_data(&m_options, &m_favorites),
+      m_ingest(&m_data),
+      m_chart(),
       m_notifier(),
       m_tabs(new QTabWidget(this))
 {
@@ -57,11 +59,9 @@ MainWindow::MainWindow(Settings *settings, QWidget *parent)
     m_notifierTimer.setInterval(1000);
     connect(&m_notifierTimer, &QTimer::timeout, &m_notifier, &LargeLiquidationNotifier::tick);
     m_notifierTimer.start();
-    connect(&m_client, &StreamClient::batchReady, this, [this](FeedBatch batch) {
-        const int n = static_cast<int>(batch.size());
-        m_data.ingest(std::move(batch));
-        m_status->noteEvents(n);
-    });
+    // Large batches (the bounded replay after connecting) are ingested in slices so the UI stays responsive.
+    connect(&m_client, &StreamClient::batchReady, &m_ingest, &IngestQueue::submit);
+    connect(&m_ingest, &IngestQueue::ingested, this, [this](int n) { m_status->noteEvents(n); });
     connect(&m_client, &StreamClient::statusChanged, this, &MainWindow::onStatusChanged);
 
     const QByteArray geometry = settings->windowGeometry();
@@ -171,13 +171,22 @@ void MainWindow::connectTo(const ConnectionConfig &config)
     m_config = config;
     m_admin->setConnection(config);
     m_data.resetSession();
-    m_client.start(config, m_clientOptions);
+    StreamClient::Options options = m_clientOptions;
+    // First subscription of the session: a bounded replay fills the OI change columns right away. Reconnects of
+    // this session resume from the last received id (inside StreamClient).
+    if (options.initialReplayMs == 0)
+        options.initialReplayMs = m_replayLookbackMs;
+    m_client.start(config, options);
+    StreamClient::Options chartOptions = m_clientOptions;
+    chartOptions.initialReplayMs = 0; // the chart controller sets its own filters and look-back
+    m_chart.setConnection(config, chartOptions);
     updateActions();
 }
 
 void MainWindow::disconnectNow()
 {
     m_client.stop();
+    m_chart.clearConnection();
     updateActions();
 }
 
@@ -191,7 +200,7 @@ void MainWindow::onStatusChanged(const ConnectionStatus &status)
 
 void MainWindow::onExchangeAdded(const QString &exchange)
 {
-    auto *tab = new ExchangeTab(&m_data, exchange, m_tabs);
+    auto *tab = new ExchangeTab(&m_data, exchange, &m_chart, m_settings, m_tabs);
     QByteArray layout = m_settings->dockLayout(exchange);
     if (layout.isEmpty())
         layout = m_settings->dockLayout(QStringLiteral("default"));
@@ -235,6 +244,7 @@ void MainWindow::saveUiState()
     for (auto it = m_exchangeTabs.cbegin(); it != m_exchangeTabs.cend(); ++it) {
         m_settings->setDockLayout(it.key(), it.value()->layoutState());
         m_settings->setDockLayout(QStringLiteral("default"), it.value()->layoutState());
+        it.value()->saveColumns();
     }
     m_settings->setFavorites(m_favorites.toList());
 }

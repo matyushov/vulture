@@ -18,14 +18,24 @@ struct Collector
 {
     explicit Collector(StreamClient &c)
     {
-        QObject::connect(&c, &StreamClient::batchReady, &c, [this](FeedBatch b) {
+        m_conns << QObject::connect(&c, &StreamClient::batchReady, &c, [this](FeedBatch b) {
             ++batches;
             maxBatch = std::max<int>(maxBatch, static_cast<int>(b.size()));
             for (const FeedEvent &e : b)
                 events.append(e);
         });
-        QObject::connect(&c, &StreamClient::statusChanged, &c, [this](const ConnectionStatus &s) { statuses.append(s); });
+        m_conns << QObject::connect(&c, &StreamClient::statusChanged, &c,
+                                    [this](const ConnectionStatus &s) { statuses.append(s); });
     }
+    // The collector is declared after the client, so it dies first; the client's destructor still reports
+    // "Disconnected". Without this disconnect that signal reached a destroyed collector (a stack use-after-scope that
+    // corrupted the heap and aborted the process on loaded machines).
+    ~Collector()
+    {
+        for (const QMetaObject::Connection &c : std::as_const(m_conns))
+            QObject::disconnect(c);
+    }
+    QList<QMetaObject::Connection> m_conns;
     QVector<FeedEvent> events;
     QVector<ConnectionStatus> statuses;
     int batches = 0;

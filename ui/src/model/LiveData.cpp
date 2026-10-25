@@ -50,23 +50,47 @@ void LiveData::ingest(FeedBatch batch)
     QStringList created;
     QMap<QString, FeedBatch> perExchange;
     QVector<FeedEvent> large;
+    QVector<FeedEvent> serverWideGaps;
+    bool dropFromStore = false;
     for (const FeedEvent &e : std::as_const(batch)) {
         if (hasExchange(e)) {
             if (!m_symbols.contains(e.exchange)) {
                 m_symbols.insert(e.exchange, new SymbolModel(e.exchange, m_favorites, m_options, this));
                 created.append(e.exchange);
             }
-            m_stats[e.exchange].add(e, now);
+            // Replayed history fills the symbol models but is not session activity (rates, counters, notifications).
+            if (!e.replayed)
+                m_stats[e.exchange].add(e, now);
             perExchange[e.exchange].append(e);
+        } else if (e.kind == EventKind::Gap && e.exchange == QLatin1String("*")) {
+            serverWideGaps.append(e);
         }
-        if (e.kind != EventKind::Info)
+        if (e.kind != EventKind::Info && !e.replayed)
             m_total.add(e, now);
-        if (e.kind == EventKind::Liquidation && !std::isnan(e.usd) && e.usd >= m_options->largeThresholdUsd())
+        if (e.kind == EventKind::Liquidation && !e.replayed && !std::isnan(e.usd) && e.usd >= m_options->largeThresholdUsd())
             large.append(e);
+        // A replayed OI snapshot is history for the OI columns only; thousands of them would push the live
+        // rows out of the bounded feed.
+        if (e.replayed && e.kind == EventKind::OpenInterest)
+            dropFromStore = true;
+    }
+    // A server-wide gap interrupts the OI series of every exchange (models created later never saw the past).
+    if (!serverWideGaps.isEmpty()) {
+        for (auto it = m_symbols.cbegin(); it != m_symbols.cend(); ++it)
+            perExchange[it.key()].append(serverWideGaps);
     }
     for (auto it = perExchange.cbegin(); it != perExchange.cend(); ++it)
         m_symbols.value(it.key())->apply(it.value());
     const int count = static_cast<int>(batch.size());
+    if (dropFromStore) {
+        FeedBatch kept;
+        kept.reserve(batch.size());
+        for (FeedEvent &e : batch) {
+            if (!(e.replayed && e.kind == EventKind::OpenInterest))
+                kept.append(std::move(e));
+        }
+        batch = std::move(kept);
+    }
     m_store.append(std::move(batch));
     for (const QString &ex : std::as_const(created))
         emit exchangeAdded(ex);
