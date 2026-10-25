@@ -129,8 +129,8 @@ private slots:
         QCOMPARE(calls[0].authorization, std::string("Bearer test-token"));
         QCOMPARE(calls[0].resumeFrom, std::string());
 
+        QTRY_VERIFY_WITH_TIMEOUT(got.marker("Connected to"), 5000);
         QCOMPARE(got.stateNames().mid(0, 2), (QStringList{"Connecting", "Live"}));
-        QVERIFY(got.marker("Connected to"));
 
         // Conversion of every payload.
         const FeedEvent *liq = nullptr, *oi = nullptr, *gp = nullptr;
@@ -210,16 +210,23 @@ private slots:
         QVERIFY(calls.size() >= 2);
         QCOMPARE(calls[0].resumeFrom, std::string());
         QCOMPARE(calls[1].resumeFrom, std::string("2-0")); // exclusive cursor: the last id that was received
-        QVERIFY(got.hasState(ConnState::Reconnecting));
-        QVERIFY(got.marker("Reconnected, resumed after event 2-0"));
-        QTRY_VERIFY_WITH_TIMEOUT(client.status().state == ConnState::Live, 3000);
+        // The client reports `lastEventId` as soon as the worker has the event, while statuses, markers and
+        // events reach the collector in the next batch (33 ms timer): wait for each of them, never assume the
+        // order (a loaded CI runner showed the marker arriving after the cursor check).
+        QTRY_VERIFY_WITH_TIMEOUT(got.hasState(ConnState::Reconnecting), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(got.marker("Reconnected, resumed after event 2-0"), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.status().state == ConnState::Live, 5000);
         QCOMPARE(client.reconnects(), 1);
         // No duplicates, no gaps in the ids that reached the UI.
-        QStringList ids;
-        for (const FeedEvent &e : got.events)
-            if (e.kind == EventKind::Liquidation)
-                ids << e.id;
-        QCOMPARE(ids, (QStringList{"1-0", "2-0", "3-0"}));
+        const auto liquidationIds = [&got] {
+            QStringList ids;
+            for (const FeedEvent &e : got.events)
+                if (e.kind == EventKind::Liquidation)
+                    ids << e.id;
+            return ids;
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(liquidationIds().size(), 3, 5000);
+        QCOMPARE(liquidationIds(), (QStringList{"1-0", "2-0", "3-0"}));
         const auto *reconnecting = [&]() -> const ConnectionStatus * {
             for (const auto &s : got.statuses)
                 if (s.state == ConnState::Reconnecting)
@@ -255,6 +262,7 @@ private slots:
         QVERIFY(calls.size() >= 2);
         QCOMPARE(calls[0].resumeFrom, std::string("1-0"));
         QCOMPARE(calls[1].resumeFrom, std::string()); // live
+        QTRY_VERIFY_WITH_TIMEOUT(got.marker("Resume cursor too old") != nullptr, 5000);
         const FeedEvent *m = got.marker("Resume cursor too old");
         QVERIFY(m);
         QVERIFY(m->warning);
@@ -273,7 +281,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(client.status().state == ConnState::Error, 5000);
         QVERIFY(client.status().message.contains("token"));
         QVERIFY(!got.hasState(ConnState::Live));
-        QVERIFY(got.marker("rejected the token"));
+        QTRY_VERIFY_WITH_TIMEOUT(got.marker("rejected the token"), 5000);
         QTest::qWait(500); // no retry storm
         QCOMPARE(server.subscribeCount(), 1);
         client.stop();
@@ -294,7 +302,7 @@ private slots:
         Collector got(client);
         client.start(configFor(server), fastOptions());
         QTRY_VERIFY_WITH_TIMEOUT(client.status().state == ConnState::Error, 5000);
-        QCOMPARE(got.count(EventKind::Liquidation), 1);
+        QTRY_COMPARE_WITH_TIMEOUT(got.count(EventKind::Liquidation), 1, 5000);
         QTest::qWait(300);
         QCOMPARE(server.subscribeCount(), 1);
     }
