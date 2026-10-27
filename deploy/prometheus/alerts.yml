@@ -215,3 +215,37 @@ groups:
         labels: {severity: info}
         annotations:
           summary: "History calls are refused for exceeding history.max_concurrent"
+
+  - name: vulture-analysis
+    rules:
+      - alert: VultureDigestFailing
+        expr: increase(vulture_alerts_digest_runs_total{result="failed"}[1d]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "The daily digest could not be built or sent (no channel, bad configuration); see the server log"
+
+      - alert: VultureDigestMissing
+        # The schedule is on (the next-run gauge exists) but no digest was queued for more than 26 hours.
+        expr: >-
+          (vulture_alerts_digest_last_success_age_seconds > 26 * 3600)
+          and on() vulture_alerts_digest_next_run_timestamp_seconds
+        labels: {severity: warning}
+        annotations:
+          summary: "No daily digest for {{ $value | humanizeDuration }} although the schedule is enabled"
+
+      - alert: VultureCompositePassSlow
+        expr: vulture_alerts_composite_pass_seconds_max > 0.5
+        for: 10m
+        labels: {severity: info}
+        annotations:
+          summary: "A pass over all symbols and composite rules took {{ $value | humanizeDuration }}; check the number of rules and symbols"
+
+      - alert: VultureFundingPollFailing
+        # OKX funding rates and index prices come from REST polls every 5 minutes; all of them failing leaves the
+        # samples without funding data (the rest of the data is not affected).
+        expr: rate(vulture_funding_errors_total[30m]) > 0 and rate(vulture_funding_requests_total[30m]) > 0 and (rate(vulture_funding_errors_total[30m]) / rate(vulture_funding_requests_total[30m]) > 0.5)
+        for: 30m
+        labels: {severity: info}
+        annotations:
+          summary: "More than half of the OKX funding/index requests fail"
+

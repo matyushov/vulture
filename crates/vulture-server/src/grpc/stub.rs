@@ -31,6 +31,13 @@ impl history_server::History for HistoryStub {
     ) -> Result<Response<AggregateResponse>, Status> {
         Err(Status::unimplemented(HISTORY))
     }
+
+    async fn seasonality(
+        &self,
+        _request: Request<SeasonalityRequest>,
+    ) -> Result<Response<SeasonalityResponse>, Status> {
+        Err(Status::unimplemented(HISTORY))
+    }
 }
 
 /// The `History` service as `serve` registers it: the live backend, or the stub without one.
@@ -63,6 +70,16 @@ impl history_server::History for HistoryBackend {
         match self {
             Self::Stub(s) => s.aggregate(request).await,
             Self::Live(l) => l.aggregate(request).await,
+        }
+    }
+
+    async fn seasonality(
+        &self,
+        request: Request<SeasonalityRequest>,
+    ) -> Result<Response<SeasonalityResponse>, Status> {
+        match self {
+            Self::Stub(s) => s.seasonality(request).await,
+            Self::Live(l) => l.seasonality(request).await,
         }
     }
 }

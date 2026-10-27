@@ -118,6 +118,7 @@ fn liquidation_rule(id: &str, channels: &[&str]) -> UpsertRuleRequest {
             symbols: vec!["btc-usdt-perp".into()],
             channel_ids: channels.iter().map(|s| s.to_string()).collect(),
             cooldown_seconds: 60,
+            quiet_hours: vec![],
         }),
     }
 }

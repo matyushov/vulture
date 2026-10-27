@@ -90,6 +90,21 @@ pub(super) fn collect(s: &OkxStatus, out: &mut Families) {
             "Completed open interest sampler cycles.",
             c(&s.oi_cycles),
         ),
+        (
+            "vulture_funding_requests_total",
+            "REST requests for funding rates and index prices.",
+            c(&s.funding_requests),
+        ),
+        (
+            "vulture_funding_errors_total",
+            "Funding and index REST requests that failed.",
+            c(&s.funding_errors),
+        ),
+        (
+            "vulture_funding_fallbacks_total",
+            "Funding poll cycles that asked instrument by instrument.",
+            c(&s.funding_fallbacks),
+        ),
     ] {
         out.counter(name, help, &x, v);
     }

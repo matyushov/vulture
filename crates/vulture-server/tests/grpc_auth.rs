@@ -56,6 +56,12 @@ async fn call_everything(server: &Server, auth: Auth) -> Vec<(&'static str, Code
         aggregate,
         AggregateRequest::default()
     );
+    call!(
+        "History.Seasonality",
+        h,
+        seasonality,
+        SeasonalityRequest::default()
+    );
     let mut c = control(server, auth).await;
     call!(
         "Control.ListSubscriptions",
@@ -130,6 +136,12 @@ async fn call_everything(server: &Server, auth: Auth) -> Vec<(&'static str, Code
         DeleteChannelRequest::default()
     );
     call!(
+        "Control.SendDigestNow",
+        c,
+        send_digest_now,
+        SendDigestNowRequest::default()
+    );
+    call!(
         "Control.GetStorageStatus",
         c,
         get_storage_status,
@@ -173,7 +185,7 @@ async fn every_rpc_of_every_service_requires_the_token() {
         ),
     ] {
         let results = call_everything(&server, auth).await;
-        assert_eq!(results.len(), 17, "all 17 RPCs of the contract are covered");
+        assert_eq!(results.len(), 19, "all 19 RPCs of the contract are covered");
         for (rpc, code) in results {
             assert_eq!(code, Code::Unauthenticated, "{label}: {rpc}");
         }
@@ -193,7 +205,7 @@ async fn every_rpc_of_every_service_requires_the_token() {
             .auth_stats
             .failures
             .load(std::sync::atomic::Ordering::Relaxed)
-            >= 6 * 17
+            >= 6 * 19
     );
     server.stop().await;
 }

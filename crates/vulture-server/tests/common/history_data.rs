@@ -109,6 +109,14 @@ pub fn raw_events() -> Vec<Event> {
                                 Some(base * mark)
                             },
                             mark_price: if n % 17 == 5 { None } else { Some(mark) },
+                            // OKX series carry no funding; the others a rate that steps every 40 samples and
+                            // an index price a little below the mark price (a positive basis).
+                            funding_rate: (*exchange != "okx")
+                                .then_some(0.0001 * (si as f64 + 1.0) + 0.00001 * (n / 40) as f64),
+                            index_price: (*exchange != "okx" && n % 23 != 7)
+                                .then_some(mark * (1.0 - 0.0003 * (si as f64 + 1.0))),
+                            next_funding_ts: (*exchange != "okx")
+                                .then(|| (t / 28_800_000 + 1) * 28_800_000),
                         })),
                     },
                 ));

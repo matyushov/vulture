@@ -215,6 +215,7 @@ mod tests {
                 symbols: vec![],
                 channels: vec!["tg".into()],
                 cooldown_secs: 10,
+                quiet_hours: Vec::new(),
             }],
             channels: vec![ChannelDef {
                 id: "tg".into(),
@@ -230,6 +231,7 @@ mod tests {
                 min_interval_ms: 0,
                 batch_window_ms: 0,
                 queue_limit: 0,
+                quiet_hours: Vec::new(),
             }],
         }
     }

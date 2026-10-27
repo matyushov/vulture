@@ -51,6 +51,7 @@ fn telegram(id: &str) -> ChannelDef {
         min_interval_ms: 0,
         batch_window_ms: 0,
         queue_limit: 0,
+        quiet_hours: Vec::new(),
     }
 }
 

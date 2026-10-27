@@ -5,7 +5,7 @@
 //! - [`cold`]: the trait of the long-term store; [`ch`] implements it on ClickHouse with the SQL of [`sql`],
 //!   [`memory`] on a vector of events (reference semantics and test double).
 //! - [`event`], [`tail`]: event time, order and filters; reading the Redis stream.
-//! - `events`, `aggregate`, [`movers`]: the three operations; `service`: limits, the gRPC adapter; [`stats`]:
+//! - `events`, `aggregate`, [`movers`], `seasonality`: the operations; `service`: limits, the gRPC adapter; [`stats`]:
 //!   `vulture_history_*` metrics.
 
 pub mod agg;
@@ -13,10 +13,12 @@ mod aggregate;
 pub mod bins;
 pub mod ch;
 pub mod cold;
+pub mod digest_data;
 pub mod event;
 mod events;
 pub mod memory;
 pub mod movers;
+mod seasonality;
 mod service;
 pub mod sql;
 pub mod stats;

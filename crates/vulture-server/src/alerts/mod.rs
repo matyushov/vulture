@@ -19,6 +19,7 @@
 pub mod cascade;
 pub mod core;
 pub mod delivery;
+pub mod digest;
 pub mod engine;
 pub mod file;
 pub mod manager;
@@ -38,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 use vulture_proto::v1::Event;
 
 pub use delivery::{Delivery, PushResult, TestOutcome};
+pub use digest::{DigestError, DigestService};
 pub use engine::{EngineInput, EngineTask};
 pub use file::{ALERTS_FILE, AlertsFile, AlertsFileError};
 pub use manager::{AlertsError, AlertsManager, ChannelView};

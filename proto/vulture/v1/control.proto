@@ -36,6 +36,10 @@ service Control {
   rpc DeleteChannel(DeleteChannelRequest) returns (DeleteChannelResponse);
   // Sends a test message to one channel right away, bypassing the queue and the batching (v0.4).
   rpc SendTestMessage(SendTestMessageRequest) returns (SendTestMessageResponse);
+  // Builds the daily digest now and queues it for the channels (v0.6): for testing the sections and the layout.
+  // Errors: INVALID_ARGUMENT (unknown channel or section, top_n above 20), FAILED_PRECONDITION (no enabled channel
+  // to send to), UNIMPLEMENTED (the alerts subsystem is off).
+  rpc SendDigestNow(SendDigestNowRequest) returns (SendDigestNowResponse);
   // Redis and flusher status.
   rpc GetStorageStatus(GetStorageStatusRequest) returns (GetStorageStatusResponse);
   // Token rotation; the new token is returned once.
@@ -211,6 +215,60 @@ enum Severity {
   SEVERITY_CRITICAL = 3;
 }
 
+// What a condition of a composite rule measures (v0.6).
+enum CompositeMetric {
+  COMPOSITE_METRIC_UNSPECIFIED = 0;
+  // Change of oi_base over window_seconds, percent (the OI spike detector's own function).
+  COMPOSITE_METRIC_OI_CHANGE_PCT = 1;
+  // Change of the mark price over window_seconds, percent.
+  COMPOSITE_METRIC_PRICE_CHANGE_PCT = 2;
+  // The latest funding rate, a fraction (0.0001 = 0.01%); window_seconds must be 0.
+  COMPOSITE_METRIC_FUNDING_RATE = 3;
+  // The latest basis, 100 * (mark - index) / index, percent; window_seconds must be 0.
+  COMPOSITE_METRIC_BASIS_PCT = 4;
+  // Liquidated USD of the symbol over window_seconds.
+  COMPOSITE_METRIC_LIQ_USD = 5;
+  // The regime over window_seconds, compared with EQ to a Regime number (1 new longs, 2 new shorts, 3 short
+  // covering, 4 long unwinding).
+  COMPOSITE_METRIC_REGIME = 6;
+}
+
+enum CompareOp {
+  COMPARE_OP_UNSPECIFIED = 0;
+  COMPARE_OP_GT = 1;
+  COMPARE_OP_GE = 2;
+  COMPARE_OP_LT = 3;
+  COMPARE_OP_LE = 4;
+  // Only for COMPOSITE_METRIC_REGIME.
+  COMPARE_OP_EQ = 5;
+}
+
+message CompositeCondition {
+  CompositeMetric metric = 1;
+  CompareOp op = 2;
+  double threshold = 3;
+  // 30 to 14400 for the windowed metrics, 0 for funding rate and basis.
+  uint32 window_seconds = 4;
+}
+
+// Composite rule (v0.6): all conditions hold at once for a symbol (AND). Scope is Rule.exchanges / Rule.symbols
+// (empty = all), the cooldown is Rule.cooldown_seconds per exchange and symbol. The server evaluates composite
+// rules on a fixed cadence (alerts.composite_eval_secs, default 10 s) from the engine state, not per event.
+message CompositeRule {
+  // 1 to 8 conditions.
+  repeated CompositeCondition conditions = 1;
+  // SEVERITY_UNSPECIFIED = info.
+  Severity severity = 2;
+}
+
+// A range of the day in UTC (v0.6). Minutes since 00:00 UTC; end is exclusive; start > end wraps midnight.
+message QuietRange {
+  // 0 to 1439.
+  uint32 start_minute = 1;
+  // 0 to 1440; must differ from start_minute.
+  uint32 end_minute = 2;
+}
+
 message GapRule {
   int64 min_duration_ms = 1;
 }
@@ -226,6 +284,8 @@ message Rule {
     GapRule gap = 12;
     // Added in v0.4.
     SignalRule signal = 13;
+    // Added in v0.6.
+    CompositeRule composite = 14;
   }
   // Filters; an empty list = no filter.
   repeated string exchanges = 4;
@@ -233,6 +293,8 @@ message Rule {
   repeated string channel_ids = 6;
   uint32 cooldown_seconds = 7;
   reserved 8, 9;
+  // Added in v0.6. UTC ranges in which the rule stays silent (no alert, cooldown not consumed). At most 8.
+  repeated QuietRange quiet_hours = 15;
 }
 
 message ListRulesRequest {}
@@ -286,6 +348,9 @@ message Channel {
   uint32 min_interval_ms = 14;
   uint32 batch_window_ms = 15;
   uint32 queue_limit = 16;
+  // Added in v0.6. UTC ranges in which the channel receives no alerts (dropped, not delayed). The daily digest is
+  // not affected. At most 8.
+  repeated QuietRange quiet_hours = 17;
 }
 
 message ListChannelsRequest {}
@@ -321,6 +386,28 @@ message SendTestMessageResponse {
   bool dry_run = 2;
   // Short outcome without secrets, for example "ok", "HTTP 401" or "dry run".
   string detail = 3;
+}
+
+// --- Daily digest (v0.6) ---
+
+message SendDigestNowRequest {
+  // Channels to send to; empty = the channels of [alerts.digest] (every enabled non-system channel if none).
+  repeated string channel_ids = 1;
+  // Sections: oi_movers, liquidations, skew, cascades, funding, gaps; empty = the configured ones.
+  repeated string sections = 2;
+  // Entries per list, 1 to 20; 0 = the configured value.
+  uint32 top_n = 3;
+}
+
+message SendDigestNowResponse {
+  // Channels the digest was queued for (delivery is asynchronous and follows the channel's rate limits and dry_run).
+  repeated string queued_channel_ids = 1;
+  // The report as plain text.
+  string preview = 2;
+  // Time spent building it, ms.
+  uint32 build_ms = 3;
+  // Sections that could not be built (listed in the report under "Not available").
+  repeated string unavailable_sections = 4;
 }
 
 // --- Storage ---

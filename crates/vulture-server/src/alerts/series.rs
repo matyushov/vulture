@@ -213,6 +213,22 @@ impl Series {
         })
     }
 
+    /// Change of the mark price over `window_ms` in percent, with the same reference sample and the same refusals
+    /// as [`Series::change`] (a hole, a gap, no reference near `now - window`). `None` when either price is
+    /// unknown.
+    pub fn mark_change(&self, window_ms: i64, extra_break: i64) -> Option<f64> {
+        let idx = self.samples.len().checked_sub(1)?;
+        let now = *self.samples.get(idx)?;
+        let valid_from = self.break_ts.max(extra_break);
+        let r = self.nearest(now.ts - window_ms, tolerance_ms(window_ms), valid_from, idx)?;
+        let reference = *self.samples.get(r)?;
+        if now.ts - reference.ts < window_ms / 2 {
+            return None;
+        }
+        let (a, b) = (reference.mark, now.mark);
+        (a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0).then(|| 100.0 * (b - a) / a)
+    }
+
     /// Distribution of the symbol's own window changes before the current window: median and robust sigma
     /// (1.4826 x MAD) of the percent changes of `window` ending at samples older than `newest - window`.
     /// At most about `max_points` points (evenly strided). `None` when fewer than `min_points` are valid.

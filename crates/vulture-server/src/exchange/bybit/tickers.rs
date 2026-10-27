@@ -19,6 +19,12 @@ pub struct TickerEntry {
     pub open_interest: Option<f64>,
     /// `openInterestValue`, quote notional.
     pub open_interest_value: Option<f64>,
+    /// `indexPrice`, exchange units.
+    pub index_price: Option<f64>,
+    /// `fundingRate`, a fraction.
+    pub funding_rate: Option<f64>,
+    /// `nextFundingTime`, ms.
+    pub next_funding_ts: Option<i64>,
     /// `ts` of the last message that touched the entry, ms.
     pub exchange_ts: i64,
     /// Local receive time of that message, ms.
@@ -38,6 +44,12 @@ pub struct TickerUpdate {
     pub open_interest: Option<f64>,
     /// See [`TickerEntry::open_interest_value`].
     pub open_interest_value: Option<f64>,
+    /// `indexPrice`.
+    pub index_price: Option<f64>,
+    /// `fundingRate` (may be negative).
+    pub funding_rate: Option<f64>,
+    /// `nextFundingTime`, ms.
+    pub next_funding_ts: Option<i64>,
     /// Message time, ms.
     pub exchange_ts: i64,
     /// Fields that were present but unusable (not a number, negative, zero price).
@@ -65,6 +77,12 @@ struct TickerData {
     open_interest: Option<String>,
     #[serde(default)]
     open_interest_value: Option<String>,
+    #[serde(default)]
+    index_price: Option<String>,
+    #[serde(default)]
+    funding_rate: Option<String>,
+    #[serde(default)]
+    next_funding_time: Option<String>,
 }
 
 /// Parses a `tickers.{symbol}` message.
@@ -95,12 +113,39 @@ pub fn parse_ticker(text: &str) -> Result<TickerUpdate, String> {
     let mark_price = number(f.data.mark_price, true);
     let open_interest = number(f.data.open_interest, false);
     let open_interest_value = number(f.data.open_interest_value, false);
+    let index_price = number(f.data.index_price, true);
+    // A funding rate is legitimately negative or zero; only a non-number is bad.
+    let funding_rate =
+        f.data
+            .funding_rate
+            .filter(|s| !s.is_empty())
+            .and_then(|v| match v.parse::<f64>() {
+                Ok(x) if x.is_finite() => Some(x),
+                _ => {
+                    bad += 1;
+                    None
+                }
+            });
+    let next_funding_ts = f
+        .data
+        .next_funding_time
+        .filter(|s| !s.is_empty())
+        .and_then(|v| match v.parse::<i64>() {
+            Ok(x) if x > 0 => Some(x),
+            _ => {
+                bad += 1;
+                None
+            }
+        });
     Ok(TickerUpdate {
         symbol,
         snapshot,
         mark_price,
         open_interest,
         open_interest_value,
+        index_price,
+        funding_rate,
+        next_funding_ts,
         exchange_ts: f.ts,
         bad_fields: bad,
     })
@@ -134,6 +179,15 @@ impl Tickers {
             }
             if u.open_interest_value.is_some() {
                 e.open_interest_value = u.open_interest_value;
+            }
+            if u.index_price.is_some() {
+                e.index_price = u.index_price;
+            }
+            if u.funding_rate.is_some() {
+                e.funding_rate = u.funding_rate;
+            }
+            if u.next_funding_ts.is_some() {
+                e.next_funding_ts = u.next_funding_ts;
             }
             e.exchange_ts = u.exchange_ts;
             e.recv_ts = recv_ts;
@@ -206,6 +260,9 @@ mod tests {
         assert_eq!(u.mark_price, Some(66666.60));
         assert_eq!(u.open_interest, Some(492373.72));
         assert_eq!(u.open_interest_value, Some(32824881841.75));
+        assert_eq!(u.index_price, Some(115418.19));
+        assert_eq!(u.funding_rate, Some(-0.005));
+        assert_eq!(u.next_funding_ts, Some(1760342400000));
         assert_eq!(u.exchange_ts, 1760325052630);
         assert_eq!(u.bad_fields, 0);
     }
@@ -254,6 +311,48 @@ mod tests {
         // An empty string and a delta without fields change nothing.
         t.apply(&delta(r#","markPrice":"""#, 4000), 40);
         assert_eq!(t.get("BTCUSDT").unwrap().mark_price, Some(66670.5));
+    }
+
+    #[test]
+    fn funding_and_index_follow_deltas_and_snapshots() {
+        let t = Tickers::default();
+        t.apply(&parse_ticker(SNAP.lines().next().unwrap()).unwrap(), 10);
+        let e = t.get("BTCUSDT").unwrap();
+        assert_eq!(
+            (e.index_price, e.funding_rate),
+            (Some(115418.19), Some(-0.005))
+        );
+        // A delta that only carries the funding rate keeps the index; a zero rate is a value, not "missing".
+        t.apply(&delta(r#","fundingRate":"0""#, 2000), 20);
+        let e = t.get("BTCUSDT").unwrap();
+        assert_eq!(
+            (e.index_price, e.funding_rate),
+            (Some(115418.19), Some(0.0))
+        );
+        assert_eq!(e.next_funding_ts, Some(1760342400000));
+        t.apply(
+            &delta(
+                r#","indexPrice":"115500.5","nextFundingTime":"1760371200000""#,
+                3000,
+            ),
+            30,
+        );
+        let e = t.get("BTCUSDT").unwrap();
+        assert_eq!(
+            (e.index_price, e.next_funding_ts),
+            (Some(115500.5), Some(1760371200000))
+        );
+        // Empty strings (a contract without funding) change nothing.
+        t.apply(
+            &delta(r#","fundingRate":"","nextFundingTime":"""#, 4000),
+            40,
+        );
+        let e = t.get("BTCUSDT").unwrap();
+        assert_eq!(e.funding_rate, Some(0.0));
+        // Garbage is counted, not applied.
+        let u = parse_ticker(r#"{"topic":"tickers.X","type":"delta","data":{"symbol":"X","indexPrice":"-5","fundingRate":"nan?","nextFundingTime":"soon"},"ts":1}"#).unwrap();
+        assert_eq!(u.bad_fields, 3);
+        assert!(u.index_price.is_none() && u.funding_rate.is_none() && u.next_funding_ts.is_none());
     }
 
     #[test]

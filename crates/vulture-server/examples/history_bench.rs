@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         SeriesParams::default(),
         Arc::new(At(end)),
     );
-    let h = HistoryHandle(service);
+    let h = HistoryHandle(service.clone());
 
     let agg = |group_by: GroupBy,
                step: Step,
@@ -287,6 +287,31 @@ async fn main() -> anyhow::Result<()> {
             missed.push(format!("{name}: {median:.1} ms > {t:.0} ms"));
         }
     }
+    // The daily digest: every section, as the scheduler builds it.
+    let sections: Vec<String> = vulture_server::config::DIGEST_SECTIONS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let mut times = Vec::new();
+    let mut errors = 0;
+    for _ in 0..args.runs.clamp(1, 3) {
+        let t = Instant::now();
+        let data = service
+            .digest_data(&vulture_server::query::digest_data::DigestRequest {
+                end,
+                sections: sections.clone(),
+                top_n: 5,
+            })
+            .await;
+        errors = data.errors.len();
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.total_cmp(b));
+    println!(
+        "daily digest data, all six sections | {:.1} | {:.1} | {errors} section error(s) | -",
+        times[times.len() / 2],
+        times[0]
+    );
     if args.assert && !missed.is_empty() {
         anyhow::bail!("targets missed:\n  {}", missed.join("\n  "));
     }

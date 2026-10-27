@@ -1033,3 +1033,146 @@ async fn stats_are_counted_per_method_and_code() {
         assert!(text.contains(name), "{name}\n{text}");
     }
 }
+
+// ---------------------------------------------------------------- funding and basis
+
+#[tokio::test]
+async fn funding_and_basis_metrics_match_a_brute_force_reference() {
+    let ds = dataset().await;
+    let r = rig(&ds, None, true, cfg()).await;
+    let metrics = [
+        Metric::FundingLast,
+        Metric::FundingAvg,
+        Metric::BasisPct,
+        Metric::BasisPctAvg,
+    ];
+    for (group_by, step, step_ms) in [
+        (GroupBy::Symbol, Step::Minute15, 15 * MIN),
+        (GroupBy::BaseAsset, Step::Hour, HOUR),
+        (GroupBy::Exchange, Step::Minute5, 5 * MIN),
+    ] {
+        let resp = aggregate(&r.handle, req(group_by, step, &metrics))
+            .await
+            .unwrap();
+        let key = |ex: &str, sym: &str| match group_by {
+            GroupBy::Exchange => ex.to_string(),
+            GroupBy::Symbol => sym.to_string(),
+            _ => base_asset(sym).to_string(),
+        };
+        // Per series and bin: last funding, mean funding, last basis, mean basis; then the mean over the series.
+        #[derive(Default, Clone)]
+        struct Cell {
+            f: Vec<(i64, f64)>,
+            b: Vec<(i64, f64)>,
+        }
+        let mut cells: BTreeMap<(String, String, i64), Cell> = BTreeMap::new();
+        for e in &ds.events {
+            if let Some(Payload::OpenInterest(o)) = &e.payload {
+                let bin = o.exchange_ts.div_euclid(step_ms) * step_ms;
+                let c = cells
+                    .entry((o.exchange.clone(), o.symbol.clone(), bin))
+                    .or_default();
+                if let Some(f) = o.funding_rate {
+                    c.f.push((o.exchange_ts, f));
+                }
+                if let (Some(m), Some(i)) = (o.mark_price, o.index_price) {
+                    c.b.push((o.exchange_ts, 100.0 * (m - i) / i));
+                }
+            }
+        }
+        let mut groups: BTreeMap<(String, i64), [Vec<f64>; 4]> = BTreeMap::new();
+        for ((ex, sym, bin), c) in &cells {
+            let g = groups.entry((key(ex, sym), *bin)).or_default();
+            if let Some(last) = c.f.iter().max_by_key(|x| x.0) {
+                g[0].push(last.1);
+                g[1].push(c.f.iter().map(|x| x.1).sum::<f64>() / c.f.len() as f64);
+            }
+            if let Some(last) = c.b.iter().max_by_key(|x| x.0) {
+                g[2].push(last.1);
+                g[3].push(c.b.iter().map(|x| x.1).sum::<f64>() / c.b.len() as f64);
+            }
+        }
+        let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+        let mut with_values = 0;
+        for row in &resp.rows {
+            let g = groups
+                .get(&(row.group.clone(), row.bucket_start))
+                .cloned()
+                .unwrap_or_default();
+            for (i, m) in metrics.iter().enumerate() {
+                assert!(
+                    close(val(&row.values, *m), mean(&g[i])),
+                    "{group_by:?} {} {} {m:?}: {:?} vs {:?}",
+                    row.group,
+                    row.bucket_start,
+                    val(&row.values, *m),
+                    mean(&g[i])
+                );
+            }
+            with_values += usize::from(val(&row.values, Metric::BasisPct).is_some());
+        }
+        assert!(with_values > 0);
+    }
+    // OKX has no funding and no index: its rows are null, not zero.
+    let mut q = req(
+        GroupBy::Symbol,
+        Step::Hour,
+        &[Metric::FundingLast, Metric::BasisPct, Metric::OiEndBase],
+    );
+    q.exchanges = vec!["okx".into()];
+    let resp = aggregate(&r.handle, q).await.unwrap();
+    assert!(!resp.rows.is_empty());
+    for row in &resp.rows {
+        assert_eq!(val(&row.values, Metric::FundingLast), None);
+        assert_eq!(val(&row.values, Metric::BasisPct), None);
+        assert!(val(&row.values, Metric::OiEndBase).is_some());
+    }
+}
+
+#[tokio::test]
+async fn funding_metrics_agree_across_the_boundary_and_redis_alone() {
+    let ds = dataset().await;
+    let whole = rig(&ds, None, true, cfg()).await;
+    let split = rig(&ds, Some((0.4, 20)), true, cfg()).await;
+    let redis = rig(&ds, None, false, cfg()).await;
+    let r = req(
+        GroupBy::BaseAsset,
+        Step::Minute15,
+        &[
+            Metric::FundingLast,
+            Metric::FundingAvg,
+            Metric::BasisPct,
+            Metric::BasisPctAvg,
+            Metric::OiEndUsd,
+        ],
+    );
+    let a = aggregate(&whole.handle, r.clone()).await.unwrap();
+    assert_same_rows(
+        &a,
+        &aggregate(&split.handle, r.clone()).await.unwrap(),
+        "split",
+    );
+    assert_same_rows(
+        &a,
+        &aggregate(&redis.handle, r).await.unwrap(),
+        "redis only",
+    );
+}
+
+#[tokio::test]
+async fn query_returns_the_funding_fields_of_the_events() {
+    let ds = dataset().await;
+    let r = rig(&ds, Some((0.5, 0)), true, cfg()).await;
+    let got = query(
+        &r.handle,
+        HistoryRequest {
+            types: vec![EventType::OpenInterest as i32],
+            exchanges: vec!["bybit".into()],
+            limit: 50,
+            ..period()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(got.iter().any(|e| matches!(&e.payload, Some(Payload::OpenInterest(o)) if o.funding_rate.is_some() && o.next_funding_ts.is_some())));
+}

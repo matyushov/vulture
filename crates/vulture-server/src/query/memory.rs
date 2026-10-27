@@ -11,7 +11,7 @@ use vulture_proto::v1::{Event, event::Payload};
 use super::agg::{FineData, GapRec, SeriesKey};
 use super::cold::{
     ColdStore, EventCursor, EventKey, EventQuery, FineAnswer, FineQuery, GapQuery, MoverAnswer,
-    MoverInput, MoverQuery,
+    MoverInput, MoverQuery, TopLiqQuery,
 };
 use super::event::{EventFilter, event_key, in_period};
 use crate::alerts::series::Sample;
@@ -103,6 +103,27 @@ impl EventCursor for VecCursor {
 }
 
 impl ColdStore for MemoryCold {
+    fn top_liquidations(&self, q: TopLiqQuery) -> BoxFuture<'_, Result<Vec<Event>, ChError>> {
+        Box::pin(async move {
+            self.check()?;
+            let mut v: Vec<(f64, EventKey, Event)> = self
+                .snapshot()
+                .into_iter()
+                .filter_map(|e| match &e.payload {
+                    Some(Payload::Liquidation(l))
+                        if l.exchange_ts >= q.from && l.exchange_ts < q.to =>
+                    {
+                        event_key(&e).map(|k| (l.notional_usd, k, e.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            v.truncate(q.n);
+            Ok(v.into_iter().map(|x| x.2).collect())
+        })
+    }
+
     fn events(&self, q: EventQuery) -> BoxFuture<'_, Result<Box<dyn EventCursor>, ChError>> {
         Box::pin(async move {
             self.check()?;

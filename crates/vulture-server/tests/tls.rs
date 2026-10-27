@@ -51,6 +51,7 @@ impl TlsServer {
             symbols: None,
             alerts: None,
             history: None,
+            digest: None,
         };
         let task = tokio::spawn({
             let (store, reloader, shutdown) = (backend.store(), reloader.clone(), shutdown.clone());

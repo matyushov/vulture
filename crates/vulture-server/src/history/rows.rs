@@ -62,7 +62,7 @@ impl Table {
                 "exchange, symbol, symbol_raw, exchange_ts, recv_ts, side, price, qty, notional_usd, event_id"
             }
             Table::OpenInterest => {
-                "exchange, symbol, symbol_raw, exchange_ts, recv_ts, oi_base, oi_usd, mark_price, event_id"
+                "exchange, symbol, symbol_raw, exchange_ts, recv_ts, oi_base, oi_usd, mark_price, event_id, funding_rate, index_price, next_funding_ts"
             }
             Table::Gaps => "exchange, stream, from_ts, to_ts, event_id",
             Table::Signals => {
@@ -145,6 +145,12 @@ pub struct OpenInterestRow {
     pub mark_price: Option<f64>,
     /// Redis stream entry ID.
     pub event_id: String,
+    /// Funding rate, when known (migration 2).
+    pub funding_rate: Option<f64>,
+    /// Index price, when known.
+    pub index_price: Option<f64>,
+    /// Next funding settlement, ms, when known.
+    pub next_funding_ts: Option<i64>,
 }
 
 /// A row of `gaps`.
@@ -246,6 +252,9 @@ impl Row {
                 put_nullable_f64(out, r.oi_usd);
                 put_nullable_f64(out, r.mark_price);
                 put_str(out, &r.event_id);
+                put_nullable_f64(out, r.funding_rate);
+                put_nullable_f64(out, r.index_price);
+                put_nullable_i64(out, r.next_funding_ts.map(clamp_ts));
             }
             Row::Gap(r) => {
                 put_str(out, &r.exchange);
@@ -300,6 +309,9 @@ fn open_interest(o: &OpenInterest, id: &str) -> OpenInterestRow {
         oi_usd: o.oi_usd,
         mark_price: o.mark_price,
         event_id: id.to_string(),
+        funding_rate: o.funding_rate,
+        index_price: o.index_price,
+        next_funding_ts: o.next_funding_ts,
     }
 }
 
@@ -362,6 +374,16 @@ fn put_nullable_f64(out: &mut Vec<u8>, v: Option<f64>) {
         Some(x) => {
             out.push(0);
             put_f64(out, x);
+        }
+        None => out.push(1),
+    }
+}
+
+fn put_nullable_i64(out: &mut Vec<u8>, v: Option<i64>) {
+    match v {
+        Some(x) => {
+            out.push(0);
+            put_i64(out, x);
         }
         None => out.push(1),
     }
@@ -523,9 +545,61 @@ mod tests {
         Row::OpenInterest(a).encode(&mut ba);
         Row::OpenInterest(b).encode(&mut bb);
         assert_eq!(ba.len() - bb.len(), 16);
-        // The NULL flags of the second row: both 1, no value bytes after them.
-        let tail = &bb[bb.len() - 4 - 2..bb.len() - 4];
+        // The NULL flags of the second row: both 1, no value bytes after them; then the event ID (1 + 3 bytes) and
+        // the three NULL flags of funding_rate, index_price and next_funding_ts.
+        let tail = &bb[bb.len() - 3 - 4 - 2..bb.len() - 3 - 4];
         assert_eq!(tail, &[1, 1]);
+        assert_eq!(&bb[bb.len() - 3..], &[1, 1, 1]);
+    }
+
+    #[test]
+    fn funding_columns_are_appended_after_the_event_id() {
+        assert!(
+            Table::OpenInterest
+                .columns()
+                .ends_with("event_id, funding_rate, index_price, next_funding_ts")
+        );
+        let e = ev(Payload::OpenInterest(OpenInterest {
+            exchange: "binance".into(),
+            oi_base: 1.0,
+            funding_rate: Some(-0.0002),
+            index_price: Some(100.5),
+            next_funding_ts: Some(1_792_800_000_000),
+            ..OpenInterest::default()
+        }));
+        let Some(Row::OpenInterest(r)) = Row::from_event(&e, "7-1") else {
+            panic!()
+        };
+        assert_eq!(
+            (r.funding_rate, r.index_price, r.next_funding_ts),
+            (Some(-0.0002), Some(100.5), Some(1_792_800_000_000))
+        );
+        let mut out = Vec::new();
+        Row::OpenInterest(r).encode(&mut out);
+        // 0, f64 | 0, f64 | 0, i64 after the event ID "7-1" (1 + 3 bytes).
+        let tail = &out[out.len() - (9 + 9 + 9)..];
+        assert_eq!(tail[0], 0);
+        assert_eq!(f64::from_le_bytes(tail[1..9].try_into().unwrap()), -0.0002);
+        assert_eq!(f64::from_le_bytes(tail[10..18].try_into().unwrap()), 100.5);
+        assert_eq!(tail[18], 0);
+        assert_eq!(
+            i64::from_le_bytes(tail[19..27].try_into().unwrap()),
+            1_792_800_000_000
+        );
+        // A timestamp outside DateTime64 is clamped like the other times.
+        let wild = ev(Payload::OpenInterest(OpenInterest {
+            next_funding_ts: Some(i64::MAX),
+            ..OpenInterest::default()
+        }));
+        let Some(Row::OpenInterest(w)) = Row::from_event(&wild, "1-0") else {
+            panic!()
+        };
+        let mut buf = Vec::new();
+        Row::OpenInterest(w).encode(&mut buf);
+        assert_eq!(
+            i64::from_le_bytes(buf[buf.len() - 8..].try_into().unwrap()),
+            MAX_TS_MS
+        );
     }
 
     #[test]

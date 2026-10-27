@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub use alerts::{AlertsConfig, CascadeConfig, DeliveryConfig, OiSpikeConfig, OiWindow};
+pub use alerts::{
+    AlertsConfig, CascadeConfig, DIGEST_SECTIONS, DeliveryConfig, DigestConfig, OiSpikeConfig,
+    OiWindow,
+};
 pub use env::ENV_PREFIX;
 pub use history::HistoryApiConfig;
 pub use secret::Secret;

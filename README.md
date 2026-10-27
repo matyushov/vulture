@@ -344,7 +344,10 @@ Four `MergeTree` tables, created by numbered SQL files embedded in the binary
 - `schema_migrations(version, name, checksum, applied_at)` records what ran. Applying is idempotent and additive
   (a unit test rejects `DROP`, `TRUNCATE`, `DELETE`, `RENAME`, `MODIFY`, TTL); a migration edited after it ran is refused
   with an explanatory error. `vulture-server migrate --config <file>` applies them by hand; `run` applies them at
-  start (and creates the database if it does not exist).
+  start (and creates the database if it does not exist). Migration 2 (`0002_open_interest_funding.sql`, V3b) adds the
+  nullable columns `funding_rate`, `index_price` and `next_funding_ts` to `open_interest` with `ADD COLUMN IF NOT EXISTS`:
+  existing rows read `NULL`, no data is rewritten or lost (a gated test upgrades a database that holds a row in the old
+  shape). An older server that is started again after the upgrade keeps working: its inserts name their columns.
 
 ### The flusher
 
@@ -538,11 +541,62 @@ pause (one `GROUP BY` with array functions), not the history. A symbol whose win
 of a hole or gap but for which a change can still be computed is listed with `partial = true`. Series silent for more
 than `movers_max_stale_secs` (15 minutes) are not movers.
 
+### Funding, index price and basis (B1)
+
+`OpenInterest` carries three optional fields (proto v0.6): `funding_rate` (a fraction, `0.0001` is 0.01%),
+`index_price` (per real coin, like `mark_price`) and `next_funding_ts`. They are stored in three nullable columns of
+`open_interest` (migration 2, applied at start; rows written before it read back as `NULL`, nothing is rewritten) and
+are filled **from data the connectors already receive, without more requests and without more samples**:
+
+| Exchange | Source |
+|---|---|
+| Binance | the mark price frames of `!markPrice@arr@1s`: `r` (funding rate), `i` (index price), `T` (next funding time) |
+| Bybit | the `tickers` state: `fundingRate`, `indexPrice`, `nextFundingTime` (deltas merge, a missing field keeps its last value) |
+| OKX | REST polls every 5 minutes (`OkxTuning::funding_poll_interval`): `GET /api/v5/market/index-tickers?quoteCcy=USDT` and `USDC` (all indexes in one answer) and `GET /api/v5/public/funding-rate?instId=ANY` (all swaps in one answer; if the exchange refuses `ANY` or answers nothing, one request per tracked instrument, at most two a second); a value older than 15 minutes is not attached |
+
+OKX is polled instead of subscribed to (`funding-rate` per instrument, `index-tickers` per index) because each channel
+adds one or two topics per instrument to the two now used: with about 700 swaps that is 1 400 topics on one connection
+today and 2 100 to 2 800 after, past the 2 000 per connection the connector allows, which would cost a second connection
+and several times the 480-per-hour subscription request budget at every start. The polls cost three requests per
+5 minutes (`vulture_funding_requests_total`, `..._errors_total`, `..._fallbacks_total{exchange="okx"}`). The request
+shapes come from the OKX documentation; the mock tests (`tests/okx.rs`) use bodies written from it, and the
+`instId=ANY` form is the one point not confirmed against the live exchange (the fallback exists for that reason).
+
+The samples are emitted at the same cadence as before, so there is no new traffic and no extra row. **Basis** is
+`mark - index`, derived in queries (`100 * (mark - index) / index` in percent), never stored. Aggregate metrics (v0.6):
+`FUNDING_LAST` and `FUNDING_AVG` (the last and the mean funding rate of the bin), `BASIS_PCT` and `BASIS_PCT_AVG`
+(basis in percent at the last sample and averaged over the samples that had both prices); for a group of several series
+the value is the mean over the series, and a series without funding data contributes nothing (null, never zero).
+
+### Analytics metrics and seasonality (B2)
+
+The "window" of these `Aggregate` metrics is the step: ask for `STEP_MINUTE_5` and the regime is the 5-minute regime.
+The price change of a bin is its last mark price against the last mark price of the bin before; the OI change is the
+change of `oi_base` over the bin as a percent of the level before it (per series, summed over the group). None of them
+is defined for `GROUP_BY_EXCHANGE` (they mix assets) or when either end is unknown.
+
+| Metric | Definition |
+|---|---|
+| `PRICE_CHANGE_PCT`, `OI_CHANGE_PCT` | the two changes above, percent |
+| `REGIME` | from the signs: price up and OI up is `NEW_LONGS` (1), price down and OI up `NEW_SHORTS` (2), price up and OI down `SHORT_COVERING` (3), price down and OI down `LONG_UNWINDING` (4); the value is the enum number, absent when either change is zero or unknown |
+| `REGIME_STRENGTH` | `sqrt(abs(price change %) * abs(OI change %))` |
+| `LIQ_TO_OI_RATIO` (fragility) | liquidated USD of the bin over the group's OI in USD |
+| `OI_PRICE_FLATNESS` (fragility) | `OI change % - abs(price change %)`: positive when positions build up faster than the price moves ("OI grows while the price is flat") |
+| `OI_DIVERGENCE_PCT` | `GROUP_BY_BASE_ASSET` only: the largest minus the smallest OI change % among the exchanges that list the asset (at least two); `AggregateRow.divergence` names them (`rising_exchange`, `falling_exchange`, their percentages, how many exchanges) |
+
+`History.Seasonality` (a separate method, not an `Aggregate` mode) builds a profile from the hourly bins of the last
+`lookback_days` (1 to 180, default 30; the hour in progress is left out): for every group, 24 buckets by UTC hour of day
+and 7 by day of week (Monday = 0), each with the number of hourly observations and the mean liquidated USD per hour, the
+mean OI change per hour in percent and the mean absolute OI change. It reads the same cells as `Aggregate` (ClickHouse
+and the Redis tail merged), so it needs several days of data to say anything: the answer carries `days_covered`
+(distinct UTC days with data) and `partial` (fewer days than asked, a weekday without observations, or a gap in an
+hour). Keep the filters narrow (it returns a profile per group); `history.max_aggregate_rows` bounds the work.
+
 ### Metrics
 
 | Series | Meaning |
 |---|---|
-| `vulture_history_requests_total{method,code}` | calls by `query`, `aggregate`, `movers` and result (`ok`, `invalid_argument`, `out_of_range`, `resource_exhausted`, `unavailable`, `deadline_exceeded`, `cancelled`, `internal`) |
+| `vulture_history_requests_total{method,code}` | calls by `query`, `aggregate`, `movers`, `seasonality` and result (`ok`, `invalid_argument`, `out_of_range`, `resource_exhausted`, `unavailable`, `deadline_exceeded`, `cancelled`, `internal`) |
 | `vulture_history_request_seconds_total{method}`, `..._seconds_max{method}` | time spent (divide by the count for the mean), slowest call |
 | `vulture_history_rows_scanned_total{source}` | rows read from `clickhouse` (its own count of rows read) and `redis` (entries scanned) |
 | `vulture_history_events_returned_total`, `..._bins_returned_total`, `..._movers_returned_total` | what was sent |
@@ -614,6 +668,85 @@ Every target is met with the existing sort key and plain `GROUP BY`; no material
 (transfer as JSON, decoding and the roll-up in Rust); a 1d step needs a third of that. If a
 dashboard ever needs hourly totals over many weeks, an `AggregatingMergeTree` view on `(exchange, symbol, hour)` is
 the next step.
+
+## Analysis tools (B3, B4)
+
+Two subcommands of `vulture-server` read the stored history and issue only `SELECT`s against ClickHouse (use the
+read-only `reader` user of `deploy/clickhouse`, see deploy/README.md). They need `[clickhouse]` in the configuration
+file; times are epoch milliseconds, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS]Z` (UTC). Both print Markdown (`--format md`,
+the default), JSON (`json`) or both, and `--out-dir <dir>` also writes `report.md` and `report.json`.
+
+### `analyze signals`: what the market did after each signal
+
+```sh
+vulture-server analyze signals --config analysis.toml --from 2026-10-01 --to 2026-10-28 [--exchange binance] \
+    [--by-strength] [--thresholds 0.1,0.25,0.5,1] [--market-proxy binance:BTC-USDT-PERP] [--out-dir report]
+```
+
+For every stored `Signal` in the period it measures the forward mark-price return at +5, +15 and +60 minutes (mark
+prices are those carried by the OI rows: the nearest sample within 60 s of the wanted time) and the USD liquidated in
+the following hour (the symbol's for an OI spike, all symbols of the signal's exchange scope for a cascade). Per signal
+type, window and exchange (and per strength bucket with `--by-strength`: information under 2 times the threshold,
+warning 2 to 4, critical 4 and over) the report gives: counts, the median and quartiles of the raw and of the
+*directional* return, and hit rates per return threshold.
+
+*Expected direction.* The study does not guess whether a signal is bullish; it measures both continuation and reversal
+of the move that came with it. For OI spikes the direction is that of the mark price over the signal's own window
+(price at the signal against one window earlier); for cascades (no symbol) it is the side that was liquidated (more
+liquidated longs than shorts means down) and the mark price of a market proxy symbol (`--market-proxy`, default Binance
+BTC-USDT-PERP) stands for the market. A *continuation hit* at threshold `t` is a return of at least `t` percent in the
+expected direction, a *reversal hit* one of at least `t` percent against it; shares are over the signals that have a
+direction and a return at that horizon.
+
+*Missing data is counted, never skipped silently.* A signal without a mark price near its time is excluded (counted in
+`excluded_no_price`); one without a price at a horizon counts as `missing` for that horizon; one whose direction cannot
+be determined is `undirected` (it still enters the raw return statistics, not the hit rates).
+
+### `analyze replay`: other thresholds over the same history
+
+```sh
+vulture-server analyze replay --config analysis.toml --detector oi_spike --from 2026-10-20 --to 2026-10-27 \
+    --params "" --params "windows=300+900,threshold_pct.300=2.5,z_min=3" [--exchange binance] [--symbol BTC-USDT-PERP] \
+    [--warmup-secs 14400] [--list-max 50]
+vulture-server analyze replay --config analysis.toml --detector liq_cascade --from 2026-10-20 --to 2026-10-27 \
+    --params "k_mad=5,floor_usd=1000000" --warmup-secs 86400
+```
+
+It runs **the engine's own core** (`alerts::core::Core`, the code behind the live detectors) over the stored events of
+the period in stream order, after a state-only warm-up (`--warmup-secs`, 4 hours by default like the live engine's
+start-up replay; the cascade detector builds its baseline from a day: give it 86400). Nothing else happens: no Redis,
+no delivery queues, no rules, no change to `alerts.json`; the core's hits are discarded. Each `--params` is one case
+(none means the configured defaults, an empty string too); all cases run over the same events in one pass and the output
+lists, per case, the signals it would have produced (type, time, exchange, symbol, window, change, threshold), a
+comparison table and the same statistics as `analyze signals` for them. Keys, `oi_spike`: `z_min`, `min_oi_usd`,
+`cooldown_secs`, `extension_factor`, `min_baseline_points`, `require_baseline`, `windows=300+900` (keep only these),
+`threshold_pct.<secs>`, `min_change_usd.<secs>`; `liq_cascade`: `k_mad`, `floor_usd`, `floor_usd_exchange`, `min_count`,
+`quiet_secs`, `end_ratio`, `min_baseline_minutes`, `baseline_secs`, `top_symbols`, `per_exchange`. An unknown key or
+an invalid value is an error before anything runs.
+
+*A caution that costs an afternoon if missed:* the ring buffers hold the longest enabled window plus 10 minutes. Keeping
+only `windows=300` leaves 15 minutes, fewer than the 60 history points `min_baseline_points` asks for, so with the default
+`require_baseline = true` nothing can fire; add `min_baseline_points=10` (or `require_baseline=false`) when you narrow the
+windows. The live engine behaves the same way.
+
+### Measurements (2026-10-28, laptop, release build, ClickHouse 25.8 in Docker, synthetic data)
+
+`synth_history --days 7 --exchanges 3`: 33.87 million OI rows (560 symbols, 3 exchanges, 30 s) and 827 thousand
+liquidations; 5 221 synthetic signals inserted at random rows.
+
+| | |
+|---|---|
+| `analyze signals`, 5 221 signals, 7 days | 3.7 s wall (two queries per signal, 8 at a time) |
+| `analyze replay oi_spike`, 1 day plus 4 h warm-up, all symbols and exchanges, 2 cases | 5.78 million events in 28 s (12 s of CPU) |
+| `analyze replay oi_spike`, Binance only, 2 cases (8 039 and 19 signals) with the statistics | 1.93 million events, 14.6 s |
+| `analyze replay liq_cascade`, 1 day plus 24 h warm-up, everything | 9.91 million events in 40.6 s (24 cascade signals) |
+| daily digest data, all six sections (7-day data set) | 415 ms median |
+| composite rules: one pass, 3 000 symbols x 8 rules x 3 conditions | 1.9 ms |
+
+The cost of the new columns, from `system.columns` after `OPTIMIZE FINAL` on that data set: `index_price` 5.02 bytes
+per row, `funding_rate` 0.89, `next_funding_ts` 0.01. A row went from 26.9 to 32.9 bytes (+22%); the synthetic index
+price is the mark price plus independent noise and compresses badly, a real index price tracks the mark price much
+more closely, so treat +6 bytes per row as the upper end: about 3.5 GiB a year more at 560 symbols and 30 s.
 
 ## gRPC API and token
 
@@ -945,6 +1078,66 @@ the message. Editing `alerts.json` by hand while the server is stopped works as 
 The synthetic market is a quiet random walk; real data will differ in how often candidates reach the baseline step.
 Re-measure on the server with the metrics above.
 
+### Daily digest (B5)
+
+`[alerts.digest]` (`enabled`, `time_utc`, `channels`, `sections`, `top_n`; `config.example.toml`) sends one summary
+message a day at `time_utc` UTC through the alert channels (ids in `channels`; empty means every enabled channel that is
+not a system channel). Sections, in this fixed order: `oi_movers` (top OI growth and decline over 24 hours, by the same
+function as the detector), `liquidations` (the largest), `skew` (long against short liquidations per exchange, whole
+hours), `cascades` (number, total, largest, longest of the market-wide cascades that ended in the window), `funding`
+(highest and lowest funding rates among series with over $1M of OI, when funding data exists) and `gaps` (data gaps of
+the day per exchange and stream). The numbers come from the History aggregate code, so the digest and the API cannot
+disagree; a section that cannot be built (ClickHouse down and the Redis window too short) is listed under "Not available"
+and the rest is still sent.
+
+It goes through the ordinary channel queues, so rate limits, retries and `dry_run` apply, but it is **a message of its
+own**: never merged into an alert batch, never counted as an alert. Telegram gets HTML (cut at a line boundary under 4 096
+characters), Discord one embed (cut under 4 000, mentions disabled). Quiet hours do not apply to it (the owner chose the
+time). `Control.SendDigestNow(channel_ids, sections, top_n)` builds and queues one on request and returns the plain-text
+preview; use it with a `dry_run` channel to see the layout in the log. Errors: `INVALID_ARGUMENT` (unknown channel or
+section, `top_n` above 20), `FAILED_PRECONDITION` (no enabled channel), `UNIMPLEMENTED` (alerts off). Metrics:
+`vulture_alerts_digest_runs_total{result}`, `vulture_alerts_digest_build_seconds`,
+`vulture_alerts_digest_last_success_age_seconds`, `vulture_alerts_digest_next_run_timestamp_seconds`,
+`vulture_alerts_channel_reports_sent_total`. The scheduler sleeps in 30-second steps against the wall clock, so a
+clock jump cannot make it a day late; a digest missed because the server was down is not sent late.
+
+### Composite rules and quiet hours (B6)
+
+A **composite rule** (`RuleKind::composite`, proto `CompositeRule`) fires for a symbol when *all* of its 1 to 8 conditions
+hold at once. A condition is `metric op threshold [window]`:
+
+| metric | meaning | window |
+|---|---|---|
+| `oi_change_pct` | change of `oi_base` over the window, percent (the detector's function) | 30 to 14 400 s |
+| `price_change_pct` | change of the mark price over the window, percent (same reference sample and refusals) | same |
+| `funding_rate` | the latest funding rate, a fraction | none |
+| `basis_pct` | the latest `100 * (mark - index) / index` | none |
+| `liq_usd` | liquidated USD of the symbol over the window | same |
+| `regime` | the regime over the window, `eq` to 1 new longs, 2 new shorts, 3 short covering, 4 long unwinding | same |
+
+Operators `gt ge lt le` (and `eq`, regime only). Scope is the rule's `exchanges` and `symbols` (empty = all), the cooldown
+is per rule, exchange and symbol, the severity is the rule's. A condition whose value cannot be computed (no reference
+sample, a hole or gap in the window, no funding data) is false; stale symbols (no sample for `hole_secs`) are skipped.
+
+**Cadence and cost.** Composite rules are evaluated every `alerts.composite_eval_secs` (default 10) from the engine's state, not per
+event: one pass visits every active symbol against every composite rule in scope. 24 000 (symbol, rule) pairs with three
+conditions take 1.9 ms (release build; `vulture_alerts_composite_pass_seconds_max`), so 10 s is cheap. Window changes
+reuse the detector's series, funding and index are the latest values of the OI event, liquidations are kept per
+symbol (up to 5 000, four hours). Counters: `vulture_alerts_composite_evaluations_total`,
+`vulture_alerts_composite_matched_total`.
+
+**Quiet hours** (`quiet_hours`: up to 8 `[start_minute, end_minute)` ranges in minutes since 00:00 UTC, a range with
+`start > end` wraps midnight, `start == end` is refused) exist on every rule and every channel. A rule in its quiet
+hours produces no alert and does not spend its cooldown (it speaks as soon as the quiet range ends and the condition still
+holds); a channel in its quiet hours drops what is pushed to it (dropped, not delayed:
+`vulture_alerts_channel_quiet_skipped_total`); `vulture_alerts_quiet_suppressed_total{scope="rule"}` counts the rules'. The
+daily digest ignores both.
+
+Everything is managed through the existing `Control` RPCs (`UpsertRule`, `ListRules`, `DeleteRule`, `UpsertChannel`,
+`ListChannels`): validation (`INVALID_ARGUMENT` with the reason), audit lines, `alerts.json` (mode 0600; the
+`composite` kind and the `quiet_hours` fields are additive, but an older server refuses a file that holds a composite rule:
+delete such rules before a downgrade), live apply to the running engine and masked secrets, as before.
+
 ## Metrics
 
 A separate listener, `metrics.listen_addr` (default `127.0.0.1:9100`), serves `/metrics` (Prometheus text format),
@@ -968,7 +1161,9 @@ atomic counters and reports them at scrape time. Labels are low-cardinality on p
 | `vulture_grpc_*`, `vulture_auth_*` | clients, subscriptions, events sent, slow-client disconnects, resumes, out-of-range, failed and rate-limited authentications |
 | `vulture_flusher_*`, `vulture_clickhouse_*` | ClickHouse flusher and storage (see "ClickHouse history"): rows, failures, lag, backlog, reachability, disk, parts |
 | `vulture_tls_*` | enabled, seconds until expiry, reloads by `result`, last reload ok, handshake failures |
-| `vulture_alerts_*` | analytics engine, detectors, rules and per-channel delivery (see "Signals and alerts") |
+| `vulture_alerts_*` | analytics engine, detectors, rules, composite rules, quiet hours, the daily digest and per-channel delivery (see "Signals and alerts") |
+| `vulture_history_*` | the History service (see "History API") |
+| `vulture_funding_*{exchange="okx"}` | OKX funding and index REST polls: requests, errors, per-instrument fallbacks |
 
 The Redis stream length and entry ages are sampled every 15 s (they need round trips to Redis), the rest is read at
 scrape time. `deploy/prometheus/` has a sample scrape configuration and alert rules (writer buffer growing, Redis
@@ -1037,7 +1232,7 @@ v0.2 (additive, `buf breaking` green): the `Signal` message (`OI_SPIKE_UP`, `OI_
 per-symbol OI interval overrides; the older `ListSubscriptions` / `SetSubscription` stay but are documented as
 superseded); and the OI movers ranking in `History.Aggregate` (`AggregateRequest.oi_movers` selects it, the answer is
 `AggregateResponse.oi_movers` with top growth and top decline by `oi_base`, absolute and percent change and a
-`partial` flag). Contract only: no server logic for these yet (the symbol policy RPCs got theirs in v0.3). v0.3 (additive): `SetSymbolPolicyResponse` gained `tracked_count`, `universe_size`, `added`, `removed`, `changed`, and
+`partial` flag). Contract only: no server logic for these yet (the symbol policy RPCs got theirs in v0.3). v0.5 (additive): the steps 1m, 5m, 15m and 4h; the metrics for OI level, mark price candles; `AggregateRow.bucket_end`, `AggregateResponse.{bins_from_ts, bins_to_ts, source}`; `OiMoversQuery.exclude_partial`. v0.6 (additive): `OpenInterest.{funding_rate, index_price, next_funding_ts}`; the funding, basis and analytics metrics, `Regime`, `Divergence`, `History.Seasonality`; `CompositeRule`, `QuietRange` on rules and channels, `Control.SendDigestNow`. v0.3 (additive): `SetSymbolPolicyResponse` gained `tracked_count`, `universe_size`, `added`, `removed`, `changed`, and
 `ListSymbolPoliciesResponse` gained `statuses` (`SymbolPolicyStatus`: tracked count, universe size, whether the
 list is loaded, whether the policy is an owner override). Timestamps are int64, Unix epoch milliseconds;
 numbers are `double`. Evolution rules: fields may only be added, numbers are not reused,

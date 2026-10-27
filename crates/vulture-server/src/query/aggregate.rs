@@ -88,30 +88,9 @@ impl HistoryService {
         } else {
             plan.first_bin
         };
-        let collected = match self
-            .collect(&plan.scope, plan.step, lo, plan.end, plan.needs, true)
-            .await
-        {
-            Ok(c) => c,
-            Err(Fetch::Status(s)) => return Err(s),
-            Err(Fetch::Cold(e)) => {
-                self.stats.clickhouse_error();
-                if self.redis_covers(lo).await {
-                    tracing::warn!(error = %e, "ClickHouse failed; answering History.Aggregate from the Redis hot window");
-                    self.stats.redis_fallback();
-                    match self
-                        .collect(&plan.scope, plan.step, lo, plan.end, plan.needs, false)
-                        .await
-                    {
-                        Ok(c) => c,
-                        Err(Fetch::Status(s)) => return Err(s),
-                        Err(Fetch::Cold(e)) => return Err(ch_status(&e)),
-                    }
-                } else {
-                    return Err(ch_status(&e));
-                }
-            }
-        };
+        let collected = self
+            .collect_or_fallback(&plan.scope, plan.step, lo, plan.end, plan.needs)
+            .await?;
         let params = RollupParams {
             group_by: plan.group_by,
             step: plan.step,
@@ -137,6 +116,36 @@ impl HistoryService {
             bins_to_ts: plan.end,
             source: collected.source.to_string(),
         })
+    }
+
+    /// [`collect`](Self::collect) from ClickHouse and the tail; if ClickHouse fails and the Redis window covers the
+    /// period, from Redis alone.
+    pub(super) async fn collect_or_fallback(
+        &self,
+        scope: &Scope,
+        step: BinStep,
+        lo: i64,
+        end: i64,
+        needs: Needs,
+    ) -> Result<Collected, Status> {
+        match self.collect(scope, step, lo, end, needs, true).await {
+            Ok(c) => Ok(c),
+            Err(Fetch::Status(s)) => Err(s),
+            Err(Fetch::Cold(e)) => {
+                self.stats.clickhouse_error();
+                if self.redis_covers(lo).await {
+                    tracing::warn!(error = %e, "ClickHouse failed; answering from the Redis hot window");
+                    self.stats.redis_fallback();
+                    match self.collect(scope, step, lo, end, needs, false).await {
+                        Ok(c) => Ok(c),
+                        Err(Fetch::Status(s)) => Err(s),
+                        Err(Fetch::Cold(e)) => Err(ch_status(&e)),
+                    }
+                } else {
+                    Err(ch_status(&e))
+                }
+            }
+        }
     }
 
     fn plan_aggregate(&self, req: &AggregateRequest) -> Result<Plan, Status> {

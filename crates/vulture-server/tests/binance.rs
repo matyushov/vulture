@@ -867,6 +867,10 @@ async fn oi_uses_mark_price_when_known_and_stays_empty_otherwise() {
     assert_eq!(btc.oi_base, 2.5);
     assert_eq!(btc.mark_price, Some(100000.5));
     assert_eq!(btc.oi_usd, Some(2.5 * 100000.5));
+    // The funding rate, index price and next funding time of the same mark price frame ride along.
+    assert_eq!(btc.funding_rate, Some(0.0001));
+    assert_eq!(btc.index_price, Some(100000.5));
+    assert_eq!(btc.next_funding_ts, Some(1_792_780_800_000));
     assert!(
         btc.exchange_ts >= 1_792_775_000_000,
         "exchange time from the response"
@@ -876,6 +880,10 @@ async fn oi_uses_mark_price_when_known_and_stays_empty_otherwise() {
     assert_eq!(eth.oi_base, 2.5);
     assert_eq!(eth.oi_usd, None);
     assert_eq!(eth.mark_price, None);
+    assert_eq!(
+        (eth.funding_rate, eth.index_price, eth.next_funding_ts),
+        (None, None, None)
+    );
     assert!(rig.count(|s| &s.oi_without_mark) >= 1);
     rig.stop().await;
 }
@@ -1466,6 +1474,9 @@ async fn aliased_symbols_without_collision_are_scaled_to_real_coins() {
     assert_eq!(o.oi_base, 1_000_000.0);
     assert!((o.oi_usd.unwrap() - 4.0).abs() < 1e-9);
     assert!((o.mark_price.unwrap() - 0.000004).abs() < 1e-15);
+    // The index price is per real coin like the mark price; the funding rate is a fraction and is not scaled.
+    assert!((o.index_price.unwrap() - 0.000004).abs() < 1e-15);
+    assert_eq!(o.funding_rate, Some(0.0001));
     rig.stop().await;
 }
 

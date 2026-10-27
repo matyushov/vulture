@@ -195,6 +195,7 @@ fn oi(ts: i64, n: usize) -> Event {
             oi_base: 91_959.654 + n as f64,
             oi_usd: n.is_multiple_of(2).then_some(5_912_345_678.25 + n as f64),
             mark_price: n.is_multiple_of(3).then_some(64_295.1),
+            ..OpenInterest::default()
         })),
     }
 }
@@ -299,9 +300,9 @@ async fn migrations_apply_twice_and_detect_edits() {
         return;
     };
     let first = env.admin.migrate().await.unwrap();
-    assert_eq!(first, vec![1]);
+    assert_eq!(first, vec![1, 2]);
     assert_eq!(env.admin.migrate().await.unwrap(), Vec::<u32>::new());
-    assert_eq!(env.count("schema_migrations").await, 1);
+    assert_eq!(env.count("schema_migrations").await, 2);
     for t in ["liquidations", "open_interest", "gaps", "signals"] {
         let rows = env
             .admin

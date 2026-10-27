@@ -80,10 +80,146 @@ pub enum LiqSide {
     Short,
 }
 
+/// A range of the day in UTC during which a rule or a channel stays silent. Minutes since 00:00 UTC; `end` is
+/// exclusive; a range with `start > end` wraps midnight (`start 1320, end 360` is 22:00 to 06:00).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuietRange {
+    /// First quiet minute of the day, 0 to 1439.
+    pub start_minute: u16,
+    /// First minute after the range, 0 to 1440.
+    pub end_minute: u16,
+}
+
+impl QuietRange {
+    /// Whether minute-of-day `m` is inside.
+    pub fn contains(&self, m: u16) -> bool {
+        if self.start_minute < self.end_minute {
+            m >= self.start_minute && m < self.end_minute
+        } else {
+            m >= self.start_minute || m < self.end_minute
+        }
+    }
+}
+
+/// Whether the time (ms since the epoch, UTC) falls in any of the ranges.
+pub fn in_quiet(ranges: &[QuietRange], ts_ms: i64) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    let minute = (ts_ms.rem_euclid(86_400_000) / 60_000) as u16;
+    ranges.iter().any(|r| r.contains(minute))
+}
+
+/// Most quiet ranges per rule or channel.
+pub const MAX_QUIET_RANGES: usize = 8;
+
+/// Checks and normalizes quiet ranges (sorted, no duplicates).
+pub fn validate_quiet(ranges: &mut Vec<QuietRange>) -> Result<(), ModelError> {
+    if ranges.len() > MAX_QUIET_RANGES {
+        return bad(format!("more than {MAX_QUIET_RANGES} quiet ranges"));
+    }
+    for r in ranges.iter() {
+        if r.start_minute >= 1440 || r.end_minute > 1440 {
+            return bad(
+                "quiet range minutes must be 0 to 1439 for the start and 0 to 1440 for the end",
+            );
+        }
+        if r.start_minute == r.end_minute {
+            return bad("a quiet range must not be empty (start equals end)");
+        }
+    }
+    ranges.sort();
+    ranges.dedup();
+    Ok(())
+}
+
+/// What a condition of a composite rule measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CondMetric {
+    /// Change of `oi_base` over `window_secs`, percent (the detector's function).
+    OiChangePct,
+    /// Change of the mark price over `window_secs`, percent.
+    PriceChangePct,
+    /// The latest funding rate (a fraction).
+    FundingRate,
+    /// The latest basis, `100 * (mark - index) / index`, percent.
+    BasisPct,
+    /// Liquidated USD of the symbol over `window_secs`.
+    LiqUsd,
+    /// The regime over `window_secs` (compared with `eq` to a number 1 to 4: new longs, new shorts, short
+    /// covering, long unwinding).
+    Regime,
+}
+
+impl CondMetric {
+    /// Whether the metric needs a window.
+    pub fn windowed(self) -> bool {
+        !matches!(self, Self::FundingRate | Self::BasisPct)
+    }
+}
+
+/// Comparison of a condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CmpOp {
+    /// `>`.
+    Gt,
+    /// `>=`.
+    Ge,
+    /// `<`.
+    Lt,
+    /// `<=`.
+    Le,
+    /// `==` (for the regime).
+    Eq,
+}
+
+impl CmpOp {
+    /// Applies the comparison.
+    pub fn holds(self, value: f64, threshold: f64) -> bool {
+        match self {
+            Self::Gt => value > threshold,
+            Self::Ge => value >= threshold,
+            Self::Lt => value < threshold,
+            Self::Le => value <= threshold,
+            Self::Eq => (value - threshold).abs() < 1e-9,
+        }
+    }
+}
+
+/// One condition of a composite rule.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Condition {
+    /// What is measured.
+    pub metric: CondMetric,
+    /// How it is compared.
+    pub op: CmpOp,
+    /// The threshold, in the unit of the metric.
+    pub threshold: f64,
+    /// Window, seconds (0 for funding and basis).
+    #[serde(default)]
+    pub window_secs: u32,
+}
+
+/// Most conditions in a composite rule.
+pub const MAX_CONDITIONS: usize = 8;
+
 /// What a rule looks for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuleKind {
+    /// All conditions hold at once for a symbol (AND). Evaluated on a fixed cadence from the engine state, not
+    /// per event.
+    Composite {
+        /// The conditions.
+        conditions: Vec<Condition>,
+        /// Severity of the alert.
+        #[serde(default)]
+        severity: Severity,
+    },
     /// A single liquidation of at least `min_notional_usd`.
     Liquidation {
         /// Threshold, USD.
@@ -148,6 +284,9 @@ pub struct RuleDef {
     /// Minimum seconds between two alerts of the rule for the same exchange and symbol.
     #[serde(default)]
     pub cooldown_secs: u32,
+    /// UTC ranges of the day in which the rule stays silent (no alert, no cooldown consumed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quiet_hours: Vec<QuietRange>,
 }
 
 /// Kind of a delivery channel.
@@ -229,6 +368,10 @@ pub struct ChannelDef {
     /// Queue length; 0 = the default.
     #[serde(default)]
     pub queue_limit: u32,
+    /// UTC ranges of the day in which the channel receives no alerts (they are dropped, not delayed). The daily
+    /// digest is not affected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quiet_hours: Vec<QuietRange>,
 }
 
 impl std::fmt::Debug for ChannelDef {
@@ -379,8 +522,47 @@ impl RuleDef {
         if self.cooldown_secs > MAX_COOLDOWN_SECS {
             return bad(format!("cooldown_secs is above {MAX_COOLDOWN_SECS}"));
         }
+        validate_quiet(&mut self.quiet_hours)?;
         let positive = |v: f64| v.is_finite() && v > 0.0;
         match &mut self.kind {
+            RuleKind::Composite { conditions, .. } => {
+                if conditions.is_empty() || conditions.len() > MAX_CONDITIONS {
+                    return bad(format!(
+                        "a composite rule needs 1 to {MAX_CONDITIONS} conditions"
+                    ));
+                }
+                for (i, c) in conditions.iter().enumerate() {
+                    let n = i + 1;
+                    if !c.threshold.is_finite() {
+                        return bad(format!("condition {n}: threshold must be a finite number"));
+                    }
+                    if c.metric.windowed() {
+                        if !(MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&c.window_secs) {
+                            return bad(format!(
+                                "condition {n}: window_secs must be between {MIN_WINDOW_SECS} and {MAX_WINDOW_SECS}"
+                            ));
+                        }
+                    } else if c.window_secs != 0 {
+                        return bad(format!(
+                            "condition {n}: funding_rate and basis_pct take no window"
+                        ));
+                    }
+                    if c.metric == CondMetric::Regime {
+                        if c.op != CmpOp::Eq || ![1.0, 2.0, 3.0, 4.0].contains(&c.threshold) {
+                            return bad(format!(
+                                "condition {n}: a regime condition is `eq` to 1 (new longs), 2 (new shorts), 3 (short covering) or 4 (long unwinding)"
+                            ));
+                        }
+                    } else if c.op == CmpOp::Eq {
+                        return bad(format!("condition {n}: `eq` is only for the regime"));
+                    }
+                    if c.metric == CondMetric::LiqUsd && c.threshold < 0.0 {
+                        return bad(format!(
+                            "condition {n}: liq_usd threshold must not be negative"
+                        ));
+                    }
+                }
+            }
             RuleKind::Liquidation {
                 min_notional_usd,
                 sides,
@@ -446,6 +628,7 @@ impl ChannelDef {
             return bad("channel name is longer than 100 characters");
         }
         self.name = self.name.trim().to_string();
+        validate_quiet(&mut self.quiet_hours)?;
         self.chat_id = self.chat_id.trim().to_string();
         let sources = usize::from(self.secret.is_some())
             + usize::from(!self.secret_file.is_empty())
@@ -550,6 +733,7 @@ mod tests {
             symbols: vec!["btc-usdt-perp".into()],
             channels: vec!["tg".into()],
             cooldown_secs: 30,
+            quiet_hours: Vec::new(),
         }
     }
 
@@ -622,6 +806,7 @@ mod tests {
             min_interval_ms: 0,
             batch_window_ms: 0,
             queue_limit: 0,
+            quiet_hours: Vec::new(),
         }
     }
 

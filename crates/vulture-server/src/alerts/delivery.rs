@@ -17,7 +17,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::model::{ChannelDef, ChannelKind, check_secret_shape};
-use super::text::{Alert, Digest, discord_body, telegram_html, test_alert};
+use super::text::{Alert, Digest, Report, discord_body, report_plain, telegram_html, test_alert};
 use crate::config::{DeliveryConfig, Secret};
 use crate::metrics::{Families, MetricSource, unix_now_ms};
 use crate::ws::Backoff;
@@ -41,6 +41,10 @@ pub struct ChannelStats {
     pub dry_run: AtomicU64,
     /// Alerts refused because the channel is disabled.
     pub disabled_skipped: AtomicU64,
+    /// Reports (daily digests) the platform accepted.
+    pub reports_sent: AtomicU64,
+    /// Alerts dropped because the channel was in its quiet hours.
+    pub quiet_skipped: AtomicU64,
     /// Time of the last accepted message, ms (0 = never).
     pub last_success_ms: AtomicI64,
 }
@@ -48,6 +52,8 @@ pub struct ChannelStats {
 #[derive(Default)]
 struct QueueState {
     items: VecDeque<Alert>,
+    /// Reports (the daily digest): sent one per message, never merged with alerts.
+    reports: VecDeque<Report>,
     /// Alerts dropped and not yet mentioned in a message.
     dropped_unreported: u64,
 }
@@ -76,6 +82,8 @@ pub enum PushResult {
     QueuedDroppedOldest,
     /// The channel is disabled.
     Disabled,
+    /// The channel is in its quiet hours: the alert was dropped.
+    Quiet,
     /// No such channel.
     Unknown,
 }
@@ -237,6 +245,10 @@ impl Delivery {
             rt.stats.disabled_skipped.fetch_add(1, Ordering::Relaxed);
             return PushResult::Disabled;
         }
+        if super::model::in_quiet(&def.quiet_hours, unix_now_ms()) {
+            rt.stats.quiet_skipped.fetch_add(1, Ordering::Relaxed);
+            return PushResult::Quiet;
+        }
         let limit = self.params(&def).queue_limit;
         let mut result = PushResult::Queued;
         {
@@ -248,6 +260,33 @@ impl Delivery {
                 result = PushResult::QueuedDroppedOldest;
             }
             q.items.push_back(alert);
+        }
+        rt.notify.notify_one();
+        result
+    }
+
+    /// Queues a report (the daily digest) for a channel. At most a few wait; a new one replaces the oldest.
+    pub fn push_report(&self, channel_id: &str, report: Report) -> PushResult {
+        let rt = {
+            let map = self.channels.read().unwrap_or_else(|e| e.into_inner());
+            match map.get(channel_id) {
+                Some(rt) => rt.clone(),
+                None => return PushResult::Unknown,
+            }
+        };
+        if !rt.def().enabled {
+            rt.stats.disabled_skipped.fetch_add(1, Ordering::Relaxed);
+            return PushResult::Disabled;
+        }
+        let mut result = PushResult::Queued;
+        {
+            let mut q = rt.queue.lock().unwrap_or_else(|e| e.into_inner());
+            while q.reports.len() >= 3 {
+                q.reports.pop_front();
+                rt.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                result = PushResult::QueuedDroppedOldest;
+            }
+            q.reports.push_back(report);
         }
         rt.notify.notify_one();
         result
@@ -335,12 +374,10 @@ impl Delivery {
         loop {
             // Wait for the first alert.
             loop {
-                let empty = rt
-                    .queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .items
-                    .is_empty();
+                let empty = {
+                    let q = rt.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    q.items.is_empty() && q.reports.is_empty()
+                };
                 if !empty {
                     break;
                 }
@@ -381,29 +418,40 @@ impl Delivery {
                     _ = rt.cancel.cancelled() => return,
                 }
             }
-            // Take everything queued.
-            let (alerts, dropped) = {
+            // A report goes out as a message of its own; otherwise take everything queued.
+            let report = rt
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reports
+                .pop_front();
+            let is_report = report.is_some();
+            let (alerts, dropped) = if is_report {
+                (Vec::new(), 0)
+            } else {
                 let mut q = rt.queue.lock().unwrap_or_else(|e| e.into_inner());
                 (
                     std::mem::take(&mut q.items).into_iter().collect::<Vec<_>>(),
                     std::mem::take(&mut q.dropped_unreported),
                 )
             };
-            if alerts.is_empty() && dropped == 0 {
+            if alerts.is_empty() && dropped == 0 && !is_report {
                 continue;
             }
-            let total = alerts.len();
+            let total = if is_report { 1 } else { alerts.len() };
             let listed = total.min(self.cfg.digest_max_items);
             let digest = Digest {
-                alerts: alerts[..listed].to_vec(),
-                more: total - listed,
+                alerts: alerts[..listed.min(alerts.len())].to_vec(),
+                more: alerts.len() - listed.min(alerts.len()),
                 dropped,
+                report,
             };
             let def = rt.def();
             if def.dry_run {
-                let text = match def.kind {
-                    ChannelKind::Telegram => telegram_html(&digest),
-                    ChannelKind::Discord => discord_body(&digest).to_string(),
+                let text = match (&digest.report, def.kind) {
+                    (Some(r), _) => report_plain(r),
+                    (None, ChannelKind::Telegram) => telegram_html(&digest),
+                    (None, ChannelKind::Discord) => discord_body(&digest).to_string(),
                 };
                 tracing::info!(channel = %def.id, kind = def.kind.as_str(), alerts = total, message = %text, "dry run: message not sent");
                 rt.stats.dry_run.fetch_add(1, Ordering::Relaxed);
@@ -416,9 +464,13 @@ impl Delivery {
                 match self.send_once(&def, &digest).await {
                     Ok(ok) => {
                         rt.stats.sent.fetch_add(1, Ordering::Relaxed);
-                        rt.stats
-                            .alerts_sent
-                            .fetch_add(total as u64, Ordering::Relaxed);
+                        if is_report {
+                            rt.stats.reports_sent.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            rt.stats
+                                .alerts_sent
+                                .fetch_add(total as u64, Ordering::Relaxed);
+                        }
                         rt.stats
                             .last_success_ms
                             .store(unix_now_ms(), Ordering::Relaxed);
@@ -640,6 +692,18 @@ impl MetricSource for Delivery {
                 "Alerts contained in accepted messages.",
                 &l,
                 g(&s.alerts_sent),
+            );
+            out.counter(
+                "vulture_alerts_channel_reports_sent_total",
+                "Daily digests the platform accepted.",
+                &l,
+                g(&s.reports_sent),
+            );
+            out.counter(
+                "vulture_alerts_channel_quiet_skipped_total",
+                "Alerts dropped because the channel was in its quiet hours.",
+                &l,
+                g(&s.quiet_skipped),
             );
             out.counter(
                 "vulture_alerts_channel_failed_total",

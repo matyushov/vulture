@@ -1,0 +1,40 @@
+<!-- A read-only ClickHouse user for analysis (DBeaver, clickhouse-client, a Grafana datasource, `vulture-server
+     analyze`). Mounted as /etc/clickhouse-server/users.d/reader.xml by deploy/docker-compose.yml, next to the
+     application user that the image creates from CLICKHOUSE_USER / CLICKHOUSE_PASSWORD.
+
+     - The password comes from the environment (CLICKHOUSE_READER_PASSWORD in .env), never from this file.
+     - `readonly = 1`: SELECT only. No INSERT, no DDL, and the session cannot change a setting (so the limits below
+       cannot be lifted from the client).
+     - SELECT is granted on the `vulture` database only (system tables, where ClickHouse keeps its own statistics,
+       are not readable). If you named the database differently (VULTURE__CLICKHOUSE__DATABASE), change it here.
+     - The limits stop a runaway query from eating the machine that also runs Redis and the server. Raise them
+       deliberately if a legitimate query needs more.
+     - ClickHouse is not published on the host by default. Keep it that way and reach it through an SSH tunnel (see
+       deploy/README.md, "Read-only analysis access"). -->
+<clickhouse>
+    <profiles>
+        <vulture_reader>
+            <readonly>1</readonly>
+            <allow_ddl>0</allow_ddl>
+            <max_execution_time>30</max_execution_time>
+            <max_memory_usage>2000000000</max_memory_usage>
+            <max_rows_to_read>500000000</max_rows_to_read>
+            <max_result_rows>1000000</max_result_rows>
+            <result_overflow_mode>throw</result_overflow_mode>
+            <max_threads>4</max_threads>
+        </vulture_reader>
+    </profiles>
+    <users>
+        <reader>
+            <password from_env="CLICKHOUSE_READER_PASSWORD"/>
+            <profile>vulture_reader</profile>
+            <quota>default</quota>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <grants>
+                <query>GRANT SELECT ON vulture.*</query>
+            </grants>
+        </reader>
+    </users>
+</clickhouse>

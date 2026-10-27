@@ -18,7 +18,7 @@ use tonic::Code;
 use vulture_proto::v1::{
     AggregateRequest, EventType, GroupBy, HistoryRequest, Metric, OiMoverSort, Step,
 };
-use vulture_server::history::Watermark;
+use vulture_server::history::{HistorySink, Watermark};
 use vulture_server::query::bins::BinStep;
 use vulture_server::query::cold::ColdStore;
 use vulture_server::query::{ChCold, MemoryCold};
@@ -208,7 +208,19 @@ async fn aggregate_matches_the_reference_across_the_boundary() {
         let Some(p) = pair("aggregate", fraction, overlap, real_redis).await else {
             return;
         };
-        let metrics = vulture_server::query::agg::DEFAULT_METRICS.to_vec();
+        let mut metrics = vulture_server::query::agg::DEFAULT_METRICS.to_vec();
+        metrics.extend([
+            Metric::FundingLast,
+            Metric::FundingAvg,
+            Metric::BasisPct,
+            Metric::BasisPctAvg,
+            Metric::PriceChangePct,
+            Metric::OiChangePct,
+            Metric::Regime,
+            Metric::RegimeStrength,
+            Metric::OiPriceFlatness,
+            Metric::OiDivergencePct,
+        ]);
         for step in [
             Step::Minute1,
             Step::Minute5,
@@ -362,4 +374,78 @@ async fn too_many_cells_are_refused_not_truncated() {
     .unwrap_err();
     assert_eq!(err.code(), Code::ResourceExhausted, "{err}");
     p.env.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_two_keeps_old_rows_and_adds_nullable_funding_columns() {
+    let Some(env) = ChEnv::new("upgrade", false).await else {
+        return;
+    };
+    // Start from a database as the previous release left it: only migration 1, one row in the old shape.
+    let old_db = unique("vulture_test_old");
+    let cfg = vulture_server::config::ClickHouseConfig {
+        database: old_db.clone(),
+        ..env.cfg.clone()
+    };
+    let client = vulture_server::history::ChClient::new(&cfg, env.password.clone()).unwrap();
+    client
+        .execute_server(&format!("CREATE DATABASE {old_db}"))
+        .await
+        .unwrap();
+    for stmt in vulture_server::history::migrations::split_statements(
+        vulture_server::history::MIGRATIONS[0].sql,
+    ) {
+        client.execute(&stmt).await.unwrap();
+    }
+    client
+        .execute("INSERT INTO open_interest (exchange, symbol, symbol_raw, exchange_ts, recv_ts, oi_base, oi_usd, mark_price, event_id) VALUES ('binance', 'BTC-USDT-PERP', 'BTCUSDT', 1792976400000, 1792976400040, 10, 1000, 100, '1792976400040-0')")
+        .await
+        .unwrap();
+    // The upgrade: everything pending is applied, nothing is lost, the old row reads NULL.
+    let applied = client.migrate().await.unwrap();
+    assert!(applied.contains(&2), "{applied:?}");
+    assert!(client.migrate().await.unwrap().is_empty(), "idempotent");
+    let rows = client
+        .query_rows("SELECT count() AS n, countIf(funding_rate IS NULL) AS nf, countIf(index_price IS NULL) AS ni, countIf(next_funding_ts IS NULL) AS nt FROM open_interest")
+        .await
+        .unwrap();
+    let n = |k: &str| vulture_server::history::client::json_u64(&rows[0][k]);
+    assert_eq!((n("n"), n("nf"), n("ni"), n("nt")), (1, 1, 1, 1));
+    // New rows with and without funding data go in with the new column list.
+    let ds = dataset().await;
+    let some: Vec<_> = ds
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.payload,
+                Some(vulture_proto::v1::event::Payload::OpenInterest(_))
+            )
+        })
+        .take(400)
+        .cloned()
+        .collect();
+    let with_funding = some.iter().filter(|e| matches!(&e.payload, Some(vulture_proto::v1::event::Payload::OpenInterest(o)) if o.funding_rate.is_some())).count();
+    assert!(with_funding > 0 && with_funding < some.len());
+    let rest = ChEnv {
+        cfg: cfg.clone(),
+        password: env.password.clone(),
+        client: Arc::new(client),
+        db: old_db.clone(),
+        redis: None,
+    };
+    rest.insert(&some).await;
+    assert_eq!(rest.scalar("SELECT count() FROM open_interest").await, 401);
+    assert_eq!(
+        rest.scalar("SELECT count() FROM open_interest WHERE funding_rate IS NOT NULL")
+            .await,
+        with_funding as u64
+    );
+    // The cost of the three columns (size on disk, after a merge), for the README.
+    rest.client
+        .execute("OPTIMIZE TABLE open_interest FINAL")
+        .await
+        .unwrap();
+    rest.cleanup().await;
+    env.cleanup().await;
 }

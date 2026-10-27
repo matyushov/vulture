@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use vulture_proto::v1::{Liquidation, Side, Signal, SignalType};
 
-use super::model::{LiqSide, RuleDef, RuleKind, Severity, SignalKind};
+use super::model::{
+    CmpOp, CondMetric, Condition, LiqSide, QuietRange, RuleDef, RuleKind, Severity, SignalKind,
+};
 use super::oi::OiOverride;
 use super::series::Change;
 use super::text::{Alert, fmt_num, fmt_pct, fmt_usd, fmt_window};
@@ -24,9 +26,16 @@ pub struct CompiledRule {
     pub channels: Vec<String>,
     /// Cooldown, ms.
     pub cooldown_ms: i64,
+    /// UTC ranges of the day in which the rule is silent.
+    pub quiet: Vec<QuietRange>,
 }
 
 impl CompiledRule {
+    /// Whether the rule is silent at `ts_ms`.
+    pub fn is_quiet(&self, ts_ms: i64) -> bool {
+        super::model::in_quiet(&self.quiet, ts_ms)
+    }
+
     /// True when the exchange and the symbol pass the rule's filters.
     pub fn matches_scope(&self, exchange: &str, symbol: &str) -> bool {
         (self.exchanges.is_empty() || self.exchanges.contains(exchange))
@@ -76,6 +85,7 @@ impl RuleSet {
                 symbols: d.symbols.iter().cloned().collect(),
                 channels: d.channels.clone(),
                 cooldown_ms: i64::from(d.cooldown_secs) * 1000,
+                quiet: d.quiet_hours.clone(),
             });
         }
         set
@@ -154,6 +164,77 @@ pub fn liquidation_matches(rule: &CompiledRule, liq: &Liquidation) -> bool {
         }
     }
     rule.matches_scope(&liq.exchange, &liq.symbol)
+}
+
+/// The message of a composite rule: the symbol, and each condition with the value that satisfied it.
+pub fn composite_alert(
+    rule: &CompiledRule,
+    exchange: &str,
+    symbol: &str,
+    conditions: &[Condition],
+    values: &[f64],
+    severity: Severity,
+    ts_ms: i64,
+) -> Alert {
+    let label = |c: &Condition| -> String {
+        match c.metric {
+            CondMetric::OiChangePct => format!("OI change {}", fmt_window(c.window_secs)),
+            CondMetric::PriceChangePct => format!("Price change {}", fmt_window(c.window_secs)),
+            CondMetric::FundingRate => "Funding rate".into(),
+            CondMetric::BasisPct => "Basis".into(),
+            CondMetric::LiqUsd => format!("Liquidated {}", fmt_window(c.window_secs)),
+            CondMetric::Regime => format!("Regime {}", fmt_window(c.window_secs)),
+        }
+    };
+    let show = |c: &Condition, v: f64| -> String {
+        match c.metric {
+            CondMetric::OiChangePct | CondMetric::PriceChangePct | CondMetric::BasisPct => {
+                fmt_pct(v)
+            }
+            CondMetric::FundingRate => format!("{:+.4}%", v * 100.0),
+            CondMetric::LiqUsd => fmt_usd(v),
+            CondMetric::Regime => match v as i32 {
+                1 => "new longs",
+                2 => "new shorts",
+                3 => "short covering",
+                4 => "long unwinding",
+                _ => "?",
+            }
+            .to_string(),
+        }
+    };
+    let op = |o: CmpOp| match o {
+        CmpOp::Gt => ">",
+        CmpOp::Ge => ">=",
+        CmpOp::Lt => "<",
+        CmpOp::Le => "<=",
+        CmpOp::Eq => "=",
+    };
+    let summary: Vec<String> = conditions
+        .iter()
+        .zip(values)
+        .map(|(c, v)| format!("{} {}", label(c).to_lowercase(), show(c, *v)))
+        .collect();
+    let mut fields: Vec<(String, String)> = conditions
+        .iter()
+        .zip(values)
+        .map(|(c, v)| {
+            let threshold = if c.metric == CondMetric::Regime {
+                String::new()
+            } else {
+                format!(" ({} {})", op(c.op), fmt_num(c.threshold))
+            };
+            (label(c), format!("{}{threshold}", show(c, *v)))
+        })
+        .collect();
+    fields.push(("Rule".into(), rule.name.clone()));
+    Alert {
+        ts_ms,
+        severity,
+        title: "Composite rule".into(),
+        headline: format!("{symbol} on {exchange}: {}", summary.join(", ")),
+        fields,
+    }
 }
 
 /// The message of a liquidation rule.
@@ -428,6 +509,7 @@ mod tests {
             symbols: vec![],
             channels: vec!["tg".into()],
             cooldown_secs: 60,
+            quiet_hours: Vec::new(),
         }
     }
 

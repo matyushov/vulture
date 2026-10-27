@@ -31,10 +31,32 @@ pub struct Quote {
     pub oi: Option<OiState>,
 }
 
+/// Funding rate of an instrument, from the REST poll.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FundingState {
+    /// `fundingRate`, a fraction.
+    pub rate: f64,
+    /// `nextFundingTime`, ms, when given.
+    pub next_ts: Option<i64>,
+    /// Local time the value was fetched, ms.
+    pub fetched_ms: i64,
+}
+
+/// Index price (`idxPx`) of an index such as `BTC-USDT`, from the REST poll.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexState {
+    /// The price.
+    pub price: f64,
+    /// Local time the value was fetched, ms.
+    pub fetched_ms: i64,
+}
+
 /// The state of all instruments.
 #[derive(Debug, Default)]
 pub struct Quotes {
     map: RwLock<HashMap<String, Quote>>,
+    funding: RwLock<HashMap<String, FundingState>>,
+    index: RwLock<HashMap<String, IndexState>>,
     first_oi: tokio::sync::Notify,
 }
 
@@ -65,6 +87,42 @@ impl Quotes {
             });
         }
         self.first_oi.notify_waiters();
+    }
+
+    /// Stores the funding rate of `inst_id`.
+    pub fn apply_funding(&self, inst_id: &str, s: FundingState) {
+        self.funding
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(inst_id.to_string(), s);
+    }
+
+    /// Stores the index price of `index_id`.
+    pub fn apply_index(&self, index_id: &str, s: IndexState) {
+        self.index
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index_id.to_string(), s);
+    }
+
+    /// The funding rate of `inst_id` if it was fetched no more than `max_age_ms` before `now_ms`.
+    pub fn funding(&self, inst_id: &str, now_ms: i64, max_age_ms: i64) -> Option<FundingState> {
+        self.funding
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(inst_id)
+            .filter(|f| now_ms - f.fetched_ms <= max_age_ms)
+            .copied()
+    }
+
+    /// The index price of `index_id` if it was fetched no more than `max_age_ms` before `now_ms`.
+    pub fn index(&self, index_id: &str, now_ms: i64, max_age_ms: i64) -> Option<IndexState> {
+        self.index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index_id)
+            .filter(|i| now_ms - i.fetched_ms <= max_age_ms)
+            .copied()
     }
 
     /// The state of `inst_id`.

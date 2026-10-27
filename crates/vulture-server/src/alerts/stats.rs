@@ -35,6 +35,14 @@ pub struct EngineStats {
     pub rule_suppressed_cooldown: AtomicU64,
     /// Alerts handed to the delivery queues.
     pub alerts_queued: AtomicU64,
+    /// (symbol, composite rule) pairs evaluated.
+    pub composite_evaluations: AtomicU64,
+    /// Composite rules that matched (before cooldown and quiet hours).
+    pub composite_matched: AtomicU64,
+    /// Alerts not produced because the rule was in its quiet hours.
+    pub quiet_suppressed_rule: AtomicU64,
+    /// Slowest composite pass, nanoseconds.
+    pub composite_pass_ns_max: AtomicU64,
     /// Evaluation time, total nanoseconds.
     pub eval_ns_total: AtomicU64,
     /// Evaluations.
@@ -132,6 +140,30 @@ impl MetricSource for EngineStats {
             "Liquidation cascades by phase.",
             &[("phase", "end")],
             g(&self.cascade_ended),
+        );
+        out.counter(
+            "vulture_alerts_composite_evaluations_total",
+            "Pairs of a symbol and a composite rule evaluated.",
+            &[],
+            g(&self.composite_evaluations),
+        );
+        out.counter(
+            "vulture_alerts_composite_matched_total",
+            "Composite rule matches (before cooldown and quiet hours).",
+            &[],
+            g(&self.composite_matched),
+        );
+        out.gauge(
+            "vulture_alerts_composite_pass_seconds_max",
+            "Slowest pass over all symbols and composite rules.",
+            &[],
+            g(&self.composite_pass_ns_max) as f64 / 1e9,
+        );
+        out.counter(
+            "vulture_alerts_quiet_suppressed_total",
+            "Alerts not produced or not queued because of quiet hours, by scope.",
+            &[("scope", "rule")],
+            g(&self.quiet_suppressed_rule),
         );
         out.counter(
             "vulture_alerts_queued_total",

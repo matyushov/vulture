@@ -346,6 +346,11 @@ impl OiPoller {
             oi_usd: values.oi_usd,
             // Per real coin, so that oi_base * mark_price == oi_usd; equals the exchange quote for multiplier 1.
             mark_price: mark.map(|m| m.price / entry.multiplier),
+            // The index and the funding rate come with the same mark price frame; the index is per real coin
+            // like the mark price, the rate is a fraction and needs no conversion.
+            funding_rate: mark.and_then(|m| m.funding),
+            index_price: mark.and_then(|m| m.index).map(|i| i / entry.multiplier),
+            next_funding_ts: mark.and_then(|m| m.next_funding_ts),
         })
     }
 }

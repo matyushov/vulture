@@ -52,6 +52,14 @@ pub struct OkxStatus {
     pub http_429: AtomicU64,
     /// Subscription changes postponed because the hourly request budget was spent.
     pub changes_deferred: AtomicU64,
+    /// Funding and index REST requests made.
+    pub funding_requests: AtomicU64,
+    /// Funding and index REST requests that failed (network, HTTP status, exchange error code, unparsable body).
+    pub funding_errors: AtomicU64,
+    /// Poll cycles that had to ask instrument by instrument because `instId=ANY` gave nothing.
+    pub funding_fallbacks: AtomicU64,
+    /// Funding rates stored by the last cycle (gauge).
+    pub funding_instruments: AtomicU64,
     /// Instruments in the universe (gauge).
     pub symbols: AtomicU64,
     /// Symbols renamed because of an alias collision (gauge of the last load).

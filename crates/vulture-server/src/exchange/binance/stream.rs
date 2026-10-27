@@ -189,6 +189,12 @@ pub struct MarkEntry {
     pub exchange_ts: i64,
     /// Local receive time, ms.
     pub recv_ts: i64,
+    /// Index price (`i`) per exchange unit, when the frame carries a usable one.
+    pub index: Option<f64>,
+    /// Funding rate (`r`) as a fraction, when the frame carries one.
+    pub funding: Option<f64>,
+    /// Next funding settlement (`T`), ms, when the frame carries one.
+    pub next_funding_ts: Option<i64>,
 }
 
 /// In-memory map symbol -> latest mark price, fed by `!markPrice@arr@1s`.
@@ -204,6 +210,15 @@ struct MarkItem {
     p: String,
     #[serde(rename = "E", default)]
     event_time: i64,
+    /// Index price.
+    #[serde(default)]
+    i: Option<String>,
+    /// Funding rate.
+    #[serde(default)]
+    r: Option<String>,
+    /// Next funding time.
+    #[serde(rename = "T", default)]
+    next_funding: Option<i64>,
 }
 
 impl MarkPrices {
@@ -217,7 +232,19 @@ impl MarkPrices {
         for item in items {
             match serde_json::from_value::<MarkItem>(item) {
                 Ok(m) => match m.p.parse::<f64>() {
-                    Ok(p) if p.is_finite() && p > 0.0 => parsed.push((m.s, p, m.event_time)),
+                    Ok(p) if p.is_finite() && p > 0.0 => {
+                        let index =
+                            m.i.as_deref()
+                                .and_then(|v| v.parse::<f64>().ok())
+                                .filter(|v| v.is_finite() && *v > 0.0);
+                        let funding =
+                            m.r.as_deref()
+                                .and_then(|v| v.parse::<f64>().ok())
+                                .filter(|v| v.is_finite());
+                        // `T` is 0 for contracts without a funding schedule.
+                        let next = m.next_funding.filter(|t| *t > 0);
+                        parsed.push((m.s, p, m.event_time, index, funding, next));
+                    }
                     _ => rejected += 1,
                 },
                 Err(_) => rejected += 1,
@@ -226,13 +253,16 @@ impl MarkPrices {
         let applied = parsed.len();
         {
             let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
-            for (s, price, exchange_ts) in parsed {
+            for (s, price, exchange_ts, index, funding, next_funding_ts) in parsed {
                 map.insert(
                     s,
                     MarkEntry {
                         price,
                         exchange_ts,
                         recv_ts,
+                        index,
+                        funding,
+                        next_funding_ts,
                     },
                 );
             }
@@ -369,7 +399,7 @@ mod tests {
     #[test]
     fn mark_prices_apply_and_expire() {
         let m = MarkPrices::default();
-        let frame = r#"[{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT","p":"100000.5","i":"1","P":"1","r":"0","T":2},
+        let frame = r#"[{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT","p":"100000.5","i":"100010.25","P":"1","r":"0.00010000","T":1792800000000},
                         {"e":"markPriceUpdate","E":1000,"s":"BAD","p":"x"},
                         {"e":"markPriceUpdate","E":1000,"s":"ETHUSDT","p":"3000"}]"#;
         assert_eq!(m.apply_frame(frame, 5_000).unwrap(), (2, 1));
@@ -377,6 +407,15 @@ mod tests {
         let btc = m.get_fresh("BTCUSDT", 5_500, 1_000).unwrap();
         assert_eq!(btc.price, 100000.5);
         assert_eq!(btc.exchange_ts, 1000);
+        assert_eq!(btc.index, Some(100010.25));
+        assert_eq!(btc.funding, Some(0.0001));
+        assert_eq!(btc.next_funding_ts, Some(1_792_800_000_000));
+        // A frame without the optional fields still gives a mark price.
+        let eth = m.get_fresh("ETHUSDT", 5_500, 1_000).unwrap();
+        assert_eq!(
+            (eth.index, eth.funding, eth.next_funding_ts),
+            (None, None, None)
+        );
         assert!(m.get_fresh("BTCUSDT", 7_000, 1_000).is_none());
         assert!(m.get_fresh("SOLUSDT", 5_000, 1_000).is_none());
         assert!(m.apply_frame("{}", 0).is_err());

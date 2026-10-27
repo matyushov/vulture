@@ -378,30 +378,68 @@ type Handler = dyn Fn(&str, usize) -> Reply + Send + Sync;
 
 struct MockHttp {
     handler: Box<Handler>,
+    /// Answers the funding and index REST polls; without it they get an empty, successful answer.
+    funding_handler: Option<Box<Handler>>,
     log: Mutex<Vec<(Duration, String)>>,
     start: Instant,
+}
+
+fn is_funding_path(path: &str) -> bool {
+    path.starts_with("/api/v5/public/funding-rate")
+        || path.starts_with("/api/v5/market/index-tickers")
 }
 
 impl MockHttp {
     fn new(handler: impl Fn(&str, usize) -> Reply + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
             handler: Box::new(handler),
+            funding_handler: None,
             log: Mutex::new(Vec::new()),
             start: Instant::now(),
         })
     }
 
+    fn with_funding(
+        handler: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+        funding: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            handler: Box::new(handler),
+            funding_handler: Some(Box::new(funding)),
+            log: Mutex::new(Vec::new()),
+            start: Instant::now(),
+        })
+    }
+
+    /// The instrument list requests (the funding polls are listed by [`MockHttp::funding_paths`]).
     fn paths(&self) -> Vec<String> {
         self.log
             .lock()
             .unwrap()
             .iter()
+            .filter(|e| !is_funding_path(&e.1))
+            .map(|e| e.1.clone())
+            .collect()
+    }
+
+    fn funding_paths(&self) -> Vec<String> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| is_funding_path(&e.1))
             .map(|e| e.1.clone())
             .collect()
     }
 
     fn offsets(&self) -> Vec<Duration> {
-        self.log.lock().unwrap().iter().map(|e| e.0).collect()
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| !is_funding_path(&e.1))
+            .map(|e| e.0)
+            .collect()
     }
 }
 
@@ -413,6 +451,12 @@ impl HttpClient for MockHttp {
                 log.push((self.start.elapsed(), path.to_string()));
                 log.len() - 1
             };
+            if is_funding_path(path) {
+                return match &self.funding_handler {
+                    Some(h) => h(path, idx).0,
+                    None => Reply::ok(r#"{"code":"0","msg":"","data":[]}"#).0,
+                };
+            }
             (self.handler)(path, idx).0
         })
     }
@@ -834,6 +878,166 @@ async fn the_sampler_emits_one_event_per_symbol_per_interval_spread_over_it() {
     assert!(o.recv_ts >= o.exchange_ts);
     assert_eq!(rig.count(|s| &s.oi_events), seen.len() as u64);
     assert_eq!(rig.count(|s| &s.oi_unit_mismatch), 0);
+    rig.stop().await;
+}
+
+const FUNDING_ALL: &str = r#"{"code":"0","msg":"","data":[
+    {"instId":"BTC-USDT-SWAP","instType":"SWAP","fundingRate":"0.0001","fundingTime":"1792800000000","nextFundingTime":"1792828800000"},
+    {"instId":"ETH-USDT-SWAP","instType":"SWAP","fundingRate":"-0.00025","fundingTime":"1792800000000","nextFundingTime":"1792828800000"}]}"#;
+const INDEX_USDT: &str = r#"{"code":"0","msg":"","data":[
+    {"instId":"BTC-USDT","idxPx":"60010.5","ts":"1"},{"instId":"ETH-USDT","idxPx":"2999.5","ts":"1"}]}"#;
+
+fn funding_http(funding: impl Fn(&str, usize) -> Reply + Send + Sync + 'static) -> Arc<MockHttp> {
+    let body = list(&[BTC, ETH]);
+    MockHttp::with_funding(move |_, _| Reply::ok(&body), funding)
+}
+
+#[tokio::test(start_paused = true)]
+async fn funding_and_index_ride_on_the_samples_without_more_samples() {
+    let ws = MockWs::new(vec![]);
+    ws.set_values("BTC-USDT-SWAP", 60000.0, 50_000.0, 0.01);
+    ws.set_values("ETH-USDT-SWAP", 3000.0, 100_000.0, 0.1);
+    let http = funding_http(|path, _| {
+        if path.starts_with("/api/v5/market/index-tickers?quoteCcy=USDT") {
+            Reply::ok(INDEX_USDT)
+        } else if path.starts_with("/api/v5/public/funding-rate?instId=ANY") {
+            Reply::ok(FUNDING_ALL)
+        } else {
+            Reply::ok(r#"{"code":"0","msg":"","data":[]}"#)
+        }
+    });
+    let mut rig = start(config(&[], 30), ws.clone(), http.clone());
+    sleep(Duration::from_secs(70)).await;
+    let ois = open_interests(&rig.drain());
+    // The same two events per 30 s cycle as without funding.
+    assert!((4..=6).contains(&ois.len()), "{}", ois.len());
+    let btc = ois
+        .iter()
+        .find(|o| o.symbol_raw == "BTC-USDT-SWAP")
+        .unwrap();
+    assert_eq!(btc.funding_rate, Some(0.0001));
+    assert_eq!(btc.index_price, Some(60010.5));
+    assert_eq!(btc.next_funding_ts, Some(1_792_828_800_000));
+    let eth = ois
+        .iter()
+        .find(|o| o.symbol_raw == "ETH-USDT-SWAP")
+        .unwrap();
+    assert_eq!(eth.funding_rate, Some(-0.00025));
+    assert_eq!(eth.index_price, Some(2999.5));
+    // Three requests per five minutes in the bulk mode: USDT and USDC indexes, all funding rates.
+    let paths = http.funding_paths();
+    assert_eq!(
+        paths,
+        [
+            "/api/v5/market/index-tickers?quoteCcy=USDT",
+            "/api/v5/market/index-tickers?quoteCcy=USDC",
+            "/api/v5/public/funding-rate?instId=ANY",
+        ]
+    );
+    assert_eq!(rig.count(|s| &s.funding_fallbacks), 0);
+    assert_eq!(rig.count(|s| &s.funding_errors), 0);
+    // After five minutes the poll repeats (and only then).
+    sleep(Duration::from_secs(300)).await;
+    assert_eq!(http.funding_paths().len(), 6);
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn when_any_is_refused_funding_is_asked_instrument_by_instrument() {
+    let ws = MockWs::new(vec![]);
+    ws.set_values("BTC-USDT-SWAP", 60000.0, 50_000.0, 0.01);
+    ws.set_values("ETH-USDT-SWAP", 3000.0, 100_000.0, 0.1);
+    let http = funding_http(|path, _| {
+        if path.contains("instId=ANY") {
+            Reply::ok(r#"{"code":"51000","msg":"Parameter instId error","data":[]}"#)
+        } else if path.contains("instId=BTC-USDT-SWAP") {
+            Reply::ok(
+                r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","fundingRate":"0.0002","nextFundingTime":"1792828800000"}]}"#,
+            )
+        } else if path.contains("instId=ETH-USDT-SWAP") {
+            Reply::ok(
+                r#"{"code":"0","msg":"","data":[{"instId":"ETH-USDT-SWAP","fundingRate":"0.0003","nextFundingTime":"1792828800000"}]}"#,
+            )
+        } else {
+            Reply::ok(r#"{"code":"0","msg":"","data":[]}"#)
+        }
+    });
+    let mut rig = start(config(&[], 30), ws.clone(), http.clone());
+    sleep(Duration::from_secs(100)).await;
+    let ois = open_interests(&rig.drain());
+    let by = |raw: &str| {
+        ois.iter()
+            .rev()
+            .find(|o| o.symbol_raw == raw)
+            .unwrap()
+            .funding_rate
+    };
+    assert_eq!(by("BTC-USDT-SWAP"), Some(0.0002));
+    assert_eq!(by("ETH-USDT-SWAP"), Some(0.0003));
+    assert_eq!(rig.count(|s| &s.funding_fallbacks), 1);
+    assert!(rig.count(|s| &s.funding_errors) >= 1);
+    let singles: Vec<_> = http
+        .funding_paths()
+        .into_iter()
+        .filter(|p| !p.contains("ANY") && p.contains("funding-rate"))
+        .collect();
+    assert_eq!(singles.len(), 2, "{singles:?}");
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_funding_data_or_when_it_is_stale_the_fields_stay_empty() {
+    let ws = MockWs::new(vec![]);
+    ws.set_values("BTC-USDT-SWAP", 60000.0, 50_000.0, 0.01);
+    ws.set_values("ETH-USDT-SWAP", 3000.0, 100_000.0, 0.1);
+    // The first poll works, every later one fails: after three intervals (15 minutes) the values are too old.
+    let http = funding_http(|path, idx| {
+        if idx < 10 && path.contains("instId=ANY") {
+            Reply::ok(FUNDING_ALL)
+        } else if idx < 10 && path.contains("index-tickers?quoteCcy=USDT") {
+            Reply::ok(INDEX_USDT)
+        } else if idx < 10 {
+            Reply::ok(r#"{"code":"0","msg":"","data":[]}"#)
+        } else {
+            Reply::status(500, "down")
+        }
+    });
+    let mut rig = start(config(&[], 30), ws.clone(), http.clone());
+    sleep(Duration::from_secs(60)).await;
+    let early = open_interests(&rig.drain());
+    assert!(
+        early
+            .iter()
+            .all(|o| o.funding_rate.is_some() && o.index_price.is_some())
+    );
+    sleep(Duration::from_secs(1500)).await;
+    let late = open_interests(&rig.drain());
+    let last = late
+        .iter()
+        .rev()
+        .find(|o| o.symbol_raw == "BTC-USDT-SWAP")
+        .unwrap();
+    assert_eq!(
+        (last.funding_rate, last.index_price, last.next_funding_ts),
+        (None, None, None)
+    );
+    assert!(rig.count(|s| &s.funding_errors) > 0);
+    rig.stop().await;
+    // A server that answers nothing sensible: samples are still published, funding fields empty.
+    let ws = MockWs::new(vec![]);
+    ws.set_values("BTC-USDT-SWAP", 60000.0, 50_000.0, 0.01);
+    let mut rig = start(
+        config(&[], 30),
+        ws,
+        funding_http(|_, _| Reply::status(404, "nope")),
+    );
+    sleep(Duration::from_secs(70)).await;
+    let ois = open_interests(&rig.drain());
+    assert!(!ois.is_empty());
+    assert!(
+        ois.iter()
+            .all(|o| o.funding_rate.is_none() && o.index_price.is_none())
+    );
     rig.stop().await;
 }
 

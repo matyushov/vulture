@@ -60,6 +60,9 @@ pub trait HistorySink: Send + Sync {
 
 /// The HTTP client.
 pub struct ChClient {
+    /// Set once the server refused the resource limits of a read query as a setting change: a read-only user
+    /// (`readonly = 1`) cannot change settings, its profile carries the limits instead.
+    limits_refused: std::sync::atomic::AtomicBool,
     http: reqwest::Client,
     base: reqwest::Url,
     database: String,
@@ -86,6 +89,7 @@ impl ChClient {
             .build()
             .map_err(|e| e.without_url().to_string())?;
         Ok(Self {
+            limits_refused: std::sync::atomic::AtomicBool::new(false),
             http,
             base,
             database: cfg.database.clone(),
@@ -196,27 +200,69 @@ impl ChClient {
             .collect()
     }
 
-    fn read_params(settings: &ReadSettings, buffered: bool) -> Vec<(String, String)> {
+    fn read_params(&self, settings: &ReadSettings, buffered: bool) -> Vec<(String, String)> {
         let mut p = vec![
             ("default_format".to_string(), "JSONEachRow".to_string()),
             (
                 "output_format_json_quote_64bit_integers".to_string(),
                 "0".to_string(),
             ),
-            (
+        ];
+        if !self
+            .limits_refused
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            p.push((
                 "max_execution_time".to_string(),
                 settings.max_execution_time_secs.to_string(),
-            ),
-            (
+            ));
+            p.push((
                 "max_memory_usage".to_string(),
                 settings.max_memory_usage.to_string(),
-            ),
-        ];
+            ));
+        }
         if buffered {
             // The summary header (rows read) is only final when the whole answer is produced before the first byte.
             p.push(("wait_end_of_query".to_string(), "1".to_string()));
         }
         p
+    }
+
+    /// Sends a read query. A read-only user cannot change settings: when the server says so, the limits are left
+    /// to the user's profile from then on and the query is repeated.
+    async fn send_read(
+        &self,
+        sql: &str,
+        settings: &ReadSettings,
+        buffered: bool,
+    ) -> Result<reqwest::Response, ChError> {
+        for attempt in 0..2 {
+            let owned = self.read_params(settings, buffered);
+            let params: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            match self
+                .send(&params, true, sql.as_bytes().to_vec(), settings.timeout)
+                .await
+            {
+                Err(ChError::Server { message, .. })
+                    if attempt == 0
+                        && !self
+                            .limits_refused
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        && (message.contains("READONLY") || message.contains("Cannot modify")) =>
+                {
+                    self.limits_refused
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(
+                        "the ClickHouse user is read-only: query limits come from its profile, not from the client"
+                    );
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the second attempt always returns")
     }
 
     /// Runs a read query and returns all rows (`FORMAT JSONEachRow`, 64-bit integers as plain numbers) with the
@@ -226,14 +272,7 @@ impl ChClient {
         sql: &str,
         settings: &ReadSettings,
     ) -> Result<(Vec<serde_json::Value>, QuerySummary), ChError> {
-        let owned = Self::read_params(settings, true);
-        let params: Vec<(&str, &str)> = owned
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let response = self
-            .send(&params, true, sql.as_bytes().to_vec(), settings.timeout)
-            .await?;
+        let response = self.send_read(sql, settings, true).await?;
         let summary = QuerySummary::from_headers(response.headers());
         let text = response
             .text()
@@ -252,14 +291,7 @@ impl ChClient {
         sql: &str,
         settings: &ReadSettings,
     ) -> Result<RowStream, ChError> {
-        let owned = Self::read_params(settings, false);
-        let params: Vec<(&str, &str)> = owned
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let response = self
-            .send(&params, true, sql.as_bytes().to_vec(), settings.timeout)
-            .await?;
+        let response = self.send_read(sql, settings, false).await?;
         Ok(RowStream {
             response,
             buf: Vec::new(),

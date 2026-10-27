@@ -146,6 +146,14 @@ exchange itself needs a restart. Check what compose will mount: `docker compose 
 git pull && docker compose build && docker compose up -d
 ```
 
+**Upgrading to the V3b release (History API, funding data, digest, composite rules, read-only ClickHouse user).** One
+new line in `.env`: `CLICKHOUSE_READER_PASSWORD=<a new secret>` (the compose file requires it, like
+`CLICKHOUSE_PASSWORD`, even while the `clickhouse` profile is off). With the profile on, ClickHouse restarts once to
+load `clickhouse/users.d/reader.xml`, and the server applies migration 2 (three nullable columns, nothing rewritten) at
+its start. No other setting is required; the new options (`[history]`, `[alerts.digest]`, `alerts.composite_eval_secs`)
+all have defaults, and the digest is off until `[alerts.digest] enabled = true`. If you downgrade the server afterwards,
+delete composite rules first (an older server refuses an `alerts.json` that holds one).
+
 Only the image changes. The data directory (`data/` with the token) and the `redis-data` volume with the stream are
 kept, so the token and the 24-hour hot window survive. Open streams end with `UNAVAILABLE` during the restart and clients resume
 from their last event id.
@@ -260,3 +268,57 @@ script, the S3 variant, retention, and what else to save: `state.json`, `audit.l
 **If ClickHouse is down for long.** The watermark stays, Redis is not trimmed by time past it, and the flusher catches
 up after the recovery. The one limit is `redis.maxlen_safeguard` (5 million entries, about 66 hours at the expected 21 events/s; watch
 `vulture_flusher_backlog_maxlen_ratio`): beyond it Redis drops the oldest unflushed entries to protect its memory. The alerts `VultureClickHouseDown` (5 minutes) and `VultureFlusherBacklogNearLoss` (70%) fire first.
+
+### Read-only analysis access
+
+ClickHouse has a second user, `reader`, made for looking at the history without any risk to it
+(`clickhouse/users.d/reader.xml`, mounted by the compose file; set `CLICKHOUSE_READER_PASSWORD` in `.env`, a value
+different from `CLICKHOUSE_PASSWORD`; the file never contains a password, ClickHouse reads it from the environment).
+
+| | |
+|---|---|
+| Rights | `readonly = 1` (SELECT only; no INSERT, no DDL, and the session cannot change a setting, so the limits cannot be lifted) and `GRANT SELECT ON vulture.*` (the system tables are not readable) |
+| Limits | `max_execution_time` 30 s, `max_memory_usage` 2 GB, `max_rows_to_read` 500 million, `max_result_rows` 1 million (`throw` beyond), `max_threads` 4 |
+| Network | none published: reach it over the compose network or an SSH tunnel |
+
+An existing deployment adds `CLICKHOUSE_READER_PASSWORD=<new secret>` to its `.env` (the compose file requires it, like
+`CLICKHOUSE_PASSWORD`, even while the profile is off) and runs `docker compose up -d`: ClickHouse restarts once with the
+new user file; no data is touched.
+
+**From your machine, over an SSH tunnel** (the port stays closed on the host; replace the placeholders):
+
+```sh
+# ClickHouse listens inside the compose network only, so tunnel to the container: find its address on the server
+#   docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vulture-clickhouse-1
+ssh -N -L 18123:<container-ip>:8123 <user>@<server>
+# or publish the port to the server's loopback only (docker-compose.yml: ports ["127.0.0.1:8123:8123"]) and tunnel
+#   ssh -N -L 18123:127.0.0.1:8123 <user>@<server>
+```
+
+- **clickhouse-client:** `clickhouse-client --host 127.0.0.1 --port 9000` needs the native port; use the HTTP one instead:
+  `curl -s --user reader:"$CLICKHOUSE_READER_PASSWORD" --data-binary @query.sql 'http://127.0.0.1:18123/?database=vulture'`,
+  or on the server `docker compose exec clickhouse clickhouse-client --user reader --password "$CLICKHOUSE_READER_PASSWORD"`.
+- **DBeaver:** new connection, driver *ClickHouse* (it downloads its own), host `127.0.0.1`, port `18123` (HTTP),
+  database `vulture`, user `reader`, the password; no SSL for a tunnel to localhost. Open a query file from
+  `clickhouse/queries/` and run it.
+- **Grafana:** install the *ClickHouse* data source plugin, server `127.0.0.1` (or the tunnel's host), port `18123`,
+  protocol HTTP, user `reader`, default database `vulture`, no TLS skip needed. Grafana adds `$__timeFilter(exchange_ts)`
+  style macros of its own; the example queries use plain `now()` windows so they also run outside Grafana.
+- **`vulture-server analyze signals|replay`:** set `[clickhouse] user = "reader"` (and the password in
+  `VULTURE__CLICKHOUSE__PASSWORD`) in a copy of the configuration used for analysis; the commands only issue `SELECT`s.
+
+**Example queries** in `clickhouse/queries/` (each starts with a comment saying what it does and what to edit;
+`now()` can be replaced by a fixed time to look at the past):
+
+| File | Answers |
+|---|---|
+| `top_oi_movers.sql` | the biggest open interest changes of the last 24 hours (`oi_base`, with a dust filter) |
+| `liquidation_skew_by_hour.sql` | long against short liquidations by hour and exchange |
+| `funding_extremes.sql` | the highest and lowest funding rates now, with OI and basis |
+| `cascades_list.sql` | liquidation cascades of the last 7 days with totals and duration |
+| `signal_outcomes.sql` | the mark price 5, 15 and 60 minutes after each OI spike signal |
+| `symbol_timeline.sql` | one series minute by minute: OI, mark, index, basis, funding, liquidations |
+| `data_completeness.sql` | OI samples per exchange and hour against what 30-second polling should give, and recorded gaps |
+
+`crates/vulture-server/tests/clickhouse_queries.rs` runs every file against the schema (with the clock pinned) in the gated
+test suite, so a schema change cannot silently break them.

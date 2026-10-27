@@ -91,6 +91,7 @@ struct Sym {
     mark: f64,
     oi: f64,
     weight: f64,
+    funding: f64,
 }
 
 fn symbols(n: usize, rng: &mut Rng) -> Vec<Sym> {
@@ -124,6 +125,7 @@ fn symbols(n: usize, rng: &mut Rng) -> Vec<Sym> {
                 oi,
                 // Zipf-like popularity for liquidations.
                 weight: 1.0 / (1.0 + i as f64).powf(0.9),
+                funding: 0.0001,
             }
         })
         .collect()
@@ -260,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
                     mark: s.mark * (1.0 + 0.0002 * e as f64),
                     oi: s.oi * (1.0 - 0.3 * e as f64),
                     weight: s.weight,
+                    funding: s.funding,
                 })
                 .collect()
         })
@@ -291,6 +294,9 @@ async fn main() -> anyhow::Result<()> {
                     s.oi = (s.oi * 1000.0).round() / 1000.0;
                 }
                 s.mark *= 1.0 + rng.range(-0.0006, 0.0006);
+                if rng.unit() < 0.1 {
+                    s.funding = (rng.range(-0.0003, 0.0006) * 1e8).round() / 1e8;
+                }
                 let mark = (s.mark * 1e6).round() / 1e6;
                 let recv = ts + rng.range(40.0, 400.0) as i64;
                 let event = Event {
@@ -304,6 +310,14 @@ async fn main() -> anyhow::Result<()> {
                         oi_base: s.oi,
                         oi_usd: Some(((s.oi * mark) * 100.0).round() / 100.0),
                         mark_price: Some(mark),
+                        // Funding moves slowly (changes about every tenth poll, quantized like the exchanges
+                        // quote it); the index price follows the mark closely.
+                        funding_rate: Some(s.funding),
+                        index_price: Some(
+                            (mark * (1.0 - 0.0004 + rng.range(-0.0002, 0.0002)) * 1e6).round()
+                                / 1e6,
+                        ),
+                        next_funding_ts: Some((ts / 28_800_000 + 1) * 28_800_000),
                     })),
                 };
                 if let Some(idx) = loader.push(event, recv)

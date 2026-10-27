@@ -702,6 +702,10 @@ async fn the_sampler_emits_one_event_per_symbol_per_interval_spread_over_it() {
         (usd - 500.0 * 60000.0).abs() < 1.0,
         "exchange value from the snapshot: {usd}"
     );
+    // Funding and index come from the same ticker state (the mock sends no nextFundingTime).
+    assert_eq!(o.funding_rate, Some(0.0001));
+    assert!((60000.0..60100.0).contains(&o.index_price.expect("index price")));
+    assert_eq!(o.next_funding_ts, None);
     assert!(o.exchange_ts >= EPOCH_MS);
     assert!(o.recv_ts >= o.exchange_ts);
     assert_eq!(rig.count(|s| &s.oi_events), seen.len() as u64);

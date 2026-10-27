@@ -236,6 +236,19 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
         Arc::new(SystemClock),
     );
     hub.register(history_service.stats().clone());
+    // The daily digest: built from the History code, sent through the alert channels.
+    let digest = alerts.as_ref().map(|a| {
+        let d = crate::alerts::DigestService::new(
+            history_service.clone(),
+            a.delivery.clone(),
+            a.manager.clone(),
+            ctx.config.alerts.digest.clone(),
+            Arc::new(SystemClock),
+        );
+        hub.register(d.clone());
+        tokio::spawn(d.clone().run(ctx.shutdown.clone()));
+        d
+    });
     let metrics_listener = crate::metrics::bind(&ctx.config.metrics.listen_addr).await?;
     let grpc = crate::grpc::start(
         &ctx.config.server,
@@ -245,6 +258,7 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
         Some(symbols),
         alerts.as_ref().map(|a| a.manager.clone()),
         Some(history_service),
+        digest,
         ctx.shutdown.clone(),
     )
     .await?;

@@ -19,11 +19,18 @@ pub struct Migration {
 }
 
 /// Every migration, in order. Append new ones at the end; never edit or remove an existing entry.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "create_history_tables",
-    sql: include_str!("../../migrations/0001_create_history_tables.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "create_history_tables",
+        sql: include_str!("../../migrations/0001_create_history_tables.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "open_interest_funding",
+        sql: include_str!("../../migrations/0002_open_interest_funding.sql"),
+    },
+];
 
 const SCHEMA_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS schema_migrations \
     (version UInt32, name String, checksum String, applied_at DateTime64(3, 'UTC') DEFAULT now64(3)) \
@@ -212,6 +219,21 @@ mod tests {
         for s in &stmts {
             assert!(s.contains("non_replicated_deduplication_window"), "{s}");
             assert!(s.contains("PARTITION BY toYYYYMM("), "{s}");
+        }
+    }
+
+    #[test]
+    fn second_migration_adds_three_nullable_columns() {
+        let stmts = split_statements(MIGRATIONS[1].sql);
+        assert_eq!(stmts.len(), 3);
+        for (s, col) in stmts
+            .iter()
+            .zip(["funding_rate", "index_price", "next_funding_ts"])
+        {
+            assert!(
+                s.contains(&format!("ADD COLUMN IF NOT EXISTS {col} Nullable(")),
+                "{s}"
+            );
         }
     }
 

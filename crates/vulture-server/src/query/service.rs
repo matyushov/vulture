@@ -8,7 +8,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status};
 use vulture_proto::v1::{
-    AggregateRequest, AggregateResponse, Event, HistoryRequest, history_server::History,
+    AggregateRequest, AggregateResponse, Event, HistoryRequest, SeasonalityRequest,
+    SeasonalityResponse, history_server::History,
 };
 
 use super::cold::{ColdStore, Scope};
@@ -272,6 +273,29 @@ impl History for HistoryHandle {
             Ok(r) => r,
             Err(_) => Err(Status::deadline_exceeded(format!(
                 "the aggregate did not finish within {} s (history.request_timeout_secs); narrow the period or the filters",
+                limit.as_secs()
+            ))),
+        };
+        call.finish(result.as_ref().map_or_else(Status::code, |_| Code::Ok));
+        result.map(Response::new)
+    }
+
+    async fn seasonality(
+        &self,
+        request: Request<SeasonalityRequest>,
+    ) -> Result<Response<SeasonalityResponse>, Status> {
+        let svc = self.0.clone();
+        let mut call = svc.begin(Method::Seasonality)?;
+        let limit = svc.timeout();
+        let result = match tokio::time::timeout(
+            limit,
+            svc.clone().seasonality_inner(request.into_inner()),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(Status::deadline_exceeded(format!(
+                "the profile did not finish within {} s (history.request_timeout_secs); shorten the lookback or narrow the filters",
                 limit.as_secs()
             ))),
         };

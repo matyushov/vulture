@@ -153,6 +153,30 @@ pub fn assert_same_rows(a: &AggregateResponse, b: &AggregateResponse, what: &str
             (y.bucket_start, y.bucket_end, &y.group, y.partial),
             "{what}"
         );
+        match (&x.divergence, &y.divergence) {
+            (None, None) => {}
+            (Some(dx), Some(dy)) => {
+                assert_eq!(
+                    (&dx.rising_exchange, &dx.falling_exchange, dx.exchanges),
+                    (&dy.rising_exchange, &dy.falling_exchange, dy.exchanges),
+                    "{what}: divergence exchanges"
+                );
+                for (a, b) in [
+                    (dx.rising_pct, dy.rising_pct),
+                    (dx.falling_pct, dy.falling_pct),
+                    (dx.spread_pct, dy.spread_pct),
+                ] {
+                    assert!(
+                        close(Some(a), Some(b)),
+                        "{what}: divergence {dx:?} vs {dy:?}"
+                    );
+                }
+            }
+            _ => panic!(
+                "{what}: divergence present on one side only at {} {}",
+                x.group, x.bucket_start
+            ),
+        }
         for (vx, vy) in x.values.iter().zip(&y.values) {
             assert_eq!(vx.metric, vy.metric);
             assert!(

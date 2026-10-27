@@ -12,6 +12,8 @@ service History {
   // Aggregates by exchange, symbol or base asset with a 1m/5m/15m/1h/4h/1d/1w/1M step (v0.5 added the minute
   // steps and 4h). With AggregateRequest.oi_movers set it returns the open interest movers ranking instead.
   rpc Aggregate(AggregateRequest) returns (AggregateResponse);
+  // Profile of liquidations and OI change by hour of day and day of week over a lookback (v0.6).
+  rpc Seasonality(SeasonalityRequest) returns (SeasonalityResponse);
 }
 
 message HistoryRequest {
@@ -74,6 +76,57 @@ enum Metric {
   METRIC_MARK_HIGH = 13;
   METRIC_MARK_LOW = 14;
   METRIC_MARK_CLOSE = 15;
+  // Added in v0.6 (funding and basis, from OpenInterest.funding_rate / index_price). For a group of several series
+  // the value is the mean over the series. Absent where the exchange supplies no funding rate or index price.
+  // Funding rate of the last sample of the bin, and the mean over all samples of the bin (fractions).
+  METRIC_FUNDING_LAST = 16;
+  METRIC_FUNDING_AVG = 17;
+  // Basis in percent, 100 * (mark - index) / index, at the last sample of the bin and averaged over the samples.
+  METRIC_BASIS_PCT = 18;
+  METRIC_BASIS_PCT_AVG = 19;
+  // Added in v0.6 (analytics). The "window" of these metrics is the step. Price change: the mark price at the
+  // end of the bin against the one at the end of the bin before, percent. OI change: change of oi_base over the
+  // bin as a percent of the oi_base at the end of the bin before. Both are absent for GROUP_BY_EXCHANGE (they mix
+  // assets) and when either end is unknown.
+  METRIC_PRICE_CHANGE_PCT = 20;
+  METRIC_OI_CHANGE_PCT = 21;
+  // Regime from the signs of the two changes: a Regime number as the value (absent when either change is zero or
+  // unknown); the strength is sqrt(|price change %| * |OI change %|).
+  METRIC_REGIME = 22;
+  METRIC_REGIME_STRENGTH = 23;
+  // OI grows while the price does not: OI change % minus |price change %| (positive: positions build up faster
+  // than the price moves).
+  METRIC_OI_PRICE_FLATNESS = 24;
+  // Cross-exchange divergence, GROUP_BY_BASE_ASSET only: the largest minus the smallest OI change % among the
+  // exchanges that list the asset (at least two); AggregateRow.divergence names the exchanges.
+  METRIC_OI_DIVERGENCE_PCT = 25;
+}
+
+// Market regime from the direction of price and open interest (METRIC_REGIME).
+enum Regime {
+  REGIME_UNSPECIFIED = 0;
+  // Price up, OI up.
+  REGIME_NEW_LONGS = 1;
+  // Price down, OI up.
+  REGIME_NEW_SHORTS = 2;
+  // Price up, OI down.
+  REGIME_SHORT_COVERING = 3;
+  // Price down, OI down.
+  REGIME_LONG_UNWINDING = 4;
+}
+
+// The exchanges behind METRIC_OI_DIVERGENCE_PCT.
+message Divergence {
+  // The exchange where OI grew the most (or fell the least) and its OI change, percent.
+  string rising_exchange = 1;
+  double rising_pct = 2;
+  // The exchange where OI fell the most (or grew the least).
+  string falling_exchange = 3;
+  double falling_pct = 4;
+  // rising_pct - falling_pct.
+  double spread_pct = 5;
+  // Exchanges compared.
+  uint32 exchanges = 6;
 }
 
 message AggregateRequest {
@@ -166,6 +219,8 @@ message AggregateRow {
   reserved 5 to 9;
   // Added in v0.5. Step end (exclusive), ms; differs from bucket_start + a fixed length for week and month.
   int64 bucket_end = 10;
+  // Added in v0.6. Set when METRIC_OI_DIVERGENCE_PCT is requested and the row has a value for it.
+  optional Divergence divergence = 11;
 }
 
 message AggregateResponse {
@@ -180,4 +235,48 @@ message AggregateResponse {
   int64 bins_to_ts = 12;
   // Where the data came from: "clickhouse", "redis" or "clickhouse+redis" (the unflushed tail was merged in).
   string source = 13;
+}
+
+// --- Seasonality (v0.6) ---
+
+message SeasonalityRequest {
+  // Grouping and filters as in AggregateRequest; keep the filters narrow (a profile is computed per group).
+  GroupBy group_by = 1;
+  repeated string exchanges = 2;
+  repeated string symbols = 3;
+  repeated string base_assets = 4;
+  // Days looked back from to_ts, 1 to 180 (0 = 30).
+  uint32 lookback_days = 5;
+  // End of the lookback, ms (0 = now).
+  int64 to_ts = 6;
+}
+
+message SeasonalityBucket {
+  // Hour of day 0 to 23 (UTC) in by_hour; day of week 0 (Monday) to 6 in by_weekday.
+  uint32 index = 1;
+  // Hourly bins that went into the means.
+  uint32 samples = 2;
+  // Mean liquidated USD per hour, and mean OI change per hour in percent (signed, and in absolute value).
+  optional double mean_liq_usd = 3;
+  optional double mean_oi_change_pct = 4;
+  optional double mean_abs_oi_change_pct = 5;
+}
+
+message SeasonalityProfile {
+  string group = 1;
+  repeated SeasonalityBucket by_hour = 2;
+  repeated SeasonalityBucket by_weekday = 3;
+}
+
+message SeasonalityResponse {
+  repeated SeasonalityProfile profiles = 1;
+  // Distinct UTC days of the lookback with data, and the lookback asked for.
+  uint32 days_covered = 2;
+  uint32 lookback_days = 3;
+  // Fewer days covered than asked, a weekday without observations, or a gap in the data.
+  bool partial = 4;
+  // The period the hourly bins covered, ms.
+  int64 from_ts = 5;
+  int64 to_ts = 6;
+  string source = 7;
 }

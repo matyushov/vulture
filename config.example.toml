@@ -120,6 +120,7 @@ max_symbols = 5000             # most symbols the engine tracks (about 15 KB eac
 series_max_samples = 1024      # hard cap of OI samples per symbol (4 h at 30 s = 480)
 sample_spacing_secs = 15       # samples closer than this to the previous one are ignored
 hole_secs = 300                # a longer pause between two samples of a symbol is a hole; windows spanning it are skipped
+composite_eval_secs = 10       # composite rules (set through Control.UpsertRule) are evaluated this often, from the engine state
 
 [alerts.oi_spike]
 enabled = true
@@ -163,6 +164,16 @@ retry_min_ms = 1000            # exponential backoff of failed messages
 retry_max_ms = 60000
 max_attempts = 8
 request_timeout_secs = 10
+
+# The daily digest: one summary message a day through the alert channels (top OI growth and decline, the largest
+# liquidations, long versus short skew per exchange, cascades, funding extremes, data gaps), built from the History
+# aggregate code. `Control.SendDigestNow` sends one on request whatever `enabled` says. Quiet hours do not apply to it.
+# [alerts.digest]
+# enabled = false
+# time_utc = "07:00"           # HH:MM, UTC
+# channels = []                # channel ids; empty = every enabled channel that is not a system channel
+# sections = ["oi_movers", "liquidations", "skew", "cascades", "funding", "gaps"]
+# top_n = 5                    # entries per list, 1 to 20
 
 # Default channel and rule (seed for alerts.json). Secrets: prefer secret_env or secret_file; an inline `secret`
 # would sit in this file. Remove the comment marks to use them.

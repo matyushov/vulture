@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use vulture_proto::v1::{
-    AggregateRow, GroupBy, Liquidation, Metric, MetricValue, OpenInterest, Side,
+    AggregateRow, Divergence, GroupBy, Liquidation, Metric, MetricValue, OpenInterest, Regime, Side,
 };
 
 use super::bins::BinStep;
@@ -116,6 +116,24 @@ pub struct OiBin {
     pub mark_high: Option<f64>,
     /// Lowest mark price.
     pub mark_low: Option<f64>,
+    /// Last known funding rate and when.
+    pub funding_last: Option<Stamped>,
+    /// Sum of the funding rates of the samples that had one.
+    pub funding_sum: f64,
+    /// Number of those samples.
+    pub funding_n: u64,
+    /// Last known basis in percent (`100 * (mark - index) / index`) and when.
+    pub basis_last: Option<Stamped>,
+    /// Sum of the basis of the samples that had mark and index prices.
+    pub basis_sum: f64,
+    /// Number of those samples.
+    pub basis_n: u64,
+}
+
+/// Basis in percent from a mark and an index price; `None` unless both are usable.
+pub fn basis_pct(mark: Option<f64>, index: Option<f64>) -> Option<f64> {
+    let (m, i) = (usable_price(mark)?, usable_price(index)?);
+    Some(100.0 * (m - i) / i)
 }
 
 fn usable_price(p: Option<f64>) -> Option<f64> {
@@ -123,8 +141,31 @@ fn usable_price(p: Option<f64>) -> Option<f64> {
 }
 
 impl OiBin {
-    /// Adds one sample.
+    /// Adds one sample without funding data.
     pub fn add_sample(&mut self, ts: i64, base: f64, usd: Option<f64>, mark: Option<f64>) {
+        self.add_full_sample(ts, base, usd, mark, None, None);
+    }
+
+    /// Adds one sample.
+    pub fn add_full_sample(
+        &mut self,
+        ts: i64,
+        base: f64,
+        usd: Option<f64>,
+        mark: Option<f64>,
+        funding: Option<f64>,
+        index: Option<f64>,
+    ) {
+        if let Some(f) = funding.filter(|f| f.is_finite()) {
+            self.funding_last = later(self.funding_last, Some(Stamped { ts, v: f }));
+            self.funding_sum += f;
+            self.funding_n += 1;
+        }
+        if let Some(b) = basis_pct(mark, index) {
+            self.basis_last = later(self.basis_last, Some(Stamped { ts, v: b }));
+            self.basis_sum += b;
+            self.basis_n += 1;
+        }
         if self.n == 0 {
             self.first_ts = ts;
             self.last_ts = ts;
@@ -169,6 +210,12 @@ impl OiBin {
         self.mark_close = later(self.mark_close, o.mark_close);
         self.mark_high = max_opt(self.mark_high, o.mark_high);
         self.mark_low = min_opt(self.mark_low, o.mark_low);
+        self.funding_last = later(self.funding_last, o.funding_last);
+        self.funding_sum += o.funding_sum;
+        self.funding_n += o.funding_n;
+        self.basis_last = later(self.basis_last, o.basis_last);
+        self.basis_sum += o.basis_sum;
+        self.basis_n += o.basis_n;
     }
 }
 
@@ -215,7 +262,14 @@ impl FineData {
             .or_default()
             .entry(bin)
             .or_default()
-            .add_sample(o.exchange_ts, o.oi_base, o.oi_usd, o.mark_price);
+            .add_full_sample(
+                o.exchange_ts,
+                o.oi_base,
+                o.oi_usd,
+                o.mark_price,
+                o.funding_rate,
+                o.index_price,
+            );
     }
 
     /// Merges `later` (the newer side, for example the Redis tail) into `self`.
@@ -291,6 +345,8 @@ pub struct Needs {
     pub oi: bool,
     /// The cells carry mark prices.
     pub mark: bool,
+    /// The cells carry funding rates and basis.
+    pub funding: bool,
 }
 
 impl Needs {
@@ -321,6 +377,21 @@ impl Needs {
                     n.oi = true;
                     n.mark = true;
                 }
+                Metric::FundingLast
+                | Metric::FundingAvg
+                | Metric::BasisPct
+                | Metric::BasisPctAvg => {
+                    n.oi = true;
+                    n.funding = true;
+                }
+                Metric::PriceChangePct
+                | Metric::Regime
+                | Metric::RegimeStrength
+                | Metric::OiPriceFlatness => {
+                    n.oi = true;
+                    n.mark = true;
+                }
+                Metric::OiChangePct | Metric::OiDivergencePct => n.oi = true,
                 Metric::Unspecified => {}
             }
         }
@@ -377,11 +448,23 @@ struct OiAcc {
     chg_n: u32,
     chg_usd: f64,
     chg_usd_n: u32,
+    /// Sum of the previous end levels (base) of the series that have a change: the base of the percentage.
+    chg_prev_base: f64,
+    /// Per exchange (change, previous level) in base units, collected only for the divergence metric.
+    by_exchange: BTreeMap<String, (f64, f64)>,
     chg_excluded: bool,
     mark_open: Option<Stamped>,
     mark_close: Option<Stamped>,
     mark_high: Option<f64>,
     mark_low: Option<f64>,
+    funding_last_sum: f64,
+    funding_last_n: u32,
+    funding_avg_sum: f64,
+    funding_avg_n: u32,
+    basis_last_sum: f64,
+    basis_last_n: u32,
+    basis_avg_sum: f64,
+    basis_avg_n: u32,
 }
 
 #[derive(Default)]
@@ -419,6 +502,8 @@ fn conversion_price(c: &OiBin) -> Option<f64> {
 /// Rolls the cells up into answer rows.
 pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Rollup, RollupError> {
     let needs = Needs::of(&p.metrics);
+    let want_divergence =
+        p.group_by == GroupBy::BaseAsset && p.metrics.contains(&Metric::OiDivergencePct);
     let mut groups: BTreeMap<String, GroupAcc> = BTreeMap::new();
     // Total OI in USD per (base asset, bin), over every series that passed the filters.
     let mut base_totals: HashMap<(String, i64), f64> = HashMap::new();
@@ -446,7 +531,9 @@ pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Roll
             let mut first_seen: Option<i64> = None;
             for (bin, cell) in bins {
                 let first = *first_seen.get_or_insert(*bin);
-                if *bin < p.first_bin || *bin >= p.end {
+                // Bins before the period are kept: the previous bin of the first one supplies its changes (price
+                // change, regime); they never become rows.
+                if *bin >= p.end {
                     continue;
                 }
                 let g = groups.entry(gk.clone()).or_default();
@@ -467,6 +554,12 @@ pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Roll
                         let change = cell.last_base - prev.last_base;
                         oi.chg_base += change;
                         oi.chg_n += 1;
+                        oi.chg_prev_base += prev.last_base;
+                        if want_divergence {
+                            let e = oi.by_exchange.entry(key.0.clone()).or_default();
+                            e.0 += change;
+                            e.1 += prev.last_base;
+                        }
                         if let Some(price) = conversion_price(cell) {
                             oi.chg_usd += change * price;
                             oi.chg_usd_n += 1;
@@ -481,6 +574,22 @@ pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Roll
                 oi.mark_close = later(oi.mark_close, cell.mark_close);
                 oi.mark_high = max_opt(oi.mark_high, cell.mark_high);
                 oi.mark_low = min_opt(oi.mark_low, cell.mark_low);
+                if let Some(f) = cell.funding_last {
+                    oi.funding_last_sum += f.v;
+                    oi.funding_last_n += 1;
+                }
+                if cell.funding_n > 0 {
+                    oi.funding_avg_sum += cell.funding_sum / cell.funding_n as f64;
+                    oi.funding_avg_n += 1;
+                }
+                if let Some(b) = cell.basis_last {
+                    oi.basis_last_sum += b.v;
+                    oi.basis_last_n += 1;
+                }
+                if cell.basis_n > 0 {
+                    oi.basis_avg_sum += cell.basis_sum / cell.basis_n as f64;
+                    oi.basis_avg_n += 1;
+                }
             }
         }
     }
@@ -488,7 +597,10 @@ pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Roll
     // Row count first, so a huge answer is refused before it is built.
     let mut total_rows = 0usize;
     for g in groups.values() {
-        if let (Some(lo), Some(hi)) = (g.bins.keys().next(), g.bins.keys().next_back()) {
+        if let (Some(lo), Some(hi)) = (
+            g.bins.range(p.first_bin..).next().map(|(k, _)| k),
+            g.bins.keys().next_back(),
+        ) {
             total_rows += p.step.count(*lo, *hi + 1) as usize;
             if total_rows > p.max_rows {
                 return Err(RollupError::TooManyRows {
@@ -501,7 +613,10 @@ pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Roll
 
     let mut out = Rollup::default();
     for (name, g) in &groups {
-        let (Some(&lo), Some(&hi)) = (g.bins.keys().next(), g.bins.keys().next_back()) else {
+        let (Some(&lo), Some(&hi)) = (
+            g.bins.range(p.first_bin..).next().map(|(k, _)| k),
+            g.bins.keys().next_back(),
+        ) else {
             continue;
         };
         let relevant: Vec<(&GapRec, bool, bool)> = gaps
@@ -539,7 +654,16 @@ pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Roll
                 .iter()
                 .map(|m| MetricValue {
                     metric: *m as i32,
-                    value: metric_value(*m, p.group_by, name, bin, acc, covered, &base_totals),
+                    value: metric_value(
+                        *m,
+                        p.group_by,
+                        name,
+                        bin,
+                        acc,
+                        g.bins.get(&p.step.prev(bin)),
+                        covered,
+                        &base_totals,
+                    ),
                 })
                 .collect();
             out.partial |= partial;
@@ -549,6 +673,11 @@ pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Roll
                 values,
                 partial,
                 bucket_end: next,
+                divergence: if want_divergence {
+                    acc.and_then(|a| a.oi.as_ref()).and_then(divergence_of)
+                } else {
+                    None
+                },
             });
             bin = next;
         }
@@ -556,12 +685,63 @@ pub fn rollup(fine: &FineData, gaps: &[GapRec], p: &RollupParams) -> Result<Roll
     Ok(out)
 }
 
+/// Largest and smallest OI change (percent of the previous level) among the exchanges of a base asset.
+fn divergence_of(o: &OiAcc) -> Option<Divergence> {
+    let pcts: Vec<(&String, f64)> = o
+        .by_exchange
+        .iter()
+        .filter(|(_, (_, prev))| *prev > 0.0)
+        .map(|(ex, (chg, prev))| (ex, 100.0 * chg / prev))
+        .collect();
+    if pcts.len() < 2 {
+        return None;
+    }
+    let rising = pcts.iter().max_by(|a, b| a.1.total_cmp(&b.1)).copied()?;
+    let falling = pcts.iter().min_by(|a, b| a.1.total_cmp(&b.1)).copied()?;
+    Some(Divergence {
+        rising_exchange: rising.0.clone(),
+        rising_pct: rising.1,
+        falling_exchange: falling.0.clone(),
+        falling_pct: falling.1,
+        spread_pct: rising.1 - falling.1,
+        exchanges: pcts.len() as u32,
+    })
+}
+
+/// Price change over the bin in percent: the last mark price against the one of the bin before.
+fn price_change_pct(oi: Option<&OiAcc>, prev: Option<&BinAcc>) -> Option<f64> {
+    let now = oi?.mark_close?.v;
+    let before = prev.and_then(|p| p.oi.as_ref())?.mark_close?.v;
+    (before > 0.0).then(|| 100.0 * (now - before) / before)
+}
+
+/// OI change over the bin in percent of the level before it.
+fn oi_change_pct(oi: Option<&OiAcc>) -> Option<f64> {
+    let o = oi?;
+    (o.chg_n > 0 && o.chg_prev_base > 0.0).then(|| 100.0 * o.chg_base / o.chg_prev_base)
+}
+
+pub fn regime_of(price_pct: f64, oi_pct: f64) -> Option<(Regime, f64)> {
+    if price_pct == 0.0 || oi_pct == 0.0 {
+        return None;
+    }
+    let regime = match (price_pct > 0.0, oi_pct > 0.0) {
+        (true, true) => Regime::NewLongs,
+        (false, true) => Regime::NewShorts,
+        (true, false) => Regime::ShortCovering,
+        (false, false) => Regime::LongUnwinding,
+    };
+    Some((regime, (price_pct.abs() * oi_pct.abs()).sqrt()))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn metric_value(
     m: Metric,
     group_by: GroupBy,
     group: &str,
     bin: i64,
     acc: Option<&BinAcc>,
+    prev: Option<&BinAcc>,
     covered: bool,
     base_totals: &HashMap<(String, i64), f64>,
 ) -> Option<f64> {
@@ -611,8 +791,39 @@ fn metric_value(
             .map(|s| s.v),
         Metric::MarkHigh => oi.filter(|_| !by_exchange).and_then(|o| o.mark_high),
         Metric::MarkLow => oi.filter(|_| !by_exchange).and_then(|o| o.mark_low),
+        Metric::PriceChangePct => price_change_pct(oi.filter(|_| !by_exchange), prev),
+        Metric::OiChangePct => oi_change_pct(oi.filter(|_| !by_exchange)),
+        Metric::Regime | Metric::RegimeStrength => {
+            let o = oi.filter(|_| !by_exchange);
+            let (pp, op) = (price_change_pct(o, prev)?, oi_change_pct(o)?);
+            let (regime, strength) = regime_of(pp, op)?;
+            Some(if m == Metric::Regime {
+                f64::from(regime as i32)
+            } else {
+                strength
+            })
+        }
+        Metric::OiPriceFlatness => {
+            let o = oi.filter(|_| !by_exchange);
+            Some(oi_change_pct(o)? - price_change_pct(o, prev)?.abs())
+        }
+        Metric::OiDivergencePct => {
+            if group_by != GroupBy::BaseAsset {
+                return None;
+            }
+            oi.and_then(divergence_of).map(|d| d.spread_pct)
+        }
+        Metric::FundingLast => mean(oi.map(|o| (o.funding_last_sum, o.funding_last_n))),
+        Metric::FundingAvg => mean(oi.map(|o| (o.funding_avg_sum, o.funding_avg_n))),
+        Metric::BasisPct => mean(oi.map(|o| (o.basis_last_sum, o.basis_last_n))),
+        Metric::BasisPctAvg => mean(oi.map(|o| (o.basis_avg_sum, o.basis_avg_n))),
         Metric::Unspecified => None,
     }
+}
+
+/// Mean of `n` values with the sum given, `None` for none.
+fn mean(v: Option<(f64, u32)>) -> Option<f64> {
+    v.filter(|(_, n)| *n > 0).map(|(sum, n)| sum / f64::from(n))
 }
 
 #[cfg(test)]
@@ -646,6 +857,7 @@ mod tests {
             oi_base: base,
             oi_usd: Some(base * mark),
             mark_price: Some(mark),
+            ..OpenInterest::default()
         }
     }
 
@@ -701,6 +913,292 @@ mod tests {
         assert_eq!(whole.mark_close.unwrap().v, 9.9);
         assert_eq!(whole.mark_high, Some(10.2));
         assert_eq!(whole.mark_low, Some(9.9));
+    }
+
+    #[test]
+    fn funding_and_basis_merge_like_the_other_cells() {
+        let samples = [
+            (T0 + 1_000, Some(0.0001), Some(100.0), Some(101.0)),
+            (T0 + 31_000, Some(0.0003), Some(100.0), Some(99.0)),
+            (T0 + 41_000, None, Some(100.0), None),
+            (T0 + 51_000, Some(-0.0002), None, Some(100.5)),
+        ];
+        let mut whole = OiBin::default();
+        for (ts, f, mark, index) in samples {
+            whole.add_full_sample(ts, 1.0, None, mark, f, index);
+        }
+        assert_eq!(whole.funding_n, 3);
+        assert!((whole.funding_sum - 0.0002).abs() < 1e-12);
+        assert_eq!(whole.funding_last.unwrap().v, -0.0002);
+        // Basis only where both prices are known: 100 * (100 - 101) / 101 and 100 * (100 - 99) / 99.
+        assert_eq!(whole.basis_n, 2);
+        let (b1, b2) = (
+            100.0 * (100.0 - 101.0) / 101.0,
+            100.0 * (100.0 - 99.0) / 99.0,
+        );
+        assert!((whole.basis_sum - (b1 + b2)).abs() < 1e-9);
+        assert!((whole.basis_last.unwrap().v - b2).abs() < 1e-9);
+        for split in 0..=samples.len() {
+            let (mut a, mut b) = (OiBin::default(), OiBin::default());
+            for (ts, f, mark, index) in &samples[..split] {
+                a.add_full_sample(*ts, 1.0, None, *mark, *f, *index);
+            }
+            for (ts, f, mark, index) in &samples[split..] {
+                b.add_full_sample(*ts, 1.0, None, *mark, *f, *index);
+            }
+            a.merge(&b);
+            // Sums are floating point: the order of additions may differ in the last bit.
+            assert!((a.funding_sum - whole.funding_sum).abs() < 1e-15);
+            assert!((a.basis_sum - whole.basis_sum).abs() < 1e-12);
+            a.funding_sum = whole.funding_sum;
+            a.basis_sum = whole.basis_sum;
+            assert_eq!(a, whole, "split at {split}");
+        }
+        assert_eq!(basis_pct(Some(101.0), Some(100.0)), Some(1.0));
+        assert_eq!(basis_pct(Some(101.0), None), None);
+        assert_eq!(basis_pct(Some(101.0), Some(0.0)), None);
+    }
+
+    #[test]
+    fn funding_metrics_are_means_over_the_series() {
+        let mut fine = FineData::default();
+        let s = BinStep::Minute1;
+        for (ex, funding, index) in [
+            ("binance", 0.0002, 100.0),
+            ("bybit", 0.0004, 98.0),
+            ("okx", f64::NAN, 100.0),
+        ] {
+            let mut o = oi(ex, "AAA-USDT-PERP", T0 + 1_000, 10.0, 100.0);
+            o.funding_rate = (!funding.is_nan()).then_some(funding);
+            o.index_price = Some(index);
+            fine.add_oi(s, &o);
+        }
+        let metrics = [
+            Metric::FundingLast,
+            Metric::FundingAvg,
+            Metric::BasisPct,
+            Metric::BasisPctAvg,
+        ];
+        let r = rollup(&fine, &[], &params(GroupBy::Symbol, &metrics)).unwrap();
+        let row = &r.rows[0];
+        // Funding: mean of the two exchanges that have it. Basis: (0 + 100*(100-98)/98 + 0) / 3.
+        assert!((value(row, Metric::FundingLast).unwrap() - 0.0003).abs() < 1e-12);
+        assert!((value(row, Metric::FundingAvg).unwrap() - 0.0003).abs() < 1e-12);
+        let expect = (0.0 + 100.0 * 2.0 / 98.0 + 0.0) / 3.0;
+        assert!((value(row, Metric::BasisPct).unwrap() - expect).abs() < 1e-9);
+        assert!((value(row, Metric::BasisPctAvg).unwrap() - expect).abs() < 1e-9);
+        // No funding anywhere: null, not zero.
+        let mut none = FineData::default();
+        none.add_oi(s, &oi("okx", "AAA-USDT-PERP", T0 + 1_000, 10.0, 100.0));
+        let r = rollup(&none, &[], &params(GroupBy::Symbol, &metrics)).unwrap();
+        for m in metrics {
+            assert_eq!(value(&r.rows[0], m), None, "{m:?}");
+        }
+    }
+
+    /// One series with a level and a mark price per minute.
+    fn walk(fine: &mut FineData, ex: &str, sym: &str, levels: &[(f64, f64)]) {
+        for (i, (base, mark)) in levels.iter().enumerate() {
+            let ts = T0 - MIN + i as i64 * MIN + 1_000;
+            fine.add_oi(BinStep::Minute1, &oi(ex, sym, ts, *base, *mark));
+        }
+    }
+
+    #[test]
+    fn regimes_follow_the_signs_of_price_and_oi() {
+        let mut fine = FineData::default();
+        // Bin 0 is the lookback bin (T0 - 1 min); the answer rows are bins 1.. of the walk.
+        walk(
+            &mut fine,
+            "binance",
+            "UP-USDT-PERP",
+            &[(100.0, 10.0), (110.0, 11.0), (121.0, 12.1)],
+        );
+        walk(
+            &mut fine,
+            "binance",
+            "DN-USDT-PERP",
+            &[(100.0, 10.0), (110.0, 9.0), (99.0, 8.1)],
+        );
+        walk(
+            &mut fine,
+            "binance",
+            "SC-USDT-PERP",
+            &[(100.0, 10.0), (90.0, 11.0), (81.0, 12.1)],
+        );
+        walk(
+            &mut fine,
+            "binance",
+            "LU-USDT-PERP",
+            &[(100.0, 10.0), (90.0, 9.0), (81.0, 8.1)],
+        );
+        walk(
+            &mut fine,
+            "binance",
+            "FL-USDT-PERP",
+            &[(100.0, 10.0), (110.0, 10.0), (121.0, 10.0)],
+        );
+        let metrics = [
+            Metric::PriceChangePct,
+            Metric::OiChangePct,
+            Metric::Regime,
+            Metric::RegimeStrength,
+            Metric::OiPriceFlatness,
+        ];
+        let r = rollup(&fine, &[], &params(GroupBy::Symbol, &metrics)).unwrap();
+        let row = |g: &str, i: usize| {
+            r.rows
+                .iter()
+                .filter(|r| r.group == g)
+                .nth(i)
+                .unwrap_or_else(|| panic!("{g} {i}"))
+        };
+        assert_eq!(r.rows.len(), 10, "two answer bins for each of five symbols");
+        for (g, regime) in [
+            ("UP-USDT-PERP", Regime::NewLongs),
+            ("DN-USDT-PERP", Regime::NewShorts),
+            ("SC-USDT-PERP", Regime::ShortCovering),
+            ("LU-USDT-PERP", Regime::LongUnwinding),
+        ] {
+            let first = row(g, 0);
+            assert_eq!(
+                value(first, Metric::Regime),
+                Some(f64::from(regime as i32)),
+                "{g}"
+            );
+            let (p, o) = (
+                value(first, Metric::PriceChangePct).unwrap(),
+                value(first, Metric::OiChangePct).unwrap(),
+            );
+            assert!(
+                (p.abs() - 10.0).abs() < 0.5 && (o.abs() - 10.0).abs() < 1e-9,
+                "{g}: {p} {o}"
+            );
+            let strength = value(first, Metric::RegimeStrength).unwrap();
+            assert!((strength - (p.abs() * o.abs()).sqrt()).abs() < 1e-9);
+            assert!((value(first, Metric::OiPriceFlatness).unwrap() - (o - p.abs())).abs() < 1e-9);
+        }
+        // Flat price: OI grows 10%, the price does not move: no regime, a large flatness.
+        let flat = row("FL-USDT-PERP", 0);
+        assert_eq!(value(flat, Metric::PriceChangePct), Some(0.0));
+        assert_eq!(value(flat, Metric::Regime), None);
+        assert_eq!(value(flat, Metric::RegimeStrength), None);
+        assert!((value(flat, Metric::OiPriceFlatness).unwrap() - 10.0).abs() < 1e-9);
+        // Exchange groups mix assets: none of this is defined for them.
+        let by_ex = rollup(&fine, &[], &params(GroupBy::Exchange, &metrics)).unwrap();
+        for m in metrics {
+            assert_eq!(value(&by_ex.rows[0], m), None, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn the_first_bin_has_no_regime_without_a_previous_bin() {
+        let mut fine = FineData::default();
+        fine.add_oi(
+            BinStep::Minute1,
+            &oi("binance", "AAA-USDT-PERP", T0 + 1_000, 100.0, 10.0),
+        );
+        let r = rollup(
+            &fine,
+            &[],
+            &params(
+                GroupBy::Symbol,
+                &[Metric::PriceChangePct, Metric::OiChangePct, Metric::Regime],
+            ),
+        )
+        .unwrap();
+        for v in &r.rows[0].values {
+            assert_eq!(v.value, None);
+        }
+    }
+
+    #[test]
+    fn divergence_names_the_exchanges_that_part_ways() {
+        let mut fine = FineData::default();
+        walk(
+            &mut fine,
+            "binance",
+            "BTC-USDT-PERP",
+            &[(100.0, 1.0), (110.0, 1.0)],
+        );
+        walk(
+            &mut fine,
+            "bybit",
+            "BTC-USDT-PERP",
+            &[(200.0, 1.0), (190.0, 1.0)],
+        );
+        walk(
+            &mut fine,
+            "okx",
+            "BTC-USDT-PERP",
+            &[(50.0, 1.0), (51.0, 1.0)],
+        );
+        // A second symbol of the same asset on binance adds to binance's change.
+        walk(
+            &mut fine,
+            "binance",
+            "BTC-USDC-PERP",
+            &[(100.0, 1.0), (110.0, 1.0)],
+        );
+        // An asset on one exchange only has no divergence.
+        walk(
+            &mut fine,
+            "binance",
+            "SOLO-USDT-PERP",
+            &[(10.0, 1.0), (20.0, 1.0)],
+        );
+        let r = rollup(
+            &fine,
+            &[],
+            &params(
+                GroupBy::BaseAsset,
+                &[Metric::OiDivergencePct, Metric::OiChangePct],
+            ),
+        )
+        .unwrap();
+        let btc = r
+            .rows
+            .iter()
+            .find(|r| r.group == "BTC" && r.bucket_start == T0)
+            .unwrap();
+        let d = btc.divergence.as_ref().expect("divergence");
+        assert_eq!(
+            (d.rising_exchange.as_str(), d.falling_exchange.as_str()),
+            ("binance", "bybit")
+        );
+        assert!((d.rising_pct - 10.0).abs() < 1e-9, "{d:?}");
+        assert!((d.falling_pct + 5.0).abs() < 1e-9, "{d:?}");
+        assert!((d.spread_pct - 15.0).abs() < 1e-9);
+        assert_eq!(d.exchanges, 3);
+        assert!((value(btc, Metric::OiDivergencePct).unwrap() - 15.0).abs() < 1e-9);
+        let solo = r
+            .rows
+            .iter()
+            .find(|r| r.group == "SOLO" && r.bucket_start == T0)
+            .unwrap();
+        assert!(solo.divergence.is_none());
+        assert_eq!(value(solo, Metric::OiDivergencePct), None);
+        assert!((value(solo, Metric::OiChangePct).unwrap() - 100.0).abs() < 1e-9);
+        // Not asked for, not computed; other groupings have none.
+        let plain = rollup(
+            &fine,
+            &[],
+            &params(GroupBy::BaseAsset, &[Metric::OiChangePct]),
+        )
+        .unwrap();
+        assert!(plain.rows.iter().all(|r| r.divergence.is_none()));
+        let by_symbol = rollup(
+            &fine,
+            &[],
+            &params(GroupBy::Symbol, &[Metric::OiDivergencePct]),
+        )
+        .unwrap();
+        assert!(
+            by_symbol
+                .rows
+                .iter()
+                .all(|r| r.divergence.is_none() && r.values[0].value.is_none())
+        );
     }
 
     #[test]
@@ -994,7 +1492,8 @@ mod tests {
             Needs {
                 liq: true,
                 oi: false,
-                mark: false
+                mark: false,
+                funding: false
             }
         );
         assert_eq!(
@@ -1002,12 +1501,15 @@ mod tests {
             Needs {
                 liq: false,
                 oi: true,
-                mark: false
+                mark: false,
+                funding: false
             }
         );
         let n = Needs::of(&[Metric::OiChangeUsd]);
         assert!(n.oi && n.mark);
         assert!(Needs::of(&[Metric::LiqToOiRatio]).liq);
         assert!(Needs::of(&[Metric::MarkHigh]).mark);
+        let f = Needs::of(&[Metric::BasisPct]);
+        assert!(f.oi && f.funding && !f.mark && !f.liq);
     }
 }

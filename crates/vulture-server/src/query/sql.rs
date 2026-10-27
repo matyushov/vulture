@@ -6,7 +6,7 @@
 //! index prunes whatever it can.
 
 use super::bins::BinStep;
-use super::cold::{EventQuery, FineQuery, Kind, MoverQuery, Scope};
+use super::cold::{EventQuery, FineQuery, Kind, MoverQuery, Scope, TopLiqQuery};
 
 /// A ClickHouse string literal.
 pub fn lit(s: &str) -> String {
@@ -99,7 +99,8 @@ fn event_columns(kind: Kind) -> &'static str {
         }
         Kind::OpenInterest => {
             "exchange, symbol, symbol_raw, toUnixTimestamp64Milli(exchange_ts) AS t_ms, \
-             toUnixTimestamp64Milli(recv_ts) AS rts, oi_base, oi_usd, mark_price, event_id"
+             toUnixTimestamp64Milli(recv_ts) AS rts, oi_base, oi_usd, mark_price, event_id, \
+             funding_rate, index_price, toUnixTimestamp64Milli(next_funding_ts) AS nf_ms"
         }
         Kind::Gap => {
             "exchange, stream, toUnixTimestamp64Milli(from_ts) AS t_ms, \
@@ -143,6 +144,16 @@ pub fn event_time(kind: Kind, id: &str, q: &EventQuery) -> String {
         period(kind, q.from_ts, q.to_ts),
         scope_terms(kind, &q.scope),
         lit(id)
+    )
+}
+
+/// The largest liquidations of a period.
+pub fn top_liquidations(q: &TopLiqQuery) -> String {
+    format!(
+        "SELECT {}, {ID_COLS} FROM liquidations WHERE {} ORDER BY notional_usd DESC, idm, ids LIMIT {}",
+        event_columns(Kind::Liquidation),
+        period(Kind::Liquidation, q.from, q.to),
+        q.n
     )
 }
 
@@ -191,6 +202,19 @@ pub fn fine_open_interest(q: &FineQuery) -> String {
              minIf(mark_price, mark_price IS NOT NULL) AS mark_low",
         );
     }
+    if q.needs.funding {
+        let cond = "mark_price IS NOT NULL AND index_price IS NOT NULL AND mark_price > 0 AND index_price > 0";
+        let expr = "(mark_price - index_price) / index_price * 100";
+        cols.push_str(&format!(
+            ", countIf(funding_rate IS NOT NULL) AS f_n, \
+             sumIf(funding_rate, funding_rate IS NOT NULL) AS f_sum, \
+             argMaxIf(funding_rate, exchange_ts, funding_rate IS NOT NULL) AS f_last, \
+             toUnixTimestamp64Milli(maxIf(exchange_ts, funding_rate IS NOT NULL)) AS f_ts, \
+             countIf({cond}) AS b_n, sumIf({expr}, {cond}) AS b_sum, \
+             argMaxIf({expr}, exchange_ts, {cond}) AS b_last, \
+             toUnixTimestamp64Milli(maxIf(exchange_ts, {cond})) AS b_ts"
+        ));
+    }
     format!(
         "SELECT exchange, symbol, {bin} AS b, {cols} FROM open_interest WHERE {period}{scope}{bound} \
          GROUP BY exchange, symbol, b LIMIT {limit}",
@@ -238,6 +262,29 @@ pub fn movers(q: &MoverQuery) -> String {
         end = ts_lit(q.end),
         scope = scope_terms(Kind::OpenInterest, &q.scope),
         min_last = q.min_last,
+    )
+}
+
+/// Events of one kind whose stream ID lies in `[from_ms, to_ms)`, in stream order (for the replay). The time
+/// column is constrained with a slack so that the primary index and the partitions prune.
+pub fn replay_events(kind: Kind, from_ms: i64, to_ms: i64, slack_ms: i64, scope: &Scope) -> String {
+    let c = time_col(kind);
+    let range = if kind == Kind::Gap {
+        // Gaps are written when they end; their table is small, the ID range alone selects them.
+        "1".to_string()
+    } else {
+        format!(
+            "{c} >= {} AND {c} < {}",
+            ts_lit(from_ms - slack_ms),
+            ts_lit(to_ms + slack_ms)
+        )
+    };
+    format!(
+        "SELECT {}, {ID_COLS} FROM {} WHERE {range}{} AND idm >= {from_ms} AND idm < {to_ms} \
+         ORDER BY idm, ids",
+        event_columns(kind),
+        kind.table(),
+        scope_terms(kind, scope),
     )
 }
 
@@ -355,6 +402,7 @@ mod tests {
                 liq: true,
                 oi: true,
                 mark: true,
+                funding: false,
             },
             id_bound: Some(IdBound { ms: 99, seq: 4 }),
             max_cells: 10,
@@ -377,6 +425,7 @@ mod tests {
                 liq: false,
                 oi: true,
                 mark: false,
+                funding: false,
             },
             id_bound: None,
             ..fq.clone()
@@ -385,6 +434,30 @@ mod tests {
         assert!(!sql.contains("mark_high") && !sql.contains("<= ("), "{sql}");
         let liq = fine_liquidations(&fq);
         assert!(liq.contains("sumIf(notional_usd, side = 'long')"), "{liq}");
+    }
+
+    #[test]
+    fn replay_queries_select_by_stream_id_in_stream_order() {
+        let scope = Scope {
+            exchanges: vec!["binance".into()],
+            ..Scope::default()
+        };
+        let sql = replay_events(Kind::OpenInterest, 1_000_000, 2_000_000, 600_000, &scope);
+        assert!(
+            sql.contains("exchange_ts >= fromUnixTimestamp64Milli(400000, 'UTC')"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("exchange_ts < fromUnixTimestamp64Milli(2600000, 'UTC')"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("idm >= 1000000 AND idm < 2000000 ORDER BY idm, ids"),
+            "{sql}"
+        );
+        assert!(sql.contains("exchange IN ('binance')"), "{sql}");
+        let gaps = replay_events(Kind::Gap, 1, 2, 3, &Scope::default());
+        assert!(gaps.contains("WHERE 1 AND idm >= 1"), "{gaps}");
     }
 
     #[test]

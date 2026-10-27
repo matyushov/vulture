@@ -226,8 +226,26 @@ pub struct MoverAnswer {
     pub scanned: u64,
 }
 
+/// A request for the largest liquidations of a period.
+#[derive(Debug, Clone)]
+pub struct TopLiqQuery {
+    /// Period start, ms, inclusive.
+    pub from: i64,
+    /// Period end, ms, exclusive.
+    pub to: i64,
+    /// How many.
+    pub n: usize,
+    /// Query limits.
+    pub max_memory: u64,
+    /// Deadline.
+    pub timeout: Duration,
+}
+
 /// The long-term store.
 pub trait ColdStore: Send + Sync {
+    /// The `n` liquidations of a period with the largest notional, largest first.
+    fn top_liquidations(&self, q: TopLiqQuery) -> BoxFuture<'_, Result<Vec<Event>, ChError>>;
+
     /// Events of a period in answer order.
     fn events(&self, q: EventQuery) -> BoxFuture<'_, Result<Box<dyn EventCursor>, ChError>>;
 

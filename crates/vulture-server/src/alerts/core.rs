@@ -9,11 +9,11 @@ use arc_swap::ArcSwap;
 use vulture_proto::v1::{Event, Gap, Liquidation, OpenInterest, Signal, event::Payload};
 
 use super::cascade::CascadeDetector;
-use super::model::RuleKind;
+use super::model::{CmpOp, CondMetric, Condition, RuleKind};
 use super::oi::OiDetector;
 use super::rules::{
-    Hit, RuleCooldowns, RuleSet, liquidation_alert, liquidation_matches, oi_change_alert,
-    signal_alert, signal_cooldown_key, signal_matches,
+    CompiledRule, Hit, RuleCooldowns, RuleSet, composite_alert, liquidation_alert,
+    liquidation_matches, oi_change_alert, signal_alert, signal_cooldown_key, signal_matches,
 };
 use super::series::{Push, SAMPLE_BYTES, Sample, Series, SeriesLimits};
 use super::stats::EngineStats;
@@ -31,6 +31,19 @@ pub struct Output {
 /// Gap stream names that do not interrupt the OI series.
 const LIQUIDATION_STREAMS: [&str; 1] = ["liquidations"];
 
+/// Per-symbol state that is not an OI ring buffer: the latest funding rate and index price, and the recent
+/// liquidations (for composite rules).
+#[derive(Debug, Default)]
+struct SymbolExtra {
+    funding: Option<f64>,
+    index: Option<f64>,
+    /// (receive time, USD), oldest first.
+    liq: std::collections::VecDeque<(i64, f64)>,
+}
+
+/// Most liquidations kept per symbol.
+const MAX_LIQ_PER_SYMBOL: usize = 5000;
+
 /// The engine state.
 pub struct Core {
     stats: Arc<EngineStats>,
@@ -47,6 +60,11 @@ pub struct Core {
     /// Live liquidations at or before this time were already counted by the warm-up replay.
     replay_liq_watermark: i64,
     last_gauge_ms: i64,
+    extras: HashMap<String, HashMap<String, SymbolExtra>>,
+    extras_count: usize,
+    composite_interval_ms: i64,
+    last_composite_ms: i64,
+    extras_retention_ms: i64,
 }
 
 impl Core {
@@ -74,6 +92,11 @@ impl Core {
             cooldowns: RuleCooldowns::default(),
             replay_liq_watermark: i64::MIN,
             last_gauge_ms: 0,
+            extras: HashMap::new(),
+            extras_count: 0,
+            composite_interval_ms: (cfg.composite_eval_secs as i64) * 1000,
+            last_composite_ms: 0,
+            extras_retention_ms: retention_ms,
         }
     }
 
@@ -151,6 +174,10 @@ impl Core {
         if !sample.oi_base.is_finite() || sample.oi_base < 0.0 {
             return;
         }
+        self.note_extras(&oi.exchange, &oi.symbol, |e| {
+            e.funding = oi.funding_rate;
+            e.index = oi.index_price;
+        });
         let by_exchange = match self.series.get_mut(&oi.exchange) {
             Some(m) => m,
             None => self.series.entry(oi.exchange.clone()).or_default(),
@@ -200,6 +227,12 @@ impl Core {
             if *min_change_usd > 0.0 && !super::series::ge(c.usd.abs(), *min_change_usd) {
                 continue;
             }
+            if rule.is_quiet(ts) {
+                self.stats
+                    .quiet_suppressed_rule
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let key = format!("{}|{}|{}", oi.exchange, oi.symbol, c.pct > 0.0);
             if !self.cooldowns.allow(&rule.id, &key, ts, rule.cooldown_ms) {
                 self.stats
@@ -227,11 +260,23 @@ impl Core {
         if liq.recv_ts <= self.replay_liq_watermark {
             return;
         }
+        self.note_extras(&liq.exchange, &liq.symbol, |e| {
+            e.liq.push_back((liq.recv_ts, liq.notional_usd));
+            while e.liq.len() > MAX_LIQ_PER_SYMBOL {
+                e.liq.pop_front();
+            }
+        });
         let signals = self.cascade.on_liquidation(liq);
         {
             let rules = self.rules.load();
             for rule in &rules.rules {
                 if !liquidation_matches(rule, liq) {
+                    continue;
+                }
+                if rule.is_quiet(liq.recv_ts) {
+                    self.stats
+                        .quiet_suppressed_rule
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 let key = format!("{}|{}", liq.exchange, liq.symbol);
@@ -263,6 +308,12 @@ impl Core {
             if !signal_matches(rule, &s) {
                 continue;
             }
+            if rule.is_quiet(s.ts) {
+                self.stats
+                    .quiet_suppressed_rule
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             if !self
                 .cooldowns
                 .allow(&rule.id, &signal_cooldown_key(&s), s.ts, rule.cooldown_ms)
@@ -287,10 +338,164 @@ impl Core {
         for s in self.cascade.advance(now_ms) {
             self.emit(s, out);
         }
+        if self.composite_interval_ms > 0
+            && now_ms - self.last_composite_ms >= self.composite_interval_ms
+        {
+            self.last_composite_ms = now_ms;
+            self.eval_composites(now_ms, out);
+        }
         if now_ms - self.last_gauge_ms >= 10_000 {
             self.last_gauge_ms = now_ms;
             self.refresh_gauges(now_ms);
         }
+    }
+
+    /// Updates the extra state of a symbol (created on first use, within the symbol limit).
+    fn note_extras(&mut self, exchange: &str, symbol: &str, f: impl FnOnce(&mut SymbolExtra)) {
+        if let Some(e) = self
+            .extras
+            .get_mut(exchange)
+            .and_then(|m| m.get_mut(symbol))
+        {
+            f(e);
+            return;
+        }
+        if self.extras_count >= self.max_symbols {
+            return;
+        }
+        self.extras_count += 1;
+        let mut e = SymbolExtra::default();
+        f(&mut e);
+        self.extras
+            .entry(exchange.to_string())
+            .or_default()
+            .insert(symbol.to_string(), e);
+    }
+
+    /// The value of one condition for a symbol, `None` when it cannot be computed (no reference, a hole or gap
+    /// in the window, no funding data).
+    fn condition_value(
+        c: &Condition,
+        series: &Series,
+        extra: Option<&SymbolExtra>,
+        extra_break: i64,
+        now_ms: i64,
+    ) -> Option<f64> {
+        let window_ms = i64::from(c.window_secs) * 1000;
+        match c.metric {
+            CondMetric::OiChangePct => series.change(window_ms, extra_break).map(|c| c.pct),
+            CondMetric::PriceChangePct => series.mark_change(window_ms, extra_break),
+            CondMetric::FundingRate => extra?.funding,
+            CondMetric::BasisPct => {
+                crate::query::agg::basis_pct(series.last().map(|s| s.mark), extra?.index)
+            }
+            CondMetric::LiqUsd => Some(
+                extra
+                    .map(|e| {
+                        e.liq
+                            .iter()
+                            .filter(|(t, _)| *t > now_ms - window_ms)
+                            .map(|(_, usd)| usd)
+                            .sum()
+                    })
+                    .unwrap_or(0.0),
+            ),
+            CondMetric::Regime => {
+                let price = series.mark_change(window_ms, extra_break)?;
+                let oi = series.change(window_ms, extra_break)?.pct;
+                crate::query::agg::regime_of(price, oi).map(|(r, _)| f64::from(r as i32))
+            }
+        }
+    }
+
+    /// Evaluates every composite rule against every active symbol. A symbol is active when its newest OI sample
+    /// is not older than the hole limit. The conditions are ANDed; the cooldown is per rule, exchange and symbol.
+    fn eval_composites(&mut self, now_ms: i64, out: &mut Output) {
+        let rules = self.rules.load_full();
+        let composites: Vec<&CompiledRule> = rules
+            .rules
+            .iter()
+            .filter(|r| matches!(r.kind, RuleKind::Composite { .. }))
+            .collect();
+        if composites.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let stale_ms = self.limits.hole_ms;
+        for (exchange, by_symbol) in &self.series {
+            let extra_break = self
+                .global_break
+                .max(self.exchange_break.get(exchange).copied().unwrap_or(0));
+            for (symbol, series) in by_symbol {
+                if series.last().is_none_or(|l| now_ms - l.ts > stale_ms) {
+                    continue;
+                }
+                let extra = self.extras.get(exchange).and_then(|m| m.get(symbol));
+                for rule in &composites {
+                    if !rule.matches_scope(exchange, symbol) {
+                        continue;
+                    }
+                    let RuleKind::Composite {
+                        conditions,
+                        severity,
+                    } = &rule.kind
+                    else {
+                        continue;
+                    };
+                    self.stats
+                        .composite_evaluations
+                        .fetch_add(1, Ordering::Relaxed);
+                    let mut values = Vec::with_capacity(conditions.len());
+                    let mut all = true;
+                    for c in conditions {
+                        match Self::condition_value(c, series, extra, extra_break, now_ms) {
+                            Some(v) if c.op != CmpOp::Eq || c.metric == CondMetric::Regime => {
+                                if !c.op.holds(v, c.threshold) {
+                                    all = false;
+                                    break;
+                                }
+                                values.push(v);
+                            }
+                            _ => {
+                                all = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !all {
+                        continue;
+                    }
+                    self.stats.composite_matched.fetch_add(1, Ordering::Relaxed);
+                    if rule.is_quiet(now_ms) {
+                        self.stats
+                            .quiet_suppressed_rule
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let key = format!("{exchange}|{symbol}");
+                    if !self
+                        .cooldowns
+                        .allow(&rule.id, &key, now_ms, rule.cooldown_ms)
+                    {
+                        self.stats
+                            .rule_suppressed_cooldown
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    out.hits.push(Hit {
+                        rule_id: rule.id.clone(),
+                        channels: rule.channels.clone(),
+                        alert: composite_alert(
+                            rule, exchange, symbol, conditions, &values, *severity, now_ms,
+                        ),
+                    });
+                }
+            }
+        }
+        self.stats.composite_pass_ns_max.fetch_max(
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     fn refresh_gauges(&mut self, now_ms: i64) {
@@ -306,6 +511,20 @@ impl Core {
                 bytes += (s.capacity_bytes() + std::mem::size_of::<Series>()) as u64;
             }
         }
+        // Funding and liquidation state of symbols that went quiet is dropped with their buffers.
+        let keep_after = now_ms - self.extras_retention_ms;
+        let mut count = 0;
+        for by_exchange in self.extras.values_mut() {
+            by_exchange.retain(|_, e| {
+                while e.liq.front().is_some_and(|(t, _)| *t < keep_after) {
+                    e.liq.pop_front();
+                }
+                let live = !e.liq.is_empty() || e.funding.is_some() || e.index.is_some();
+                count += usize::from(live);
+                live
+            });
+        }
+        self.extras_count = count;
         self.symbols = series as usize;
         self.stats.series.store(series, Ordering::Relaxed);
         self.stats.samples.store(samples, Ordering::Relaxed);
@@ -343,6 +562,7 @@ mod tests {
                 oi_base: base,
                 oi_usd: Some(base * mark),
                 mark_price: Some(mark),
+                ..OpenInterest::default()
             })),
         }
     }
@@ -412,6 +632,7 @@ mod tests {
             symbols: vec![],
             channels: vec!["tg".into()],
             cooldown_secs: 0,
+            quiet_hours: Vec::new(),
         }
     }
 
@@ -518,6 +739,7 @@ mod tests {
             symbols: vec![],
             channels: vec!["tg".into()],
             cooldown_secs: 30,
+            quiet_hours: Vec::new(),
         };
         let (mut core, _) = core_with(vec![rule]);
         let evs = [
@@ -563,6 +785,7 @@ mod tests {
             symbols: vec![],
             channels: vec!["tg".into()],
             cooldown_secs: 0,
+            quiet_hours: Vec::new(),
         };
         set.store(Arc::new(RuleSet::compile(&[rule])));
         assert_eq!(feed(&mut core, &[e], true).hits.len(), 1);
@@ -584,6 +807,7 @@ mod tests {
             symbols: vec![],
             channels: vec!["tg".into()],
             cooldown_secs: 600,
+            quiet_hours: Vec::new(),
         };
         let sig_only_down = RuleDef {
             id: "down".into(),

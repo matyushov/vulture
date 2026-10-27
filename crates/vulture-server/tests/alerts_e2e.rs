@@ -72,6 +72,7 @@ fn oi(symbol: &str, ts: i64, base: f64) -> Event {
             oi_base: base,
             oi_usd: Some(base * 1000.0),
             mark_price: Some(1000.0),
+            ..OpenInterest::default()
         })),
     }
 }
@@ -107,6 +108,7 @@ fn rules() -> Vec<RuleDef> {
             symbols: vec![],
             channels: vec!["tg".into()],
             cooldown_secs: 0,
+            quiet_hours: Vec::new(),
         },
         RuleDef {
             id: "signals".into(),
@@ -120,6 +122,7 @@ fn rules() -> Vec<RuleDef> {
             symbols: vec![],
             channels: vec!["tg".into()],
             cooldown_secs: 0,
+            quiet_hours: Vec::new(),
         },
     ]
 }
@@ -139,6 +142,7 @@ fn channel() -> ChannelDef {
         min_interval_ms: 0,
         batch_window_ms: 0,
         queue_limit: 0,
+        quiet_hours: Vec::new(),
     }
 }
 
@@ -477,6 +481,7 @@ async fn a_cascade_is_baselined_from_redis_announced_and_summarized_without_floo
                 symbols: vec![],
                 channels: vec!["tg".into()],
                 cooldown_secs: 0,
+                quiet_hours: Vec::new(),
             },
             "e2e",
         )

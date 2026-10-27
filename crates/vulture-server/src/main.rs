@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::io::Read as _;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use vulture_server::app::{self, AppContext};
 use vulture_server::config::Config;
@@ -19,6 +19,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Run the server.
     Run {
@@ -48,6 +49,11 @@ enum Command {
         #[command(subcommand)]
         command: TlsCommand,
     },
+    /// Offline analysis of the stored history (read-only against ClickHouse).
+    Analyze {
+        #[command(subcommand)]
+        command: AnalyzeCommand,
+    },
     /// Ask the running server's metrics endpoint whether it is alive (`/healthz`) or ready (`/readyz`); exit
     /// code 0 means yes. Meant for the container health check.
     Healthcheck {
@@ -57,6 +63,98 @@ enum Command {
         /// Check `/readyz` (Redis reachable and the gRPC listener running) instead of `/healthz`.
         #[arg(long)]
         ready: bool,
+    },
+}
+
+/// Output of the analysis commands.
+#[derive(Args)]
+struct OutputArgs {
+    /// `md` (default), `json`, or `both` (Markdown first, then JSON, separated by a line).
+    #[arg(long, default_value = "md")]
+    format: String,
+    /// Also write `report.md` and `report.json` into this directory.
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+}
+
+/// Settings of the event study shared by both commands.
+#[derive(Args)]
+struct StudyArgs {
+    /// Split the groups by signal strength (info, warning, critical).
+    #[arg(long)]
+    by_strength: bool,
+    /// Return thresholds of the hit rates, percent, comma separated.
+    #[arg(long, default_value = "0.1,0.25,0.5,1")]
+    thresholds: String,
+    /// Market proxy for liquidation cascades: `exchange:symbol`.
+    #[arg(long, default_value = "binance:BTC-USDT-PERP")]
+    market_proxy: String,
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
+enum AnalyzeCommand {
+    /// Event study of the stored signals: forward mark-price returns at +5, +15 and +60 minutes, hit rates and
+    /// the liquidations of the next hour, per signal type, window and exchange. Only `SELECT`s are issued.
+    Signals {
+        /// Path to the TOML configuration file (for `[clickhouse]`).
+        #[arg(long)]
+        config: PathBuf,
+        /// Start: epoch milliseconds, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS]Z` (UTC).
+        #[arg(long)]
+        from: String,
+        /// End (exclusive), same formats.
+        #[arg(long)]
+        to: String,
+        /// Only signals of these exchanges (repeatable).
+        #[arg(long = "exchange")]
+        exchanges: Vec<String>,
+        #[command(flatten)]
+        study: StudyArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Replays a detector (the engine's own core) over stored history with other thresholds and reports the
+    /// signals it would have produced with the same statistics. No Redis, delivery or rule changes are involved.
+    /// `--params` may be repeated to compare threshold sets. oi_spike keys: z_min, min_oi_usd, cooldown_secs,
+    /// extension_factor, min_baseline_points, require_baseline, windows=300+900, threshold_pct.<secs>,
+    /// min_change_usd.<secs>. liq_cascade keys: k_mad, floor_usd, floor_usd_exchange, min_count, quiet_secs,
+    /// end_ratio, min_baseline_minutes, baseline_secs, top_symbols, per_exchange.
+    Replay {
+        /// Path to the TOML configuration file (for `[clickhouse]` and the `[alerts]` defaults).
+        #[arg(long)]
+        config: PathBuf,
+        /// `oi_spike` or `liq_cascade`.
+        #[arg(long)]
+        detector: String,
+        /// Parameters as `key=value,key=value` (repeatable; none = the configured defaults).
+        #[arg(long = "params")]
+        params: Vec<String>,
+        /// Start of the period (signals before it are not reported).
+        #[arg(long)]
+        from: String,
+        /// End of the period (exclusive).
+        #[arg(long)]
+        to: String,
+        /// State-only run before `--from`, seconds (the live engine warms up with 4 hours).
+        #[arg(long, default_value_t = 14_400)]
+        warmup_secs: u64,
+        /// Length of one read from ClickHouse, seconds.
+        #[arg(long, default_value_t = 1_200)]
+        chunk_secs: u64,
+        /// Only these exchanges (repeatable).
+        #[arg(long = "exchange")]
+        exchanges: Vec<String>,
+        /// Only these normalized symbols (repeatable).
+        #[arg(long = "symbol")]
+        symbols: Vec<String>,
+        /// Signals listed per case in the Markdown.
+        #[arg(long, default_value_t = 50)]
+        list_max: usize,
+        #[command(flatten)]
+        study: StudyArgs,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
@@ -125,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
             command: TlsCommand::Check { config },
         } => tls_check(config),
         Command::Healthcheck { config, ready } => healthcheck(config, ready).await,
+        Command::Analyze { command } => analyze(command).await,
     }
 }
 
@@ -338,4 +437,124 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     let ctx = AppContext::from_config(config, shutdown)?;
     app::run(ctx).await?;
     Ok(())
+}
+
+fn study_config(a: &StudyArgs) -> anyhow::Result<vulture_server::analyze::study::StudyConfig> {
+    let thresholds = a
+        .thresholds
+        .split(',')
+        .map(|t| t.trim().parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("--thresholds must be numbers separated by commas")?;
+    anyhow::ensure!(
+        !thresholds.is_empty() && thresholds.iter().all(|t| t.is_finite() && *t >= 0.0),
+        "--thresholds must be non-negative numbers"
+    );
+    let (exchange, symbol) = a
+        .market_proxy
+        .split_once(':')
+        .context("--market-proxy must be exchange:symbol")?;
+    Ok(vulture_server::analyze::study::StudyConfig {
+        thresholds_pct: thresholds,
+        by_strength: a.by_strength,
+        proxy: (exchange.to_string(), symbol.to_string()),
+        ..Default::default()
+    })
+}
+
+fn emit(rendered: &vulture_server::analyze::cli::Rendered, out: &OutputArgs) -> anyhow::Result<()> {
+    if let Some(dir) = &out.out_dir {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        std::fs::write(dir.join("report.md"), &rendered.markdown)?;
+        std::fs::write(dir.join("report.json"), &rendered.json)?;
+    }
+    match out.format.as_str() {
+        "md" => println!("{}", rendered.markdown),
+        "json" => println!("{}", rendered.json),
+        "both" => println!("{}\n---\n{}", rendered.markdown, rendered.json),
+        other => anyhow::bail!("--format must be md, json or both, not {other:?}"),
+    }
+    Ok(())
+}
+
+async fn analyze(command: AnalyzeCommand) -> anyhow::Result<()> {
+    use vulture_server::analyze::{cli, params::Detector, parse_time};
+    use vulture_server::history::build_client;
+    use vulture_server::query::cold::Scope;
+    let load = |path: &PathBuf| -> anyhow::Result<(Config, std::sync::Arc<vulture_server::history::ChClient>)> {
+        let config = Config::load(path)?;
+        let ch = config
+            .clickhouse
+            .as_ref()
+            .context("no [clickhouse] section in the configuration")?;
+        let client = std::sync::Arc::new(build_client(ch)?);
+        Ok((config, client))
+    };
+    match command {
+        AnalyzeCommand::Signals {
+            config,
+            from,
+            to,
+            exchanges,
+            study,
+            output,
+        } => {
+            let (_, client) = load(&config)?;
+            let (from, to) = (
+                parse_time(&from).map_err(anyhow::Error::msg)?,
+                parse_time(&to).map_err(anyhow::Error::msg)?,
+            );
+            anyhow::ensure!(from < to, "--from must be before --to");
+            let opts = cli::SignalsOpts {
+                from,
+                to,
+                exchanges,
+                study: study_config(&study)?,
+            };
+            let rendered = cli::signals_on_clickhouse(client, &opts)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            emit(&rendered, &output)
+        }
+        AnalyzeCommand::Replay {
+            config,
+            detector,
+            params,
+            from,
+            to,
+            warmup_secs,
+            chunk_secs,
+            exchanges,
+            symbols,
+            list_max,
+            study,
+            output,
+        } => {
+            let (cfg, client) = load(&config)?;
+            let (from, to) = (
+                parse_time(&from).map_err(anyhow::Error::msg)?,
+                parse_time(&to).map_err(anyhow::Error::msg)?,
+            );
+            anyhow::ensure!(from < to, "--from must be before --to");
+            let opts = cli::ReplayOpts {
+                detector: Detector::parse(&detector).map_err(anyhow::Error::msg)?,
+                params,
+                from,
+                to,
+                warmup_secs,
+                chunk_secs,
+                scope: Scope {
+                    exchanges,
+                    symbols,
+                    base_assets: vec![],
+                },
+                list_max,
+                study: study_config(&study)?,
+            };
+            let result = cli::replay_on_clickhouse(client, &cfg.alerts, &opts)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            emit(&result.rendered, &output)
+        }
+    }
 }

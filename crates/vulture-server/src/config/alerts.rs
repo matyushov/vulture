@@ -24,6 +24,9 @@ pub struct AlertsConfig {
     pub series_max_samples: usize,
     /// Samples closer than this to the previous one are ignored, seconds.
     pub sample_spacing_secs: u64,
+    /// How often composite rules are evaluated, seconds. Each pass looks at every symbol with a recent sample
+    /// against every composite rule in scope (a few microseconds per pair); 10 s keeps that negligible.
+    pub composite_eval_secs: u64,
     /// A pause longer than this between two samples of a symbol is a hole: windows spanning it are skipped,
     /// seconds. Without it a symbol that was untracked for a while would show a false jump when it returns.
     pub hole_secs: u64,
@@ -33,6 +36,8 @@ pub struct AlertsConfig {
     pub liq_cascade: CascadeConfig,
     /// Delivery to Telegram and Discord.
     pub delivery: DeliveryConfig,
+    /// The daily digest.
+    pub digest: DigestConfig,
     /// Default channels: they seed `<data_dir>/alerts.json` while that file does not exist. Once it exists it is
     /// authoritative and these entries are ignored.
     pub channels: Vec<ChannelDef>,
@@ -50,9 +55,11 @@ impl Default for AlertsConfig {
             series_max_samples: 1024,
             sample_spacing_secs: 15,
             hole_secs: 300,
+            composite_eval_secs: 10,
             oi_spike: OiSpikeConfig::default(),
             liq_cascade: CascadeConfig::default(),
             delivery: DeliveryConfig::default(),
+            digest: DigestConfig::default(),
             channels: Vec::new(),
             rules: Vec::new(),
         }
@@ -228,6 +235,83 @@ impl Default for DeliveryConfig {
     }
 }
 
+/// The sections the daily digest can contain, in the order they appear.
+pub const DIGEST_SECTIONS: [&str; 6] = [
+    "oi_movers",
+    "liquidations",
+    "skew",
+    "cascades",
+    "funding",
+    "gaps",
+];
+
+/// `[alerts.digest]`: one summary message a day, built from the History aggregate code.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DigestConfig {
+    /// Sends the digest every day at `time_utc`. `Control.SendDigestNow` works whatever this says.
+    pub enabled: bool,
+    /// Time of day, UTC, `HH:MM`.
+    pub time_utc: String,
+    /// Channel ids that receive it; empty means every enabled channel that is not a system channel.
+    pub channels: Vec<String>,
+    /// Sections, in the order of [`DIGEST_SECTIONS`] whatever order is given here: `oi_movers` (top OI growth and
+    /// decline over 24 h), `liquidations` (the largest), `skew` (long versus short liquidations per exchange),
+    /// `cascades` (number and size), `funding` (extremes, when funding data exists), `gaps` (data gaps of the day).
+    pub sections: Vec<String>,
+    /// Entries per list.
+    pub top_n: u32,
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            time_utc: "07:00".into(),
+            channels: Vec::new(),
+            sections: DIGEST_SECTIONS.iter().map(|s| (*s).to_string()).collect(),
+            top_n: 5,
+        }
+    }
+}
+
+impl DigestConfig {
+    /// Seconds after midnight UTC of `time_utc`, if it is a valid `HH:MM`.
+    pub fn time_of_day_secs(&self) -> Option<u32> {
+        let (h, m) = self.time_utc.split_once(':')?;
+        let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+        (h < 24 && m < 60 && self.time_utc.len() == 5).then_some(h * 3600 + m * 60)
+    }
+
+    /// Adds every problem to `problems`.
+    pub fn validate(&self, problems: &mut Vec<String>) {
+        if self.time_of_day_secs().is_none() {
+            problems.push(format!(
+                "alerts.digest.time_utc: {:?} is not HH:MM (24 hour, UTC)",
+                self.time_utc
+            ));
+        }
+        for s in &self.sections {
+            if !DIGEST_SECTIONS.contains(&s.as_str()) {
+                problems.push(format!(
+                    "alerts.digest.sections: {s:?} is not one of {}",
+                    DIGEST_SECTIONS.join(", ")
+                ));
+            }
+        }
+        if !(1..=20).contains(&self.top_n) {
+            problems.push("alerts.digest.top_n must be between 1 and 20".into());
+        }
+        for c in &self.channels {
+            if !crate::alerts::model::valid_id(c) {
+                problems.push(format!(
+                    "alerts.digest.channels: {c:?} is not a valid channel id"
+                ));
+            }
+        }
+    }
+}
+
 impl AlertsConfig {
     /// Adds every problem to `problems`.
     pub fn validate(&self, problems: &mut Vec<String>) {
@@ -249,6 +333,10 @@ impl AlertsConfig {
         check(
             "sample_spacing_secs must be greater than 0",
             self.sample_spacing_secs > 0,
+        );
+        check(
+            "composite_eval_secs must be between 1 and 300",
+            (1..=300).contains(&self.composite_eval_secs),
         );
         check(
             "hole_secs must be greater than sample_spacing_secs",
@@ -350,5 +438,6 @@ impl AlertsConfig {
             "delivery.*_max_per_minute must be greater than 0",
             d.telegram_max_per_minute > 0 && d.discord_max_per_minute > 0,
         );
+        self.digest.validate(problems);
     }
 }

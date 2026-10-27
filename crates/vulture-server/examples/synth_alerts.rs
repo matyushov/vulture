@@ -115,6 +115,7 @@ impl Gen {
                 oi_base: base,
                 oi_usd: Some(base * 1000.0),
                 mark_price: Some(1000.0),
+                ..OpenInterest::default()
             })),
         }
     }

@@ -12,7 +12,7 @@ use vulture_proto::v1::{
 use super::agg::{FineData, GapRec, LiqBin, OiBin, Stamped};
 use super::cold::{
     ColdStore, EventCursor, EventKey, EventQuery, FineAnswer, FineQuery, GapQuery, Kind,
-    MoverAnswer, MoverInput, MoverQuery,
+    MoverAnswer, MoverInput, MoverQuery, TopLiqQuery,
 };
 use super::event::event_key;
 use super::sql;
@@ -83,7 +83,7 @@ fn uint(v: &Value, key: &str) -> u64 {
 
 // ---------------------------------------------------------------- events
 
-fn decode_event(kind: Kind, v: &Value) -> Event {
+pub(crate) fn decode_event(kind: Kind, v: &Value) -> Event {
     let id = text(v, "event_id");
     let payload = match kind {
         Kind::Liquidation => Payload::Liquidation(Liquidation {
@@ -110,6 +110,9 @@ fn decode_event(kind: Kind, v: &Value) -> Event {
             oi_base: num(v, "oi_base"),
             oi_usd: opt_num(v, "oi_usd"),
             mark_price: opt_num(v, "mark_price"),
+            funding_rate: opt_num(v, "funding_rate"),
+            index_price: opt_num(v, "index_price"),
+            next_funding_ts: v["nf_ms"].as_i64(),
         }),
         Kind::Gap => Payload::Gap(Gap {
             exchange: text(v, "exchange"),
@@ -258,6 +261,26 @@ fn decode_oi_cells(rows: &[Value], data: &mut FineData) {
             } else {
                 None
             },
+            funding_last: (uint(r, "f_n") > 0).then(|| Stamped {
+                ts: int(r, "f_ts"),
+                v: num(r, "f_last"),
+            }),
+            funding_sum: if r.get("f_n").is_some() {
+                num(r, "f_sum")
+            } else {
+                0.0
+            },
+            funding_n: uint(r, "f_n"),
+            basis_last: (uint(r, "b_n") > 0).then(|| Stamped {
+                ts: int(r, "b_ts"),
+                v: num(r, "b_last"),
+            }),
+            basis_sum: if r.get("b_n").is_some() {
+                num(r, "b_sum")
+            } else {
+                0.0
+            },
+            basis_n: uint(r, "b_n"),
         };
         data.oi
             .entry((text(r, "exchange"), text(r, "symbol")))
@@ -311,6 +334,20 @@ fn decode_mover(r: &Value) -> Option<MoverInput> {
 // ---------------------------------------------------------------- the trait
 
 impl ColdStore for ChCold {
+    fn top_liquidations(&self, q: TopLiqQuery) -> BoxFuture<'_, Result<Vec<Event>, ChError>> {
+        Box::pin(async move {
+            let st = settings(q.max_memory, q.timeout);
+            let (rows, _) = self
+                .client
+                .query_rows_with(&sql::top_liquidations(&q), &st)
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| decode_event(Kind::Liquidation, r))
+                .collect())
+        })
+    }
+
     fn events(&self, q: EventQuery) -> BoxFuture<'_, Result<Box<dyn EventCursor>, ChError>> {
         Box::pin(async move {
             let st = settings(q.max_memory, q.timeout);

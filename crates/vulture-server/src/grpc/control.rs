@@ -19,9 +19,10 @@ use tonic::{Request, Response, Status};
 use vulture_proto::v1::*;
 
 use crate::alerts::model::{
-    ChannelDef, ChannelKind, LiqSide, RuleDef, RuleKind, Severity, SignalKind,
+    ChannelDef, ChannelKind, CmpOp, CondMetric, Condition, LiqSide, QuietRange, RuleDef, RuleKind,
+    Severity, SignalKind,
 };
-use crate::alerts::{AlertsError, AlertsManager};
+use crate::alerts::{AlertsError, AlertsManager, DigestError, DigestService};
 use crate::symbols::{Mode, PolicyView, SetError, SymbolManager, SymbolPolicy};
 
 const NOT_YET: &str = "this Control RPC is not implemented yet (epic V4)";
@@ -32,6 +33,7 @@ const NO_OVERRIDES: &str = "per-symbol OI interval overrides (oi_intervals) are 
 pub struct ControlService {
     symbols: Option<Arc<SymbolManager>>,
     alerts: Option<Arc<AlertsManager>>,
+    digest: Option<Arc<DigestService>>,
 }
 
 impl ControlService {
@@ -40,7 +42,14 @@ impl ControlService {
         Self {
             symbols,
             alerts: None,
+            digest: None,
         }
+    }
+
+    /// Adds the daily digest backend (`SendDigestNow`).
+    pub fn with_digest(mut self, digest: Option<Arc<DigestService>>) -> Self {
+        self.digest = digest;
+        self
     }
 
     /// Adds the rules and channels backend.
@@ -235,6 +244,52 @@ fn rule_from_proto(rule: Rule) -> Result<RuleDef, Status> {
                 min_severity,
             }
         }
+        Some(rule::Kind::Composite(c)) => {
+            let mut conditions = Vec::new();
+            for (i, cond) in c.conditions.into_iter().enumerate() {
+                let metric = match CompositeMetric::try_from(cond.metric) {
+                    Ok(CompositeMetric::OiChangePct) => CondMetric::OiChangePct,
+                    Ok(CompositeMetric::PriceChangePct) => CondMetric::PriceChangePct,
+                    Ok(CompositeMetric::FundingRate) => CondMetric::FundingRate,
+                    Ok(CompositeMetric::BasisPct) => CondMetric::BasisPct,
+                    Ok(CompositeMetric::LiqUsd) => CondMetric::LiqUsd,
+                    Ok(CompositeMetric::Regime) => CondMetric::Regime,
+                    _ => {
+                        return Err(Status::invalid_argument(format!(
+                            "composite.conditions[{i}].metric is required"
+                        )));
+                    }
+                };
+                let op = match CompareOp::try_from(cond.op) {
+                    Ok(CompareOp::Gt) => CmpOp::Gt,
+                    Ok(CompareOp::Ge) => CmpOp::Ge,
+                    Ok(CompareOp::Lt) => CmpOp::Lt,
+                    Ok(CompareOp::Le) => CmpOp::Le,
+                    Ok(CompareOp::Eq) => CmpOp::Eq,
+                    _ => {
+                        return Err(Status::invalid_argument(format!(
+                            "composite.conditions[{i}].op is required"
+                        )));
+                    }
+                };
+                conditions.push(Condition {
+                    metric,
+                    op,
+                    threshold: cond.threshold,
+                    window_secs: cond.window_seconds,
+                });
+            }
+            let severity = match vulture_proto::v1::Severity::try_from(c.severity) {
+                Ok(vulture_proto::v1::Severity::Warning) => Severity::Warning,
+                Ok(vulture_proto::v1::Severity::Critical) => Severity::Critical,
+                Ok(_) => Severity::Info,
+                Err(_) => return Err(Status::invalid_argument("composite.severity is unknown")),
+            };
+            RuleKind::Composite {
+                conditions,
+                severity,
+            }
+        }
         Some(rule::Kind::Gap(_)) => {
             return Err(Status::unimplemented(
                 "gap rules belong to the system alerts (epic V4-5) and are not implemented yet",
@@ -251,11 +306,70 @@ fn rule_from_proto(rule: Rule) -> Result<RuleDef, Status> {
         symbols: rule.symbols,
         channels: rule.channel_ids,
         cooldown_secs: rule.cooldown_seconds,
+        quiet_hours: quiet_from_proto(&rule.quiet_hours)?,
     })
+}
+
+fn quiet_from_proto(ranges: &[vulture_proto::v1::QuietRange]) -> Result<Vec<QuietRange>, Status> {
+    ranges
+        .iter()
+        .map(|r| {
+            Ok(QuietRange {
+                start_minute: u16::try_from(r.start_minute).map_err(|_| {
+                    Status::invalid_argument("quiet_hours: start_minute is out of range")
+                })?,
+                end_minute: u16::try_from(r.end_minute).map_err(|_| {
+                    Status::invalid_argument("quiet_hours: end_minute is out of range")
+                })?,
+            })
+        })
+        .collect()
+}
+
+fn quiet_to_proto(ranges: &[QuietRange]) -> Vec<vulture_proto::v1::QuietRange> {
+    ranges
+        .iter()
+        .map(|r| vulture_proto::v1::QuietRange {
+            start_minute: u32::from(r.start_minute),
+            end_minute: u32::from(r.end_minute),
+        })
+        .collect()
 }
 
 fn rule_to_proto(rule: &RuleDef) -> Rule {
     let kind = match &rule.kind {
+        RuleKind::Composite {
+            conditions,
+            severity,
+        } => rule::Kind::Composite(CompositeRule {
+            conditions: conditions
+                .iter()
+                .map(|c| CompositeCondition {
+                    metric: match c.metric {
+                        CondMetric::OiChangePct => CompositeMetric::OiChangePct,
+                        CondMetric::PriceChangePct => CompositeMetric::PriceChangePct,
+                        CondMetric::FundingRate => CompositeMetric::FundingRate,
+                        CondMetric::BasisPct => CompositeMetric::BasisPct,
+                        CondMetric::LiqUsd => CompositeMetric::LiqUsd,
+                        CondMetric::Regime => CompositeMetric::Regime,
+                    } as i32,
+                    op: match c.op {
+                        CmpOp::Gt => CompareOp::Gt,
+                        CmpOp::Ge => CompareOp::Ge,
+                        CmpOp::Lt => CompareOp::Lt,
+                        CmpOp::Le => CompareOp::Le,
+                        CmpOp::Eq => CompareOp::Eq,
+                    } as i32,
+                    threshold: c.threshold,
+                    window_seconds: c.window_secs,
+                })
+                .collect(),
+            severity: match severity {
+                Severity::Info => vulture_proto::v1::Severity::Info,
+                Severity::Warning => vulture_proto::v1::Severity::Warning,
+                Severity::Critical => vulture_proto::v1::Severity::Critical,
+            } as i32,
+        }),
         RuleKind::Liquidation {
             min_notional_usd,
             sides,
@@ -308,6 +422,7 @@ fn rule_to_proto(rule: &RuleDef) -> Rule {
         symbols: rule.symbols.clone(),
         channel_ids: rule.channels.clone(),
         cooldown_seconds: rule.cooldown_secs,
+        quiet_hours: quiet_to_proto(&rule.quiet_hours),
     }
 }
 
@@ -335,6 +450,7 @@ fn channel_from_proto(c: vulture_proto::v1::Channel) -> Result<ChannelDef, Statu
         min_interval_ms: c.min_interval_ms,
         batch_window_ms: c.batch_window_ms,
         queue_limit: c.queue_limit,
+        quiet_hours: quiet_from_proto(&c.quiet_hours)?,
     })
 }
 
@@ -356,6 +472,7 @@ fn channel_to_proto(c: &ChannelDef, mask: String) -> vulture_proto::v1::Channel 
         min_interval_ms: c.min_interval_ms,
         batch_window_ms: c.batch_window_ms,
         queue_limit: c.queue_limit,
+        quiet_hours: quiet_to_proto(&c.quiet_hours),
     }
 }
 
@@ -441,6 +558,34 @@ impl ControlService {
         Ok(Response::new(DeleteChannelResponse {}))
     }
 
+    async fn digest_now(
+        &self,
+        request: Request<SendDigestNowRequest>,
+    ) -> Result<Response<SendDigestNowResponse>, Status> {
+        let digest = self
+            .digest
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented(NOT_YET))?;
+        let req = request.into_inner();
+        let out = digest
+            .send_now(
+                &req.channel_ids,
+                &req.sections,
+                (req.top_n > 0).then_some(req.top_n),
+            )
+            .await
+            .map_err(|e| match e {
+                DigestError::Invalid(m) => Status::invalid_argument(m),
+                DigestError::NoChannel(m) => Status::failed_precondition(m),
+            })?;
+        Ok(Response::new(SendDigestNowResponse {
+            queued_channel_ids: out.queued,
+            preview: out.preview,
+            build_ms: out.build_ms.min(u64::from(u32::MAX)) as u32,
+            unavailable_sections: out.unavailable,
+        }))
+    }
+
     async fn test_message(
         &self,
         request: Request<SendTestMessageRequest>,
@@ -517,6 +662,13 @@ macro_rules! control_impl {
                 request: Request<DeleteChannelRequest>,
             ) -> Result<Response<DeleteChannelResponse>, Status> {
                 self.channel_delete(request).await
+            }
+
+            async fn send_digest_now(
+                &self,
+                request: Request<SendDigestNowRequest>,
+            ) -> Result<Response<SendDigestNowResponse>, Status> {
+                self.digest_now(request).await
             }
 
             async fn send_test_message(

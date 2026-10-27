@@ -73,6 +73,14 @@ message OpenInterest {
   // Mark price at the time of the snapshot, if known.
   optional double mark_price = 8;
   reserved 9 to 15;
+  // Added in v0.6, from data the connectors already receive (no extra requests, no higher sampling rate); absent
+  // when the exchange did not supply it. Basis is derived by clients and queries: mark_price - index_price.
+  // Funding rate of the current interval as a fraction (0.0001 = 0.01%).
+  optional double funding_rate = 16;
+  // Index price per real coin, like mark_price.
+  optional double index_price = 17;
+  // Time of the next funding settlement, ms.
+  optional int64 next_funding_ts = 18;
 }
 
 // Source interruption: data in the interval [from_ts, to_ts] is incomplete.

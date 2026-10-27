@@ -15,10 +15,17 @@ pub enum Method {
     Aggregate,
     /// `History.Aggregate` with `oi_movers`.
     Movers,
+    /// `History.Seasonality`.
+    Seasonality,
 }
 
 impl Method {
-    const ALL: [Method; 3] = [Method::Query, Method::Aggregate, Method::Movers];
+    const ALL: [Method; 4] = [
+        Method::Query,
+        Method::Aggregate,
+        Method::Movers,
+        Method::Seasonality,
+    ];
 
     fn idx(self) -> usize {
         self as usize
@@ -29,6 +36,7 @@ impl Method {
             Method::Query => "query",
             Method::Aggregate => "aggregate",
             Method::Movers => "movers",
+            Method::Seasonality => "seasonality",
         }
     }
 }
@@ -79,9 +87,9 @@ pub enum Reject {
 /// Shared counters.
 #[derive(Debug, Default)]
 pub struct HistoryStats {
-    requests: [[AtomicU64; 8]; 3],
-    nanos: [AtomicU64; 3],
-    nanos_max: [AtomicU64; 3],
+    requests: [[AtomicU64; 8]; 4],
+    nanos: [AtomicU64; 4],
+    nanos_max: [AtomicU64; 4],
     rows_scanned_ch: AtomicU64,
     rows_scanned_redis: AtomicU64,
     events_returned: AtomicU64,

@@ -663,6 +663,9 @@ impl Sampler {
             oi_usd: values.oi_usd,
             // Per real coin, so that oi_base * mark_price == oi_usd.
             mark_price: t.mark_price.map(|m| m / entry.multiplier),
+            funding_rate: t.funding_rate,
+            index_price: t.index_price.map(|i| i / entry.multiplier),
+            next_funding_ts: t.next_funding_ts,
         };
         let sent = self
             .sink

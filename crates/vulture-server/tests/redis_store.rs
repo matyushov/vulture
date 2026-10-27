@@ -109,6 +109,7 @@ fn oi(ts: i64, n: usize) -> Event {
             oi_base: 91_959.654 + n as f64,
             oi_usd: Some(5_912_345_678.25 + n as f64),
             mark_price: Some(64_295.1),
+            ..OpenInterest::default()
         })),
     }
 }

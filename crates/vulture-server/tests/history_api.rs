@@ -185,6 +185,16 @@ async fn a_client_deadline_stops_the_work() {
 struct SlowCold(MemoryCold, Duration);
 
 impl ColdStore for SlowCold {
+    fn top_liquidations(
+        &self,
+        q: vulture_server::query::cold::TopLiqQuery,
+    ) -> futures_util::future::BoxFuture<
+        '_,
+        Result<Vec<vulture_proto::v1::Event>, vulture_server::history::ChError>,
+    > {
+        self.0.top_liquidations(q)
+    }
+
     fn events(
         &self,
         q: vulture_server::query::cold::EventQuery,

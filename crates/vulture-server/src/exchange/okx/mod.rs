@@ -18,10 +18,13 @@
 //! - Open interest: `oi` (contracts), `oiCcy` (base coin) and `oiUsd` are kept per instrument next to the last
 //!   `mark-price`; an interval sampler emits one `OpenInterest` per tracked instrument per
 //!   `oi_poll_interval_secs`, spread over the interval. Never one event per push.
+//! - Funding rate and index price: slow REST polls ([`funding`]), not WebSocket channels: the two extra channels per
+//!   instrument would push the topics per connection past 2000 and spend the hourly subscription budget.
 //! - `Gap` events (streams `liquidations` and `open_interest`) when a connection recovers after a loss.
 //!   Changing the tracked set never produces a `Gap`.
 
 mod budget;
+mod funding;
 mod info;
 mod metrics;
 mod state;
@@ -42,8 +45,12 @@ use tokio_util::sync::CancellationToken;
 use vulture_proto::v1::{Event, Gap, OpenInterest, event::Payload};
 
 pub use budget::{RequestBudget, requests_for};
+pub use funding::{
+    FUNDING_RATE_ALL_PATH, FundingRecord, INDEX_TICKERS_USDC_PATH, INDEX_TICKERS_USDT_PATH,
+    funding_rate_path, index_id_of, parse_funding_rates, parse_index_tickers,
+};
 pub use info::INSTRUMENTS_PATH;
-pub use state::{OiState, Quote, Quotes};
+pub use state::{FundingState, IndexState, OiState, Quote, Quotes};
 pub use status::OkxStatus;
 pub use stream::{
     DEFAULT_ARGS_PER_REQUEST, LIQUIDATION_CHANNEL, Liq, MARK_PRICE_CHANNEL, MarkUpdate,
@@ -140,6 +147,11 @@ pub struct OkxTuning {
     pub request_budget: usize,
     /// Length of the request budget window.
     pub request_window: Duration,
+    /// How often funding rates and index prices are fetched over REST. A value older than three intervals is not
+    /// attached to open interest samples.
+    pub funding_poll_interval: Duration,
+    /// Least spacing between the per-instrument funding requests of the fallback.
+    pub funding_min_spacing: Duration,
 }
 
 impl Default for OkxTuning {
@@ -166,6 +178,8 @@ impl Default for OkxTuning {
             settle: Duration::from_secs(2),
             request_budget: 240,
             request_window: Duration::from_secs(3600),
+            funding_poll_interval: Duration::from_secs(300),
+            funding_min_spacing: Duration::from_millis(500),
         }
     }
 }
@@ -285,10 +299,25 @@ impl OkxConnector {
                 clock: self.clock.clone(),
                 interval: Duration::from_secs(self.cfg.oi_poll_interval_secs.max(1)),
                 first_data_wait: self.tuning.first_data_wait,
+                funding_max_age: self.tuning.funding_poll_interval.saturating_mul(3),
                 table: table_rx.clone(),
                 policy: self.symbols.subscribe_policy(),
                 sink: sink.clone(),
                 sink_closed: sink_closed.clone(),
+                shutdown: stop.clone(),
+            }
+            .run(),
+        );
+
+        tasks.spawn(
+            funding::FundingPoller {
+                http: self.http.clone(),
+                status: status.clone(),
+                quotes: quotes.clone(),
+                clock: self.clock.clone(),
+                tuning: self.tuning.clone(),
+                table: table_rx.clone(),
+                policy: self.symbols.subscribe_policy(),
                 shutdown: stop.clone(),
             }
             .run(),
@@ -691,6 +720,7 @@ struct Sampler {
     clock: Arc<dyn Clock>,
     interval: Duration,
     first_data_wait: Duration,
+    funding_max_age: Duration,
     table: watch::Receiver<Option<Arc<OkxTable>>>,
     policy: watch::Receiver<Arc<SymbolPolicy>>,
     sink: mpsc::Sender<Event>,
@@ -785,6 +815,10 @@ impl Sampler {
             }
         };
         let m = entry.symbol.multiplier;
+        let now = self.clock.now_ms();
+        let max_age = self.funding_max_age.as_millis() as i64;
+        let funding = self.quotes.funding(raw, now, max_age);
+        let index = funding::index_id_of(raw).and_then(|id| self.quotes.index(id, now, max_age));
         let event = OpenInterest {
             exchange: NAME.into(),
             symbol_raw: raw.to_string(),
@@ -795,6 +829,10 @@ impl Sampler {
             oi_usd: values.oi_usd,
             // Per real coin, so that oi_base * mark_price == oi_usd.
             mark_price: quote.mark.map(|p| p / m),
+            funding_rate: funding.map(|f| f.rate),
+            // Per real coin like the mark price; the funding rate is a fraction.
+            index_price: index.map(|i| i.price / m),
+            next_funding_ts: funding.and_then(|f| f.next_ts),
         };
         let sent = self
             .sink

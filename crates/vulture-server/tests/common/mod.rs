@@ -231,6 +231,7 @@ pub fn oi(exchange: &str, symbol: &str, ts: i64) -> Event {
             oi_base: 1000.0 + ts as f64,
             oi_usd: Some(2.0e6),
             mark_price: Some(2000.0),
+            ..OpenInterest::default()
         })),
     }
 }
@@ -342,7 +343,7 @@ impl Server {
         symbols: Option<Arc<vulture_server::symbols::SymbolManager>>,
         alerts: Option<Arc<vulture_server::alerts::AlertsManager>>,
     ) -> Self {
-        Self::start_inner(backend, stream, limiter, symbols, alerts, None).await
+        Self::start_inner(backend, stream, limiter, symbols, alerts, None, None).await
     }
 
     /// Like `start_with`, with a `History` backend.
@@ -357,6 +358,26 @@ impl Server {
             None,
             None,
             Some(history),
+            None,
+        )
+        .await
+    }
+
+    /// Like `start_all`, with a `History` backend and the digest backend of `Control`.
+    pub async fn start_digest(
+        backend: &Backend,
+        alerts: Arc<vulture_server::alerts::AlertsManager>,
+        history: Arc<vulture_server::query::HistoryService>,
+        digest: Arc<vulture_server::alerts::DigestService>,
+    ) -> Self {
+        Self::start_inner(
+            backend,
+            test_stream_config(),
+            LimiterConfig::default(),
+            None,
+            Some(alerts),
+            Some(history),
+            Some(digest),
         )
         .await
     }
@@ -368,6 +389,7 @@ impl Server {
         symbols: Option<Arc<vulture_server::symbols::SymbolManager>>,
         alerts: Option<Arc<vulture_server::alerts::AlertsManager>>,
         history: Option<Arc<vulture_server::query::HistoryService>>,
+        digest: Option<Arc<vulture_server::alerts::DigestService>>,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let token_store = TokenStore::new(dir.path());
@@ -391,6 +413,7 @@ impl Server {
             symbols,
             alerts,
             history,
+            digest,
         };
         let task = tokio::spawn({
             let (store, authority, stats, auth_stats, shutdown) = (

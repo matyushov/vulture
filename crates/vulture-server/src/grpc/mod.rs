@@ -129,6 +129,8 @@ pub struct ServeOptions {
     pub alerts: Option<Arc<AlertsManager>>,
     /// Backend of `History`; without it the service answers `UNIMPLEMENTED`.
     pub history: Option<Arc<crate::query::HistoryService>>,
+    /// Backend of `Control.SendDigestNow`.
+    pub digest: Option<Arc<crate::alerts::DigestService>>,
 }
 
 impl ServeOptions {
@@ -142,6 +144,7 @@ impl ServeOptions {
             symbols: None,
             alerts: None,
             history: None,
+            digest: None,
         }
     }
 }
@@ -229,7 +232,9 @@ where
             None => HistoryBackend::Stub(HistoryStub),
         }))
         .add_service(ControlServer::new(
-            ControlService::new(options.symbols.clone()).with_alerts(options.alerts.clone()),
+            ControlService::new(options.symbols.clone())
+                .with_alerts(options.alerts.clone())
+                .with_digest(options.digest.clone()),
         ))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
         .await?;
@@ -272,6 +277,7 @@ pub async fn start(
     symbols: Option<Arc<SymbolManager>>,
     alerts: Option<Arc<AlertsManager>>,
     history: Option<Arc<crate::query::HistoryService>>,
+    digest: Option<Arc<crate::alerts::DigestService>>,
     shutdown: CancellationToken,
 ) -> Result<GrpcHandle, GrpcError> {
     let tls_enabled = tls.is_some();
@@ -302,6 +308,7 @@ pub async fn start(
         options.symbols = symbols;
         options.alerts = alerts;
         options.history = history;
+        options.digest = digest;
         async move {
             let result = match tls {
                 Some(tls) => {

@@ -40,6 +40,9 @@ mod tests {
             oi_base: 1_000.0,
             oi_usd: Some(2_000_000.0),
             mark_price: Some(2_000.0),
+            funding_rate: None,
+            index_price: None,
+            next_funding_ts: None,
         }
     }
 
@@ -125,6 +128,14 @@ mod tests {
                 ],
                 partial: true,
                 bucket_end: 1_700_000_060_000,
+                divergence: Some(Divergence {
+                    rising_exchange: "binance".into(),
+                    rising_pct: 2.0,
+                    falling_exchange: "okx".into(),
+                    falling_pct: -1.0,
+                    spread_pct: 3.0,
+                    exchanges: 2,
+                }),
             }],
             partial: true,
             oi_movers: None,
@@ -203,6 +214,10 @@ mod tests {
                 symbols: vec![],
                 channel_ids: vec!["tg".into()],
                 cooldown_seconds: 30,
+                quiet_hours: vec![QuietRange {
+                    start_minute: 1320,
+                    end_minute: 360,
+                }],
             }),
         });
         round_trip(&UpsertChannelRequest {
@@ -220,6 +235,10 @@ mod tests {
                 min_interval_ms: 1000,
                 batch_window_ms: 2000,
                 queue_limit: 100,
+                quiet_hours: vec![QuietRange {
+                    start_minute: 0,
+                    end_minute: 60,
+                }],
             }),
             secret: "x".into(),
         });
@@ -236,7 +255,42 @@ mod tests {
                 symbols: vec![],
                 channel_ids: vec![],
                 cooldown_seconds: 0,
+                quiet_hours: vec![],
             }),
+        });
+        round_trip(&UpsertRuleRequest {
+            rule: Some(Rule {
+                id: "c".into(),
+                name: "composite".into(),
+                enabled: true,
+                kind: Some(rule::Kind::Composite(CompositeRule {
+                    conditions: vec![
+                        CompositeCondition {
+                            metric: CompositeMetric::OiChangePct as i32,
+                            op: CompareOp::Ge as i32,
+                            threshold: 3.0,
+                            window_seconds: 300,
+                        },
+                        CompositeCondition {
+                            metric: CompositeMetric::FundingRate as i32,
+                            op: CompareOp::Gt as i32,
+                            threshold: 0.0003,
+                            window_seconds: 0,
+                        },
+                    ],
+                    severity: Severity::Warning as i32,
+                })),
+                exchanges: vec!["binance".into()],
+                symbols: vec![],
+                channel_ids: vec!["tg".into()],
+                cooldown_seconds: 600,
+                quiet_hours: vec![],
+            }),
+        });
+        round_trip(&SendDigestNowRequest {
+            channel_ids: vec!["tg".into()],
+            sections: vec!["gaps".into()],
+            top_n: 3,
         });
         round_trip(&SendTestMessageResponse {
             delivered: false,
@@ -300,6 +354,31 @@ mod tests {
     #[test]
     fn event_golden_open_interest() {
         check_golden(event(Payload::OpenInterest(open_interest())), GOLDEN_OI);
+    }
+
+    #[test]
+    fn open_interest_funding_fields_are_additive() {
+        // Bytes written before the funding fields decode with them absent; with them the message round-trips and
+        // uses field numbers 16 to 18 (tags 0x81 0x01, 0x89 0x01, 0x90 0x01).
+        let old = Event::decode(unhex(GOLDEN_OI).as_slice()).unwrap();
+        let Some(Payload::OpenInterest(o)) = old.payload else {
+            panic!()
+        };
+        assert_eq!(
+            (o.funding_rate, o.index_price, o.next_funding_ts),
+            (None, None, None)
+        );
+        let with = OpenInterest {
+            funding_rate: Some(-0.0001),
+            index_price: Some(1_999.5),
+            next_funding_ts: Some(1_700_028_800_000),
+            ..open_interest()
+        };
+        let bytes = with.encode_to_vec();
+        assert_eq!(OpenInterest::decode(bytes.as_slice()).unwrap(), with);
+        assert!(bytes.windows(2).any(|w| w == [0x81, 0x01]));
+        assert!(bytes.windows(2).any(|w| w == [0x89, 0x01]));
+        assert!(bytes.windows(2).any(|w| w == [0x90, 0x01]));
     }
 
     #[test]

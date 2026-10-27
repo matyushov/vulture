@@ -163,10 +163,104 @@ pub struct Digest {
     pub more: usize,
     /// Alerts dropped by the queue since the last message.
     pub dropped: u64,
+    /// A report (the daily digest) sent as a message of its own; when set the fields above are ignored.
+    pub report: Option<Report>,
+}
+
+/// A titled report in sections of plain lines: the daily digest. It is rendered as one message and never merged with
+/// alerts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Report {
+    /// Time the report was built, ms.
+    pub ts_ms: i64,
+    /// Title line.
+    pub title: String,
+    /// Sections in order of importance (a message that is too long loses the last ones first).
+    pub sections: Vec<ReportSection>,
+    /// Last line (period, data source).
+    pub footer: String,
+}
+
+/// One section of a [`Report`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReportSection {
+    /// Heading.
+    pub heading: String,
+    /// Plain-text lines (no markup).
+    pub lines: Vec<String>,
+}
+
+/// Plain-text form of a report: the dry-run log line, the Control preview and the base of both renderings.
+pub fn report_plain(r: &Report) -> String {
+    let mut out = format!("{}\n", r.title);
+    for s in &r.sections {
+        out.push_str(&format!("\n{}\n", s.heading));
+        for l in &s.lines {
+            out.push_str(&format!("- {l}\n"));
+        }
+    }
+    if !r.footer.is_empty() {
+        out.push_str(&format!("\n{}\n", r.footer));
+    }
+    out
+}
+
+fn telegram_report(r: &Report) -> String {
+    let mut lines: Vec<String> = vec![format!("\u{1f4ca} <b>{}</b>", html_escape(&r.title))];
+    for s in &r.sections {
+        lines.push(String::new());
+        lines.push(format!("<b>{}</b>", html_escape(&s.heading)));
+        for l in &s.lines {
+            lines.push(format!("\u{2022} {}", html_escape(l)));
+        }
+    }
+    if !r.footer.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("<i>{}</i>", html_escape(&r.footer)));
+    }
+    truncate_html(&lines.join("\n"), TELEGRAM_LIMIT)
+}
+
+fn discord_report(r: &Report) -> Value {
+    let mut lines: Vec<String> = Vec::new();
+    for s in &r.sections {
+        lines.push(format!("**{}**", discord_escape(&s.heading)));
+        for l in &s.lines {
+            lines.push(format!("\u{2022} {}", discord_escape(l)));
+        }
+        lines.push(String::new());
+    }
+    if !r.footer.is_empty() {
+        lines.push(format!("_{}_", discord_escape(&r.footer)));
+    }
+    // Cut at a line boundary: a half-cut bold marker would swallow the rest of the message.
+    let mut desc = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if desc.chars().count() + line.chars().count() + 24 > DISCORD_DESC_LIMIT {
+            desc.push_str(&format!("\n\u{2026} ({} more lines cut)", lines.len() - i));
+            break;
+        }
+        if !desc.is_empty() {
+            desc.push('\n');
+        }
+        desc.push_str(line);
+    }
+    json!({
+        "allowed_mentions": {"parse": []},
+        "embeds": [{
+            "title": truncate_chars(&r.title, 250),
+            "description": desc,
+            "color": color(Severity::Info),
+            "timestamp": rfc3339(r.ts_ms),
+        }],
+    })
 }
 
 /// Renders for Telegram (HTML). One alert gets the full form, several a compact digest.
 pub fn telegram_html(d: &Digest) -> String {
+    if let Some(r) = &d.report {
+        return telegram_report(r);
+    }
     let mut out = String::new();
     if d.alerts.len() == 1 && d.more == 0 {
         let a = &d.alerts[0];
@@ -250,6 +344,9 @@ fn color(sev: Severity) -> u32 {
 
 /// Renders the JSON body of a Discord webhook call (one embed, mentions disabled).
 pub fn discord_body(d: &Digest) -> Value {
+    if let Some(r) = &d.report {
+        return discord_report(r);
+    }
     let (title, description, sev, ts) = if d.alerts.len() == 1 && d.more == 0 {
         let a = &d.alerts[0];
         let mut desc = discord_escape(&a.headline);
@@ -367,6 +464,7 @@ mod tests {
             alerts: vec![alert("A", "one"), alert("B", "two")],
             more: 3,
             dropped: 7,
+            ..Default::default()
         };
         let t = telegram_html(&d);
         assert!(t.contains("5 alerts"));
