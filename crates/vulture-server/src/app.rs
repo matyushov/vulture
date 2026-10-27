@@ -16,6 +16,8 @@ use crate::metrics::{
     AuthMetrics, GrpcMetrics, MetricsHub, Readiness, RedisSampler, TokenFileMetrics, WriterMetrics,
 };
 use crate::normalize::{AliasError, BaseAliases};
+use crate::query::cold::ColdStore;
+use crate::query::{ChCold, HistoryService, SeriesParams};
 use crate::store::{RedisClientStore, RedisStore, RedisWriter, WriterConfig};
 use crate::symbols::SymbolManager;
 use crate::tls::TlsReloader;
@@ -196,6 +198,44 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
     if let Some(a) = &alerts {
         a.register_metrics(&hub);
     }
+    let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
+    let mut cold: Option<Arc<dyn ColdStore>> = None;
+    let history = match ctx.config.clickhouse_enabled() {
+        Some(ch) => {
+            let client =
+                Arc::new(build_client(ch).map_err(|e| AppError::ClickHouse(e.to_string()))?);
+            let watermark = Arc::new(Watermark::new());
+            let status = Arc::new(FlusherStatus::new(
+                watermark.clone(),
+                ctx.config.redis.maxlen_safeguard,
+                crate::metrics::unix_now_ms(),
+            ));
+            cold = Some(Arc::new(ChCold::new(client.clone())) as Arc<dyn ColdStore>);
+            Some(HistorySetup {
+                sink: client.clone(),
+                flusher: crate::history::FlusherConfig::from_config(ch, deadline),
+                watermark,
+                status,
+                monitor: Some((client, Duration::from_secs(ch.monitor_interval_secs))),
+            })
+        }
+        None => {
+            tracing::info!(
+                "[clickhouse] is not configured: no history is kept, the stream is trimmed by time only"
+            );
+            None
+        }
+    };
+    // The History service answers from ClickHouse (when configured) and the Redis hot window.
+    let history_service = HistoryService::new(
+        store.clone(),
+        cold,
+        history.as_ref().map(|h| h.watermark.clone()),
+        ctx.config.history.clone(),
+        SeriesParams::from_alerts(&ctx.config.alerts),
+        Arc::new(SystemClock),
+    );
+    hub.register(history_service.stats().clone());
     let metrics_listener = crate::metrics::bind(&ctx.config.metrics.listen_addr).await?;
     let grpc = crate::grpc::start(
         &ctx.config.server,
@@ -204,6 +244,7 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
         authority,
         Some(symbols),
         alerts.as_ref().map(|a| a.manager.clone()),
+        Some(history_service),
         ctx.shutdown.clone(),
     )
     .await?;
@@ -235,32 +276,6 @@ pub async fn run(ctx: AppContext) -> Result<(), AppError> {
         ctx.shutdown.clone(),
     ));
 
-    let deadline = Duration::from_secs(ctx.config.server.shutdown_timeout_secs);
-    let history = match ctx.config.clickhouse_enabled() {
-        Some(ch) => {
-            let client =
-                Arc::new(build_client(ch).map_err(|e| AppError::ClickHouse(e.to_string()))?);
-            let watermark = Arc::new(Watermark::new());
-            let status = Arc::new(FlusherStatus::new(
-                watermark.clone(),
-                ctx.config.redis.maxlen_safeguard,
-                crate::metrics::unix_now_ms(),
-            ));
-            Some(HistorySetup {
-                sink: client.clone(),
-                flusher: crate::history::FlusherConfig::from_config(ch, deadline),
-                watermark,
-                status,
-                monitor: Some((client, Duration::from_secs(ch.monitor_interval_secs))),
-            })
-        }
-        None => {
-            tracing::info!(
-                "[clickhouse] is not configured: no history is kept, the stream is trimmed by time only"
-            );
-            None
-        }
-    };
     run_with_alerts(ctx.clone(), store, connectors, Some(hub), history, alerts).await;
     grpc.wait(deadline * 2).await;
     let _ = metrics_task.await;

@@ -50,6 +50,9 @@ struct Args {
     /// Symbols with open interest.
     #[arg(long, default_value_t = 560)]
     symbols: usize,
+    /// Exchanges (binance, bybit, okx in this order); each polls every symbol, with its own random walk.
+    #[arg(long, default_value_t = 1)]
+    exchanges: usize,
     /// Seconds between snapshots of one symbol.
     #[arg(long, default_value_t = 30)]
     interval_secs: u64,
@@ -242,8 +245,25 @@ async fn main() -> anyhow::Result<()> {
     println!("migrations applied: {applied:?}");
 
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let mut syms = symbols(args.symbols, &mut rng);
-    let weight_sum: f64 = syms.iter().map(|s| s.weight).sum();
+    let names = ["binance", "bybit", "okx"];
+    let n_ex = args.exchanges.clamp(1, names.len());
+    let base_syms = symbols(args.symbols, &mut rng);
+    let weight_sum: f64 = base_syms.iter().map(|s| s.weight).sum();
+    // One book per exchange: the same symbols, a slightly different level and an independent walk.
+    let mut books: Vec<Vec<Sym>> = (0..n_ex)
+        .map(|e| {
+            base_syms
+                .iter()
+                .map(|s| Sym {
+                    raw: s.raw.clone(),
+                    norm: s.norm.clone(),
+                    mark: s.mark * (1.0 + 0.0002 * e as f64),
+                    oi: s.oi * (1.0 - 0.3 * e as f64),
+                    weight: s.weight,
+                })
+                .collect()
+        })
+        .collect();
     let cycles = u64::from(args.days) * 86_400 / args.interval_secs;
     let liq_base_rate = args.liquidations_per_day as f64 / 86_400.0 * 0.7;
     let cascade_rate = liq_base_rate * 40.0;
@@ -257,38 +277,40 @@ async fn main() -> anyhow::Result<()> {
         page: args.page,
     };
     let started = Instant::now();
-    let n = syms.len() as u64;
+    let n = args.symbols as u64;
     let day_ms = 86_400_000i64;
     for k in 0..cycles {
         let cycle_start = args.start_ms + (k * args.interval_secs * 1000) as i64;
         // Open interest: each symbol is polled at its own offset within the interval.
-        for (i, s) in syms.iter_mut().enumerate() {
-            let offset = (i as u64 * args.interval_secs * 1000 / n) as i64;
-            let ts = cycle_start + offset + rng.range(-250.0, 250.0) as i64;
-            if rng.unit() < 0.7 {
-                s.oi *= 1.0 + rng.range(-0.0008, 0.0008);
-                s.oi = (s.oi * 1000.0).round() / 1000.0;
-            }
-            s.mark *= 1.0 + rng.range(-0.0006, 0.0006);
-            let mark = (s.mark * 1e6).round() / 1e6;
-            let recv = ts + rng.range(40.0, 400.0) as i64;
-            let event = Event {
-                id: String::new(),
-                payload: Some(Payload::OpenInterest(OpenInterest {
-                    exchange: "binance".into(),
-                    symbol_raw: s.raw.clone(),
-                    symbol: s.norm.clone(),
-                    exchange_ts: ts,
-                    recv_ts: recv,
-                    oi_base: s.oi,
-                    oi_usd: Some(((s.oi * mark) * 100.0).round() / 100.0),
-                    mark_price: Some(mark),
-                })),
-            };
-            if let Some(idx) = loader.push(event, recv)
-                && loader.pages[idx].len() >= loader.page
-            {
-                loader.flush(idx).await;
+        for (ex, syms) in books.iter_mut().enumerate() {
+            for (i, s) in syms.iter_mut().enumerate() {
+                let offset = (i as u64 * args.interval_secs * 1000 / n) as i64;
+                let ts = cycle_start + offset + rng.range(-250.0, 250.0) as i64;
+                if rng.unit() < 0.7 {
+                    s.oi *= 1.0 + rng.range(-0.0008, 0.0008);
+                    s.oi = (s.oi * 1000.0).round() / 1000.0;
+                }
+                s.mark *= 1.0 + rng.range(-0.0006, 0.0006);
+                let mark = (s.mark * 1e6).round() / 1e6;
+                let recv = ts + rng.range(40.0, 400.0) as i64;
+                let event = Event {
+                    id: String::new(),
+                    payload: Some(Payload::OpenInterest(OpenInterest {
+                        exchange: names[ex].into(),
+                        symbol_raw: s.raw.clone(),
+                        symbol: s.norm.clone(),
+                        exchange_ts: ts,
+                        recv_ts: recv,
+                        oi_base: s.oi,
+                        oi_usd: Some(((s.oi * mark) * 100.0).round() / 100.0),
+                        mark_price: Some(mark),
+                    })),
+                };
+                if let Some(idx) = loader.push(event, recv)
+                    && loader.pages[idx].len() >= loader.page
+                {
+                    loader.flush(idx).await;
+                }
             }
         }
         // Liquidations: a Poisson-like stream, with three five-minute cascades a day at 40x the rate.
@@ -311,6 +333,8 @@ async fn main() -> anyhow::Result<()> {
             for _ in 0..count {
                 let mut pick = rng.unit() * weight_sum;
                 let mut idx = 0;
+                let ex = (rng.next() % n_ex as u64) as usize;
+                let syms = &books[ex];
                 for (i, s) in syms.iter().enumerate() {
                     pick -= s.weight;
                     if pick <= 0.0 {
@@ -326,7 +350,7 @@ async fn main() -> anyhow::Result<()> {
                 let event = Event {
                     id: String::new(),
                     payload: Some(Payload::Liquidation(Liquidation {
-                        exchange: "binance".into(),
+                        exchange: names[ex].into(),
                         symbol_raw: s.raw.clone(),
                         symbol: s.norm.clone(),
                         exchange_ts: ts,

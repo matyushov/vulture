@@ -60,6 +60,7 @@ async fn sighup_swaps_the_certificate_and_open_streams_survive() {
         stream: test_stream_config(),
         symbols: None,
         alerts: None,
+        history: None,
     };
     let server = tokio::spawn(grpc::serve_tls(
         listener,

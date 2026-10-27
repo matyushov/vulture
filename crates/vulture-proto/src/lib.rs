@@ -124,9 +124,13 @@ mod tests {
                     },
                 ],
                 partial: true,
+                bucket_end: 1_700_000_060_000,
             }],
             partial: true,
             oi_movers: None,
+            bins_from_ts: 1_700_000_000_000,
+            bins_to_ts: 1_700_000_060_000,
+            source: "clickhouse+redis".into(),
         });
         round_trip(&SetSymbolPolicyRequest {
             policy: Some(SymbolPolicy {
@@ -148,6 +152,7 @@ mod tests {
                 limit: 20,
                 sort_by: OiMoverSort::Pct as i32,
                 min_oi_usd: 1e6,
+                exclude_partial: true,
             }),
             to_ts: 5,
             ..AggregateRequest::default()

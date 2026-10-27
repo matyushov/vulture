@@ -8,6 +8,7 @@
 
 mod alerts;
 mod env;
+mod history;
 mod secret;
 
 use std::net::SocketAddr;
@@ -17,6 +18,7 @@ use serde::Deserialize;
 
 pub use alerts::{AlertsConfig, CascadeConfig, DeliveryConfig, OiSpikeConfig, OiWindow};
 pub use env::ENV_PREFIX;
+pub use history::HistoryApiConfig;
 pub use secret::Secret;
 
 /// Errors of loading and validating the configuration. The messages are meant to be read by the operator.
@@ -78,6 +80,8 @@ pub struct Config {
     pub normalize: NormalizeConfig,
     /// Analytics engine, signals, rules and delivery.
     pub alerts: AlertsConfig,
+    /// Limits of the `History` service (`Query`, `Aggregate`).
+    pub history: HistoryApiConfig,
 }
 
 /// `[server]` section.
@@ -498,6 +502,7 @@ impl Config {
             }
         }
         self.alerts.validate(&mut problems);
+        self.history.validate(&mut problems);
         if self.alerts.enabled {
             for (i, ex) in self.exchanges.iter().enumerate() {
                 if ex.enabled && ex.oi_poll_interval_secs.saturating_mul(2) > self.alerts.hole_secs

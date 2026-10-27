@@ -50,6 +50,25 @@ buffer_limit = 100000          # events kept in memory while Redis is down; abov
 # insert_timeout_secs = 60         # deadline of one insert or migration statement
 # monitor_interval_secs = 60       # disk and table statistics sampling
 
+# Limits of the History service (Query and Aggregate). The service is always on: with [clickhouse] it answers from
+# ClickHouse plus the unflushed Redis tail, without it from the Redis hot window only. Defaults shown.
+# [history]
+# max_query_range_secs = 2678400       # longest period of one Query (31 days); Aggregate is bounded by max_bins
+# default_limit = 10000                # events when the request says limit = 0
+# max_rows = 1000000                   # a limit above this is refused (RESOURCE_EXHAUSTED); page with the cursor
+# max_bins = 5000                      # bins per group of one Aggregate
+# max_aggregate_rows = 200000          # groups x bins of one Aggregate answer
+# max_fine_rows = 3000000              # (exchange, symbol, bin) cells read from ClickHouse for one Aggregate
+# tail_max_entries = 2000000           # Redis entries one call may scan for the unflushed tail
+# tail_page = 5000
+# request_timeout_secs = 30            # deadline of a whole call
+# max_concurrent = 8                   # simultaneous History calls
+# clickhouse_max_memory_bytes = 2147483648
+# movers_default_limit = 20
+# movers_max_limit = 200
+# movers_max_stale_secs = 900          # a series silent for longer is not a mover
+# redis_slack_secs = 300               # Redis IDs are write times; period-to-ID slack for Redis-only reads
+
 # The set of exchanges and symbols is data, not code. Symbols are normalized (BASE-QUOTE-PERP);
 # an empty list means every linear USDT/USDC perpetual the exchange offers. `symbols` is the DEFAULT policy
 # (empty = ALL, otherwise a whitelist): what the owner sets at runtime through Control.SetSymbolPolicy is kept in

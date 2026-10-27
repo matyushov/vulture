@@ -9,8 +9,8 @@ service History {
   // Events for a period (recent from Redis, older from ClickHouse, transparently). Pagination:
   // cursor = Event.id of the last received event, passed in HistoryRequest.cursor.
   rpc Query(HistoryRequest) returns (stream Event);
-  // Aggregates by exchange, symbol or base asset with an hour/day/week/month step. With
-  // AggregateRequest.oi_movers set it returns the open interest movers ranking instead (v0.2).
+  // Aggregates by exchange, symbol or base asset with a 1m/5m/15m/1h/4h/1d/1w/1M step (v0.5 added the minute
+  // steps and 4h). With AggregateRequest.oi_movers set it returns the open interest movers ranking instead.
   rpc Aggregate(AggregateRequest) returns (AggregateResponse);
 }
 
@@ -40,6 +40,12 @@ enum Step {
   STEP_DAY = 2;
   STEP_WEEK = 3;
   STEP_MONTH = 4;
+  // Added in v0.5. Bins are aligned to UTC (a day starts at 00:00 UTC, a week on Monday 00:00 UTC, a month on
+  // the 1st); the minute and hour steps divide the day evenly.
+  STEP_MINUTE_1 = 5;
+  STEP_MINUTE_5 = 6;
+  STEP_MINUTE_15 = 7;
+  STEP_HOUR_4 = 8;
 }
 
 enum Metric {
@@ -59,6 +65,15 @@ enum Metric {
   METRIC_OI_TOTAL_USD = 8;
   // Liquidations as a share of OI: liq_usd / oi_usd.
   METRIC_LIQ_TO_OI_RATIO = 9;
+  // Added in v0.5. OI level at the end of the step (the last sample in it): base coin and USD.
+  METRIC_OI_END_BASE = 10;
+  METRIC_OI_END_USD = 11;
+  // Mark price open/high/low/close of the step, taken from the mark prices carried by the 30-second OI samples:
+  // an approximation of a candle, not exchange candles. Not defined (absent) for GROUP_BY_EXCHANGE.
+  METRIC_MARK_OPEN = 12;
+  METRIC_MARK_HIGH = 13;
+  METRIC_MARK_LOW = 14;
+  METRIC_MARK_CLOSE = 15;
 }
 
 message AggregateRequest {
@@ -98,6 +113,9 @@ message OiMoversQuery {
   // Ignore symbols whose current OI is below this many USD (noise filter); 0 = no filter.
   double min_oi_usd = 4;
   reserved 5 to 9;
+  // Added in v0.5. Leave out symbols for which the window crosses a Gap or a data hole (the signal detector would
+  // not evaluate them); by default they are listed with OiMover.partial set.
+  bool exclude_partial = 10;
 }
 
 message OiMover {
@@ -141,9 +159,13 @@ message AggregateRow {
   // Group key: exchange, normalized symbol or base asset (per group_by).
   string group = 2;
   repeated MetricValue values = 3;
-  // The step overlaps a Gap or the source is incomplete (for example Binance !forceOrder).
+  // The step overlaps a Gap of a source the requested metrics depend on, or lies inside a data hole (no samples
+  // while the group has data before and after). The inherent incompleteness of the Binance !forceOrder feed is
+  // not flagged here: its sums are always lower bounds.
   bool partial = 4;
   reserved 5 to 9;
+  // Added in v0.5. Step end (exclusive), ms; differs from bucket_start + a fixed length for week and month.
+  int64 bucket_end = 10;
 }
 
 message AggregateResponse {
@@ -153,4 +175,9 @@ message AggregateResponse {
   // v0.2: set instead of rows when the request asked for the OI movers ranking.
   OiMovers oi_movers = 10;
   reserved 3 to 9;
+  // Added in v0.5. The aligned period the bins cover: [bins_from_ts, bins_to_ts), ms.
+  int64 bins_from_ts = 11;
+  int64 bins_to_ts = 12;
+  // Where the data came from: "clickhouse", "redis" or "clickhouse+redis" (the unflushed tail was merged in).
+  string source = 13;
 }

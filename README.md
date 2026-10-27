@@ -10,7 +10,7 @@ reload, Prometheus metrics, tracked symbols managed at runtime (`Control.ListSym
 `SetSymbolPolicy`), and a Dockerfile with compose, certbot, systemd and Prometheus templates in `deploy/`.
 The Bybit linear connector (V2a) with runtime subscriptions and a connection budget in the WebSocket manager, and the
 OKX linear swap connector (V2b), are implemented. ClickHouse history (schema, migrations, the Redis-to-ClickHouse flusher, disk monitoring, backups) is implemented;
-`History.Query`/`Aggregate` and the rest of `Control` are in the contract but answer `UNIMPLEMENTED`, and the other
+`History.Query`/`Aggregate` (V3b, see "History API") are implemented; the other `Control` RPCs answer `UNIMPLEMENTED`, and the other
 exchanges except Bybit and OKX are not implemented yet. The server needs a Redis instance (`redis.url`); ClickHouse is optional
 (`[clickhouse]`). Deployment is described in [deploy/README.md](deploy/README.md).
 
@@ -70,7 +70,8 @@ added to the repository.
   reader per client, health, server settings) with a `redis`-crate implementation and an in-memory double, and the
   `RedisWriter` that batches, survives outages and records gaps (see "Redis storage").
 - `auth`: the owner token (file, rotation), the interceptor and the failure limiter; `grpc`: the tonic server with
-  `Stream.Subscribe` and the `History`/`Control` stubs (see "gRPC API and token").
+  `Stream.Subscribe`, `History` and `Control` (see "gRPC API and token"); `query`: the `History` service (`Query`,
+  `Aggregate`, OI movers) over ClickHouse and the Redis tail (see "History API").
 - `alerts`: the analytics engine in the server process: per-symbol OI ring buffers, the OI spike and liquidation
   cascade detectors, rules and channels (`alerts.json`), and delivery to Telegram and Discord (see "Signals and
   alerts").
@@ -451,11 +452,174 @@ lower). One column, the `event_id` text, costs 29% of an OI row; storing it as t
 sequence) would take about 2.9 instead of 7.8 bytes/row and save about 18% of the table (not done: the task asks for
 the string). Re-measure on the real stream: repeated OI values compress much better than random walks.
 
+## History API (V3b)
+
+`History.Query` streams stored events of a period; `History.Aggregate` returns binned metrics and the OI movers
+ranking. Both need the token and answer from ClickHouse plus the unflushed Redis tail; without `[clickhouse]` they
+answer from the Redis hot window (24 hours) alone. Limits are in `[history]` (see `config.example.toml`).
+
+### `Query`
+
+`HistoryRequest`: `exchanges`, `symbols`, `types` (empty = all four), `[from_ts, to_ts)` in ms (`to_ts = 0` means
+now), `limit` (0 = `history.default_limit`), `cursor`.
+
+- **Time and order.** An event's time is `exchange_ts` (liquidations, OI), `from_ts` (gaps) or `ts` (signals), the
+  column each table is sorted by. A gap belongs to a period when it *overlaps* it. Events come in order of (time,
+  stream ID compared as numbers); `Event.id` is the Redis entry ID, also for rows read from ClickHouse (`event_id`).
+  The filters behave like the live stream: the writer's gaps and market-wide signals (exchange `*`) pass an exchange
+  filter, entries without a symbol pass a symbol filter.
+- **Paging.** `limit` caps one call; to continue, send the `Event.id` of the last event received as `cursor` with
+  the same period and filters. The cursor's own time is looked up in the tail and in ClickHouse within that period, so
+  a cursor from another period is `INVALID_ARGUMENT`. A call that returns fewer events than `limit` has reached the
+  end of the period.
+- **Flow control.** The answer is a gRPC stream read from ClickHouse as a streamed HTTP response (one query per
+  kind, merged here) through a bounded queue: a slow client slows the reads, memory stays flat. Server limits:
+  `max_query_range_secs` (31 days, `OUT_OF_RANGE` with the hint to split the period or use `Aggregate`), `max_rows`
+  (a larger `limit` is `RESOURCE_EXHAUSTED` with the hint to page), `max_concurrent` calls (`RESOURCE_EXHAUSTED`),
+  `request_timeout_secs` (`DEADLINE_EXCEEDED`; a shorter client deadline also works). Names in filters: at most 1000,
+  each 1 to 64 characters without control characters.
+- **The boundary.** Events with a stream ID up to the flusher's watermark are read from ClickHouse, everything after
+  it from Redis. The two overlap only between an acknowledged insert and the watermark update (and after a crash
+  there); a tail event that ClickHouse also returns is dropped from the ClickHouse side by `event_id`. The watermark
+  is the in-process one or, if that has not been loaded yet, the persisted one in Redis. If ClickHouse fails and the
+  Redis window covers the start of the period, the answer comes from Redis (`vulture_history_redis_fallbacks_total`);
+  otherwise `UNAVAILABLE`. Without ClickHouse a gap is found only if it was recorded within `redis_slack_secs` after
+  the end of the period (Redis IDs are write times, a gap is written when it ends).
+
+### `Aggregate`
+
+`AggregateRequest`: `group_by` (EXCHANGE, SYMBOL, BASE_ASSET), `step`, `[from_ts, to_ts)`, filters `exchanges`,
+`symbols`, `base_assets`, `metrics` (empty = the default set). Steps `1m 5m 15m 1h 4h 1d 1w 1M` are aligned to UTC
+(a week starts on Monday 00:00 UTC, a month on the 1st); the period is widened to whole bins and the response says
+which (`bins_from_ts`, `bins_to_ts`, and per row `bucket_start`, `bucket_end`). At most `max_bins` bins per group
+(`OUT_OF_RANGE`), `max_aggregate_rows` rows (`RESOURCE_EXHAUSTED`) and `max_fine_rows` (exchange, symbol, bin) cells
+read (`RESOURCE_EXHAUSTED`, with the hint to use a larger step or filters). Rows are ordered by group, then bin.
+
+**Base asset** is the part of the normalized symbol before the first `-` (`BTC` for `BTC-USDT-PERP`, `1000PEPE` for
+`1000PEPE-USDT-PERP`; the exchange connectors already map aliases such as `XBT` to `BTC`).
+
+| Metric | Definition |
+|---|---|
+| `LIQ_SUM_USD`, `LIQ_COUNT`, `LIQ_LONG_USD`, `LIQ_SHORT_USD`, `LIQ_MAX_USD` | liquidated USD, number, by side, largest single one, in the bin (by `exchange_ts`) |
+| `OI_END_BASE`, `OI_END_USD` | the group's OI at the end of the bin: the last sample of every series, summed (`OI_END_BASE` is null for `GROUP_BY_EXCHANGE`: base units of different assets do not add) |
+| `OI_CHANGE_BASE`, `OI_CHANGE_USD` | per series, end level minus the end level of the bin right before it, summed over the series; the USD change is priced at the bin's last mark price (else the implied price of its `oi_usd`) |
+| `OI_TOTAL_USD` | OI in USD of the whole base asset at the end of the bin: all series of that base asset that pass the filters (all exchanges when none is given); null for `GROUP_BY_EXCHANGE` |
+| `LIQ_TO_OI_RATIO` | liquidated USD of the bin divided by `OI_END_USD` of the group |
+| `MARK_OPEN/HIGH/LOW/CLOSE` | the mark prices carried by the 30-second OI samples of the bin: an **approximation of a candle**, not exchange candles; with several exchanges in a group the earliest, highest, lowest and latest sample of any of them; null for `GROUP_BY_EXCHANGE` |
+
+**Null, zero, partial.** A value is null when there is no data for it. A bin without liquidations counts 0 as long as
+the group has data in it (or the answer asks for no OI metric at all); `LIQ_MAX_USD` is then null. A row is
+`partial` when its bin overlaps a `Gap` of a source the requested metrics depend on (`liquidations` for liquidation
+metrics, other streams for OI metrics, the writer's own gaps for both), lies inside a hole of its group (no data
+while there is data before and after it; all values null), or its OI change could not be computed because the series
+has older data but nothing in the bin right before (the first bin after a hole). The inherent incompleteness of the
+Binance `!forceOrder` feed (one liquidation per symbol per second) is not flagged: Binance liquidation sums are
+always lower bounds. `AggregateResponse.partial` is set when any row is.
+
+**Hot and cold.** ClickHouse does the `GROUP BY` on the interval per (exchange, symbol, bin) using the existing sort
+key `(exchange, symbol, time)`; no materialized views were needed (see the measurements). The Redis tail (entries
+after the watermark) is aggregated in Rust into cells of the same shape and merged into ClickHouse's: sums add, the last
+value takes the later sample, the first the earlier one, high and low merge. For the bins the tail touches,
+ClickHouse is read only for rows with an ID up to the watermark. The roll-up to groups and the OI change per bin
+(which needs the previous bin's last value, so one bin before the period is read) happen after the merge, so the
+boundary bin is exact for every metric. `AggregateResponse.source` says `clickhouse`, `clickhouse+redis` or `redis`.
+
+### OI movers
+
+`AggregateRequest.oi_movers` (window 1 minute to 24 hours, `limit`, `sort_by` percent or absolute, `min_oi_usd`,
+`exclude_partial`; `to_ts` is the end of the window, 0 = now) returns `top_growth` and `top_decline`. The change of a
+symbol is computed by **the signal detector's own function**, `alerts::series::Series::change`: the sample nearest to
+`now - window` within the tolerance `window/8` (15 s to 300 s), no reference across a hole or a `Gap`, `now` being the
+symbol's newest sample. The samples go into a `Series` built with the live engine's limits
+(`alerts.sample_spacing_secs`, `alerts.hole_secs`) and `Gap` records become the same exchange-level breaks, so the
+ranking and the signals cannot disagree (a test builds the engine's series from the same events and compares).
+ClickHouse returns, per series, only the newest sample, the samples near the reference point and the time of the latest
+pause (one `GROUP BY` with array functions), not the history. A symbol whose window the detector would refuse because
+of a hole or gap but for which a change can still be computed is listed with `partial = true`. Series silent for more
+than `movers_max_stale_secs` (15 minutes) are not movers.
+
+### Metrics
+
+| Series | Meaning |
+|---|---|
+| `vulture_history_requests_total{method,code}` | calls by `query`, `aggregate`, `movers` and result (`ok`, `invalid_argument`, `out_of_range`, `resource_exhausted`, `unavailable`, `deadline_exceeded`, `cancelled`, `internal`) |
+| `vulture_history_request_seconds_total{method}`, `..._seconds_max{method}` | time spent (divide by the count for the mean), slowest call |
+| `vulture_history_rows_scanned_total{source}` | rows read from `clickhouse` (its own count of rows read) and `redis` (entries scanned) |
+| `vulture_history_events_returned_total`, `..._bins_returned_total`, `..._movers_returned_total` | what was sent |
+| `vulture_history_rejections_total{reason}` | refused for `range`, `limit`, `bins`, `rows`, `concurrency` |
+| `vulture_history_in_flight`, `..._clickhouse_errors_total`, `..._redis_fallbacks_total`, `..._tail_merges_total` | running calls, failed ClickHouse calls, answers produced from Redis because of them, answers that merged the tail |
+
+`deploy/prometheus/alerts.yml` has rules for failing calls, ClickHouse fallback, slow calls and refused concurrency.
+
+### Examples
+
+`grpcurl` has no reflection here; give it the proto files (`<token>` and the host are placeholders):
+
+```sh
+export VULTURE_TOKEN=$(vulture-server token show --config /etc/vulture/config.toml)
+# The last 10 liquidations of BTC on Binance in a period (ms), then the next page with the last id as cursor.
+grpcurl -import-path proto -proto vulture/v1/history.proto -H "authorization: Bearer $VULTURE_TOKEN" \
+  -d '{"exchanges":["binance"],"symbols":["BTC-USDT-PERP"],"types":["EVENT_TYPE_LIQUIDATION"],
+       "from_ts":1792972800000,"to_ts":1793059200000,"limit":10}' vulture.example.org:50051 vulture.v1.History/Query
+# One symbol, 5 minute bins, liquidations, OI level and change, mark price candle.
+grpcurl -import-path proto -proto vulture/v1/history.proto -H "authorization: Bearer $VULTURE_TOKEN" \
+  -d '{"group_by":"GROUP_BY_SYMBOL","step":"STEP_MINUTE_5","from_ts":1792972800000,"to_ts":1793059200000,
+       "symbols":["BTC-USDT-PERP"],"metrics":["METRIC_LIQ_SUM_USD","METRIC_OI_END_USD","METRIC_OI_CHANGE_USD",
+       "METRIC_MARK_OPEN","METRIC_MARK_HIGH","METRIC_MARK_LOW","METRIC_MARK_CLOSE"]}' \
+  vulture.example.org:50051 vulture.v1.History/Aggregate
+# Total OI per base asset, hourly, over a week.
+grpcurl ... -d '{"group_by":"GROUP_BY_BASE_ASSET","step":"STEP_HOUR","from_ts":1792368000000,"to_ts":1792972800000,
+       "metrics":["METRIC_OI_TOTAL_USD"]}' vulture.example.org:50051 vulture.v1.History/Aggregate
+# The 15 minute OI movers, top 20 each way, ignoring dust.
+grpcurl ... -d '{"to_ts":0,"oi_movers":{"window_secs":900,"limit":20,"min_oi_usd":1000000}}' \
+  vulture.example.org:50051 vulture.v1.History/Aggregate
+```
+
+### Tests
+
+`tests/history_service.rs` (in-memory stores): order, pagination across the boundary for several watermark positions
+and overlaps, filters, Redis-only and fallback, limits and statuses, bin arithmetic against a brute-force reference
+(1m to 4h, three groupings), boundary merge equal to a single store, partial/null, UTC alignment, the movers against
+the engine's own `Series`, metrics. `tests/history_api.rs`: the same over the wire (token, status codes, a slow
+reader, a vanished client, server timeouts). `tests/history_clickhouse.rs` (gated by `VULTURE_TEST_CLICKHOUSE_URL`
+and `VULTURE_TEST_REDIS_URL`): the SQL against the in-memory reference on real servers, SQL bin expressions against
+the Rust ones, round trip of every row type, SQL-injection attempts, the cell cap. `src/query/*` unit tests cover bins,
+cell merge, roll-up, SQL text and the tail reader.
+
+### Measurements (2026-10-25)
+
+`cargo run --release -p vulture-server --example synth_history -- --days 30 --exchanges 3` (now with `--exchanges`) fills
+a scratch ClickHouse with 30 days of 560 symbols on three exchanges: 145.15 million `open_interest` rows (3.64 GiB
+compressed after `OPTIMIZE FINAL`, 26.9 bytes/row) and 3.54 million liquidations (127 MiB); loaded at 1.13 million rows/s
+end to end. `cargo run --release -p vulture-server --example history_bench` then drives the `History` service in
+process against it (ClickHouse 25.8 in a Docker container on an Apple M5 Pro laptop, warm cache, median of five,
+wall time including the roll-up in Rust; the unflushed tail is empty here):
+
+| Case | median | best | rows | target |
+|---|---|---|---|---|
+| one symbol, 1m bins over 24 h, all 15 metrics (Binance) | 13.2 ms | 12.6 ms | 1 440 | 200 ms |
+| the same symbol on all three exchanges | 29.7 ms | 28.2 ms | 1 440 | 200 ms |
+| one symbol, 1d bins over 90 days (30 days have data) | 17.6 ms | 16.9 ms | 31 | 200 ms |
+| total OI per base asset over 7 days, 1h bins | 625 ms | 593 ms | 94 080 | 1 s |
+| total OI per base asset over 7 days, 1d bins | 226 ms | 220 ms | 3 920 | 1 s |
+| liquidations per exchange over 30 days, 1d bins | 79.5 ms | 77.5 ms | 90 | |
+| OI movers, all symbols, window 1 h | 109 ms | 109 ms | 40 | 1 s |
+| OI movers, all symbols, window 5 min | 88 ms | 85 ms | 40 | 1 s |
+| OI movers, all symbols, window 24 h | 311 ms | 303 ms | 40 | |
+| `Query`, one symbol's events over 24 h (6 963 events) | 47 ms | 42 ms | 6 963 | |
+| `Query`, first 10 000 liquidations of the last day | 83 ms | 81 ms | 10 000 | |
+
+Every target is met with the existing sort key and plain `GROUP BY`; no materialized view was added. The slowest case
+(hourly totals, 94 thousand rows) is dominated by moving and rolling up 282 thousand (exchange, symbol, hour) cells
+(transfer as JSON, decoding and the roll-up in Rust); a 1d step needs a third of that. If a
+dashboard ever needs hourly totals over many weeks, an `AggregatingMergeTree` view on `(exchange, symbol, hour)` is
+the next step.
+
 ## gRPC API and token
 
-`vulture-server run` serves three services on `server.listen_addr` (default `127.0.0.1:50051`): `Stream`
-(implemented), `History` and `Control` (`History` and all `Control` methods except the two symbol RPCs answer `UNIMPLEMENTED`; the
-contract stays visible to `grpcurl`). Every RPC of every service needs the token. Without `[tls]` the connection is plaintext, so
+`vulture-server run` serves three services on `server.listen_addr` (default `127.0.0.1:50051`): `Stream`,
+`History` (see "History API") and `Control` (the symbol, rule and channel RPCs are implemented, the rest answers
+`UNIMPLEMENTED`; the contract stays visible to `grpcurl`). Every RPC of every service needs the token. Without `[tls]` the connection is plaintext, so
 the server **refuses a non-loopback `listen_addr`** unless `server.allow_plaintext = true` is set (a warning is
 logged; for an internal network or a TLS-terminating proxy). With `[tls]` any address is accepted (see "TLS").
 
@@ -854,7 +1018,7 @@ grpcurl -plaintext -import-path proto -proto vulture/v1/stream.proto \
   127.0.0.1:50051 vulture.v1.Stream/Subscribe
 grpcurl -plaintext -import-path proto -proto vulture/v1/control.proto \
   -H "authorization: Bearer $VULTURE_TOKEN" 127.0.0.1:50051 vulture.v1.Control/GetConnectorStatus
-# -> UNIMPLEMENTED with a valid token, UNAUTHENTICATED without one
+# -> UNIMPLEMENTED for the RPCs that are not built yet, UNAUTHENTICATED without a token
 ```
 
 Tests: `crates/vulture-server/tests/grpc_stream.rs` (filters, resume, cursor rules, slow client, limits, outages, run

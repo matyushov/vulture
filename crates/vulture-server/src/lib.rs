@@ -11,6 +11,7 @@
 //! - [`normalize`]: symbols, base asset aliases, open interest units, market filter.
 //! - [`store`]: the Redis Streams layout, the writer and its in-memory test double.
 //! - [`history`]: ClickHouse schema, migrations, the Redis-to-ClickHouse flusher and storage monitoring.
+//! - [`query`]: the `History` service: `Query` and `Aggregate` over ClickHouse and the Redis hot window.
 //! - [`symbols`]: tracked symbols per exchange, changed at runtime through `Control` (policy, state file, audit).
 //! - [`ws`]: the reconnecting WebSocket session manager shared by all connectors.
 //! - [`tls`]: rustls for the gRPC listener with certificate hot reload.
@@ -27,6 +28,7 @@ pub mod history;
 pub mod logging;
 pub mod metrics;
 pub mod normalize;
+pub mod query;
 pub mod store;
 pub mod symbols;
 pub mod tls;

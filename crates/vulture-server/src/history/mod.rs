@@ -19,7 +19,7 @@ pub mod rows;
 pub mod status;
 pub mod watermark;
 
-pub use client::{ChClient, ChError, HistorySink};
+pub use client::{ChClient, ChError, HistorySink, QuerySummary, ReadSettings, RowStream};
 pub use flusher::{
     FlushError, Flusher, FlusherConfig, INFLIGHT_KEY, WATERMARK_KEY, estimate_backlog,
 };

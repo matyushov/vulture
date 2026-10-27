@@ -37,6 +37,11 @@ impl Families {
         self.add(name, help, Kind::Counter, labels, value as f64);
     }
 
+    /// Adds a counter sample with a fractional value (seconds summed over requests, for example).
+    pub fn counter_f64(&mut self, name: &str, help: &str, labels: &[(&str, &str)], value: f64) {
+        self.add(name, help, Kind::Counter, labels, value);
+    }
+
     /// Adds a gauge sample.
     pub fn gauge(&mut self, name: &str, help: &str, labels: &[(&str, &str)], value: f64) {
         self.add(name, help, Kind::Gauge, labels, value);

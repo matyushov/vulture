@@ -3,6 +3,9 @@
 #![allow(dead_code)]
 
 pub mod certs;
+pub mod ch_env;
+pub mod history_data;
+pub mod history_rig;
 pub mod log_capture;
 pub mod mock_http;
 
@@ -339,6 +342,33 @@ impl Server {
         symbols: Option<Arc<vulture_server::symbols::SymbolManager>>,
         alerts: Option<Arc<vulture_server::alerts::AlertsManager>>,
     ) -> Self {
+        Self::start_inner(backend, stream, limiter, symbols, alerts, None).await
+    }
+
+    /// Like `start_with`, with a `History` backend.
+    pub async fn start_history(
+        backend: &Backend,
+        history: Arc<vulture_server::query::HistoryService>,
+    ) -> Self {
+        Self::start_inner(
+            backend,
+            test_stream_config(),
+            LimiterConfig::default(),
+            None,
+            None,
+            Some(history),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        backend: &Backend,
+        stream: StreamConfig,
+        limiter: LimiterConfig,
+        symbols: Option<Arc<vulture_server::symbols::SymbolManager>>,
+        alerts: Option<Arc<vulture_server::alerts::AlertsManager>>,
+        history: Option<Arc<vulture_server::query::HistoryService>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let token_store = TokenStore::new(dir.path());
         let token = token_store.create_if_missing().unwrap().into_secret();
@@ -360,6 +390,7 @@ impl Server {
             stream,
             symbols,
             alerts,
+            history,
         };
         let task = tokio::spawn({
             let (store, authority, stats, auth_stats, shutdown) = (

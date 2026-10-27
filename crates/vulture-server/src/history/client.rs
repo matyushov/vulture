@@ -100,13 +100,13 @@ impl ChClient {
         &self.database
     }
 
-    async fn post(
+    async fn send(
         &self,
         params: &[(&str, &str)],
         with_database: bool,
         body: Vec<u8>,
         timeout: Duration,
-    ) -> Result<String, ChError> {
+    ) -> Result<reqwest::Response, ChError> {
         let mut url = self.base.clone();
         {
             let mut q = url.query_pairs_mut();
@@ -135,18 +135,31 @@ impl ChClient {
             .await
             .map_err(|e| ChError::Connection(e.without_url().to_string()))?;
         let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
         let text = response
             .text()
             .await
             .map_err(|e| ChError::Connection(e.without_url().to_string()))?;
-        if status.is_success() {
-            Ok(text)
-        } else {
-            Err(ChError::Server {
-                status: status.as_u16(),
-                message: truncate(text.trim(), 600),
-            })
-        }
+        Err(ChError::Server {
+            status: status.as_u16(),
+            message: truncate(text.trim(), 600),
+        })
+    }
+
+    async fn post(
+        &self,
+        params: &[(&str, &str)],
+        with_database: bool,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<String, ChError> {
+        self.send(params, with_database, body, timeout)
+            .await?
+            .text()
+            .await
+            .map_err(|e| ChError::Connection(e.without_url().to_string()))
     }
 
     /// Runs a statement (DDL, `INSERT ... VALUES` in the text, ...) in the configured database.
@@ -181,6 +194,77 @@ impl ChClient {
                     .map_err(|e| ChError::Connection(format!("unparsable answer: {e}")))
             })
             .collect()
+    }
+
+    fn read_params(settings: &ReadSettings, buffered: bool) -> Vec<(String, String)> {
+        let mut p = vec![
+            ("default_format".to_string(), "JSONEachRow".to_string()),
+            (
+                "output_format_json_quote_64bit_integers".to_string(),
+                "0".to_string(),
+            ),
+            (
+                "max_execution_time".to_string(),
+                settings.max_execution_time_secs.to_string(),
+            ),
+            (
+                "max_memory_usage".to_string(),
+                settings.max_memory_usage.to_string(),
+            ),
+        ];
+        if buffered {
+            // The summary header (rows read) is only final when the whole answer is produced before the first byte.
+            p.push(("wait_end_of_query".to_string(), "1".to_string()));
+        }
+        p
+    }
+
+    /// Runs a read query and returns all rows (`FORMAT JSONEachRow`, 64-bit integers as plain numbers) with the
+    /// server's summary of the work done. For answers that fit in memory.
+    pub async fn query_rows_with(
+        &self,
+        sql: &str,
+        settings: &ReadSettings,
+    ) -> Result<(Vec<serde_json::Value>, QuerySummary), ChError> {
+        let owned = Self::read_params(settings, true);
+        let params: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let response = self
+            .send(&params, true, sql.as_bytes().to_vec(), settings.timeout)
+            .await?;
+        let summary = QuerySummary::from_headers(response.headers());
+        let text = response
+            .text()
+            .await
+            .map_err(|e| ChError::Connection(e.without_url().to_string()))?;
+        let mut rows = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            rows.push(parse_row(line)?);
+        }
+        Ok((rows, summary))
+    }
+
+    /// Runs a read query and hands the rows out as they arrive, so that a large answer never sits in memory.
+    pub async fn query_stream(
+        &self,
+        sql: &str,
+        settings: &ReadSettings,
+    ) -> Result<RowStream, ChError> {
+        let owned = Self::read_params(settings, false);
+        let params: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let response = self
+            .send(&params, true, sql.as_bytes().to_vec(), settings.timeout)
+            .await?;
+        Ok(RowStream {
+            response,
+            buf: Vec::new(),
+            done: false,
+        })
     }
 
     /// Inserts a `RowBinary` body. See [`HistorySink::insert`].
@@ -235,6 +319,105 @@ impl HistorySink for ChClient {
     }
 }
 
+/// Settings of one read query.
+#[derive(Debug, Clone)]
+pub struct ReadSettings {
+    /// `max_execution_time` of the query, seconds.
+    pub max_execution_time_secs: u64,
+    /// `max_memory_usage` of the query, bytes.
+    pub max_memory_usage: u64,
+    /// Deadline of the whole HTTP request (a streamed answer included).
+    pub timeout: Duration,
+}
+
+/// What ClickHouse reports about the work behind an answer (`X-ClickHouse-Summary`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuerySummary {
+    /// Rows read from the tables.
+    pub read_rows: u64,
+    /// Bytes read from the tables.
+    pub read_bytes: u64,
+}
+
+impl QuerySummary {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        let Some(text) = headers
+            .get("x-clickhouse-summary")
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Self::default();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+            return Self::default();
+        };
+        Self {
+            read_rows: json_u64(&v["read_rows"]),
+            read_bytes: json_u64(&v["read_bytes"]),
+        }
+    }
+}
+
+/// The rows of a streamed answer.
+pub struct RowStream {
+    response: reqwest::Response,
+    buf: Vec<u8>,
+    done: bool,
+}
+
+impl RowStream {
+    /// The next row, or `None` at the end of the answer. An error that ClickHouse reports after it has started
+    /// to answer (a memory or time limit hit mid-way) arrives here.
+    pub async fn next_row(&mut self) -> Result<Option<serde_json::Value>, ChError> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                return parse_row(&text).map(Some);
+            }
+            if self.done {
+                if self.buf.iter().all(u8::is_ascii_whitespace) {
+                    return Ok(None);
+                }
+                let line = std::mem::take(&mut self.buf);
+                return parse_row(&String::from_utf8_lossy(&line)).map(Some);
+            }
+            match self
+                .response
+                .chunk()
+                .await
+                .map_err(|e| ChError::Connection(e.without_url().to_string()))?
+            {
+                Some(chunk) => self.buf.extend_from_slice(&chunk),
+                None => self.done = true,
+            }
+        }
+    }
+}
+
+fn parse_row(line: &str) -> Result<serde_json::Value, ChError> {
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) => {
+            if let Some(e) = v.get("exception").and_then(|e| e.as_str()) {
+                return Err(ChError::Server {
+                    status: 200,
+                    message: truncate(e.trim(), 600),
+                });
+            }
+            Ok(v)
+        }
+        Err(_) if line.contains("DB::Exception") || line.starts_with("Code:") => {
+            Err(ChError::Server {
+                status: 200,
+                message: truncate(line.trim(), 600),
+            })
+        }
+        Err(e) => Err(ChError::Connection(format!("unparsable answer: {e}"))),
+    }
+}
+
 /// A 64-bit unsigned integer from a JSON answer (ClickHouse quotes them) or a plain number.
 pub fn json_u64(v: &serde_json::Value) -> u64 {
     match v {
@@ -267,6 +450,26 @@ mod tests {
         );
         assert_eq!(json_u64(&serde_json::json!(12)), 12);
         assert_eq!(json_u64(&serde_json::json!(null)), 0);
+    }
+
+    #[test]
+    fn rows_parse_and_mid_stream_errors_surface() {
+        assert_eq!(parse_row("{\"a\":1.5}").unwrap()["a"], 1.5);
+        // Floats survive the round trip exactly.
+        let v = parse_row("{\"x\":983.6709816088288}").unwrap();
+        assert_eq!(
+            v["x"].as_f64().unwrap().to_bits(),
+            983.6709816088288f64.to_bits()
+        );
+        let e =
+            parse_row("{\"exception\":\"Code: 241. DB::Exception: Memory limit\"}").unwrap_err();
+        assert!(matches!(e, ChError::Server { .. }), "{e:?}");
+        let e = parse_row("Code: 159. DB::Exception: Timeout exceeded").unwrap_err();
+        assert!(matches!(e, ChError::Server { .. }), "{e:?}");
+        assert!(matches!(
+            parse_row("garbage").unwrap_err(),
+            ChError::Connection(_)
+        ));
     }
 
     #[test]

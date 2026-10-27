@@ -1,5 +1,6 @@
-//! The gRPC server (V1-6, V1-7, V1-11): `Stream.Subscribe` with resume, the symbol RPCs of `Control`, a stub for
-//! `History` and `UNIMPLEMENTED` for the rest of `Control`, all behind the bearer token interceptor.
+//! The gRPC server (V1-6, V1-7, V1-11, V3b): `Stream.Subscribe` with resume, `History` (`Query`, `Aggregate`), the
+//! symbol and alert RPCs of `Control` and `UNIMPLEMENTED` for the rest of `Control`, all behind the bearer token
+//! interceptor.
 //!
 //! With `[tls]` the listener serves TLS ([`crate::tls`], certificate hot reload) on any address. Without it the
 //! server accepts only a loopback bind unless `server.allow_plaintext` is set, because the token would travel
@@ -29,7 +30,7 @@ pub use stats::{GrpcSnapshot, GrpcStats};
 pub use stream::{
     ClientStream, Filter, Start, StreamConfig, StreamService, ZERO_ID, resolve_start,
 };
-pub use stub::HistoryStub;
+pub use stub::{HistoryBackend, HistoryStub};
 
 use crate::alerts::AlertsManager;
 use crate::auth::{
@@ -126,6 +127,8 @@ pub struct ServeOptions {
     pub symbols: Option<Arc<SymbolManager>>,
     /// Backend of the rule and channel RPCs of `Control`; without it they answer `UNIMPLEMENTED`.
     pub alerts: Option<Arc<AlertsManager>>,
+    /// Backend of `History`; without it the service answers `UNIMPLEMENTED`.
+    pub history: Option<Arc<crate::query::HistoryService>>,
 }
 
 impl ServeOptions {
@@ -138,6 +141,7 @@ impl ServeOptions {
             stream: StreamConfig::from_server(server),
             symbols: None,
             alerts: None,
+            history: None,
         }
     }
 }
@@ -220,7 +224,10 @@ where
         // One layer in front of the router: every path is authenticated, including services that do not exist.
         .layer(InterceptorLayer::new(interceptor))
         .add_service(StreamServer::new(stream))
-        .add_service(HistoryServer::new(HistoryStub))
+        .add_service(HistoryServer::new(match options.history.clone() {
+            Some(h) => HistoryBackend::Live(crate::query::HistoryHandle(h)),
+            None => HistoryBackend::Stub(HistoryStub),
+        }))
         .add_service(ControlServer::new(
             ControlService::new(options.symbols.clone()).with_alerts(options.alerts.clone()),
         ))
@@ -256,6 +263,7 @@ impl GrpcHandle {
 }
 
 /// Binds the listener and starts serving in the background: TLS when `tls` is given, plaintext otherwise.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     server: &ServerConfig,
     tls: Option<Arc<TlsReloader>>,
@@ -263,6 +271,7 @@ pub async fn start(
     authority: Arc<TokenAuthority>,
     symbols: Option<Arc<SymbolManager>>,
     alerts: Option<Arc<AlertsManager>>,
+    history: Option<Arc<crate::query::HistoryService>>,
     shutdown: CancellationToken,
 ) -> Result<GrpcHandle, GrpcError> {
     let tls_enabled = tls.is_some();
@@ -292,6 +301,7 @@ pub async fn start(
         let mut options = ServeOptions::from_server(server);
         options.symbols = symbols;
         options.alerts = alerts;
+        options.history = history;
         async move {
             let result = match tls {
                 Some(tls) => {

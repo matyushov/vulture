@@ -182,3 +182,36 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "No fresh ClickHouse disk and table statistics for {{ $value | humanizeDuration }}"
+
+  - name: vulture-history-api
+    rules:
+      - alert: VultureHistoryErrors
+        # Internal errors and ClickHouse trouble seen by History callers (limits and bad requests do not count).
+        expr: sum(rate(vulture_history_requests_total{code=~"internal|unavailable"}[10m])) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "History calls are failing ({{ $value | humanize }}/s with internal or unavailable); check ClickHouse and Redis"
+
+      - alert: VultureHistoryClickHouseFallback
+        expr: increase(vulture_history_redis_fallbacks_total[15m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "History answered from the Redis hot window because ClickHouse failed"
+
+      - alert: VultureHistorySlow
+        # The slowest call since start is a poor alert on its own; the mean over 15 minutes is the signal.
+        expr: >-
+          sum by (method) (rate(vulture_history_request_seconds_total[15m]))
+          / clamp_min(sum by (method) (rate(vulture_history_requests_total[15m])), 1e-9) > 5
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "History {{ $labels.method }} calls average {{ $value | humanize }} s"
+
+      - alert: VultureHistoryRejectingCalls
+        expr: sum(rate(vulture_history_rejections_total{reason="concurrency"}[10m])) > 0
+        for: 10m
+        labels: {severity: info}
+        annotations:
+          summary: "History calls are refused for exceeding history.max_concurrent"

@@ -21,8 +21,8 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # Throwaway Redis and ClickHouse for the storage integration tests (crates/vulture-server/tests/redis_store.rs
-    # and clickhouse_history.rs). Both are skipped locally when the variables below are not set.
+    # Throwaway Redis and ClickHouse for the storage integration tests (crates/vulture-server/tests/redis_store.rs,
+    # clickhouse_history.rs and history_clickhouse.rs). Both are skipped locally when the variables below are not set.
     services:
       redis:
         image: redis:7
