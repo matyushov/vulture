@@ -93,7 +93,8 @@ INSERT INTO liquidations SELECT 'binance', concat('SYM', toString(number % 50), 
   fromUnixTimestamp64Milli(toInt64(1788220800000 + number * 60000)), fromUnixTimestamp64Milli(toInt64(1788220800000 + number * 60000 + 80)),
   CAST(number % 3 AS Int8), 100 + number / 7, 0.5 + (number % 11), (100 + number / 7) * (0.5 + (number % 11)), concat(toString(1788220800000 + number * 60000), '-', toString(number % 5))
 FROM numbers(50000);
-INSERT INTO open_interest SELECT 'binance', concat('SYM', toString(number % 500), '-USDT-PERP'), concat('SYM', toString(number % 500), 'USDT'),
+INSERT INTO open_interest (exchange, symbol, symbol_raw, exchange_ts, recv_ts, oi_base, oi_usd, mark_price, event_id)
+SELECT 'binance', concat('SYM', toString(number % 500), '-USDT-PERP'), concat('SYM', toString(number % 500), 'USDT'),
   fromUnixTimestamp64Milli(toInt64(1788220800000 + intDiv(number, 500) * 30000)), fromUnixTimestamp64Milli(toInt64(1788220800000 + intDiv(number, 500) * 30000 + 120)),
   1000 + number / 3, if(number % 2 = 0, 5.0e7 + number, NULL), if(number % 3 = 0, 1.5 + number % 100, NULL), concat(toString(1788220800000 + number), '-0')
 FROM numbers(300000);
@@ -109,7 +110,8 @@ ch "$RUN-a" -q "BACKUP DATABASE vulture TO Disk('backups', 'verify_full') FORMAT
 
 echo "== more data, then incremental backup"
 chi "$RUN-a" --database vulture --multiquery <<'SQL'
-INSERT INTO open_interest SELECT 'binance', concat('SYM', toString(number % 500), '-USDT-PERP'), concat('SYM', toString(number % 500), 'USDT'),
+INSERT INTO open_interest (exchange, symbol, symbol_raw, exchange_ts, recv_ts, oi_base, oi_usd, mark_price, event_id)
+SELECT 'binance', concat('SYM', toString(number % 500), '-USDT-PERP'), concat('SYM', toString(number % 500), 'USDT'),
   fromUnixTimestamp64Milli(toInt64(1788220800000 + 86400000 * 40 + intDiv(number, 500) * 30000)), fromUnixTimestamp64Milli(toInt64(1788220800000 + 86400000 * 40 + intDiv(number, 500) * 30000 + 100)),
   2000 + number / 3, NULL, NULL, concat('late-', toString(number))
 FROM numbers(20000);
