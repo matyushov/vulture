@@ -31,12 +31,12 @@
     <part_log>
         <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
     </part_log>
-    <metric_log>
-        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
-    </metric_log>
-    <asynchronous_metric_log>
-        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
-    </asynchronous_metric_log>
+    <!-- metric_log (about a thousand columns, sampled every second) and asynchronous_metric_log made the background
+         merges the main CPU consumer of a small machine (about 1.4 cores around the clock). Prometheus metrics of
+         vulture and node-level tools cover the same ground. After the upgrade drop the leftover tables:
+         DROP TABLE IF EXISTS system.metric_log, system.asynchronous_metric_log. -->
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
     <error_log>
         <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
     </error_log>
