@@ -30,6 +30,51 @@ protected:
     QString getTickLabel(double tick, const QLocale &, QChar, int) override { return fmt::price(tick); }
 };
 
+/// Date/time ticker whose labels follow the timeframe: the format is the timeframe's, except that day-less formats
+/// ("MM-dd" for 4h and 1d) gain the time when the ticks are closer than a day (zoomed in), and the time-only format
+/// gains the date when they are a day or more apart.
+class TimeTicker : public QCPAxisTickerDateTime
+{
+public:
+    void setBaseFormat(const QString &format)
+    {
+        m_base = format;
+        setDateTimeFormat(format);
+    }
+    const QString &baseFormat() const { return m_base; }
+    void setZone(const QTimeZone &zone)
+    {
+        m_zone = zone;
+        setTimeZone(zone);
+    }
+    QString currentFormat() const
+    {
+        const bool hasTime = m_base.contains(QLatin1String("HH"));
+        const bool hasDate = m_base.contains(QLatin1String("dd"));
+        if (!hasTime && m_step > 0 && m_step < 86'399)
+            return QStringLiteral("MM-dd HH:mm");
+        if (hasTime && !hasDate && m_step >= 86'399)
+            return QStringLiteral("MM-dd");
+        return m_base;
+    }
+
+protected:
+    double getTickStep(const QCPRange &range) override
+    {
+        m_step = QCPAxisTickerDateTime::getTickStep(range);
+        return m_step;
+    }
+    QString getTickLabel(double tick, const QLocale &locale, QChar, int) override
+    {
+        return locale.toString(keyToDateTime(tick).toTimeZone(m_zone), currentFormat());
+    }
+
+private:
+    QString m_base = QStringLiteral("HH:mm");
+    QTimeZone m_zone = QTimeZone::utc();
+    double m_step = 0;
+};
+
 QCPRange padded(double lo, double hi, double fraction, double minSpanRel = 0.002)
 {
     if (!(lo <= hi) || !std::isfinite(lo) || !std::isfinite(hi))
@@ -68,6 +113,14 @@ QcpChartView::QcpChartView(QWidget *parent) : QWidget(parent)
     m_badge = new QLabel(QStringLiteral("≈ approximate"), this);
     m_badge->setAttribute(Qt::WA_TransparentForMouseEvents, false);
     m_badge->hide();
+    m_partialBadge = new QLabel(QStringLiteral("◪ partial data"), this);
+    m_partialBadge->setAttribute(Qt::WA_TransparentForMouseEvents, false);
+    m_partialBadge->setToolTip(QStringLiteral("The hatched bins overlap a gap or a hole in the server's data: the liquidation sums "
+                                              "there are lower bounds and the open interest change is an estimate."));
+    m_partialBadge->hide();
+    m_status = new QLabel(this);
+    m_status->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_status->hide();
     m_tooltip = new QLabel(this);
     m_tooltip->setAttribute(Qt::WA_TransparentForMouseEvents);
     m_tooltip->setTextFormat(Qt::PlainText);
@@ -113,9 +166,9 @@ void QcpChartView::buildPlot()
         rect->setRangeZoom(Qt::Horizontal);
         rect->setRangeDragAxes(m_x[i], nullptr);
         rect->setRangeZoomAxes(m_x[i], nullptr);
-        auto ticker = QSharedPointer<QCPAxisTickerDateTime>::create();
-        ticker->setDateTimeFormat(QStringLiteral("HH:mm"));
-        ticker->setTimeZone(QTimeZone::utc());
+        auto ticker = QSharedPointer<TimeTicker>::create();
+        ticker->setBaseFormat(QStringLiteral("HH:mm"));
+        ticker->setZone(QTimeZone::utc());
         m_x[i]->setTicker(ticker);
         m_x[i]->setTickLabels(i == kPanels - 1); // one row of time labels, under the last panel
         m_y[i]->setPadding(4);
@@ -248,6 +301,9 @@ void QcpChartView::applyColors()
     }
     m_badge->setStyleSheet(QStringLiteral("QLabel { background: %1; color: %2; border: 1px solid %2; border-radius: 3px; padding: 1px 5px; }")
                                .arg(m_colors.warningTint.name(), palette().color(QPalette::Text).name()));
+    m_partialBadge->setStyleSheet(m_badge->styleSheet());
+    m_status->setStyleSheet(QStringLiteral("QLabel { background: %1; color: %2; border-radius: 3px; padding: 1px 6px; }")
+                                .arg(m_colors.tooltipBg.name(), m_colors.tooltipText.name()));
     m_tooltip->setStyleSheet(QStringLiteral("QLabel { background: %1; color: %2; border: 1px solid %3; border-radius: 3px; }")
                                  .arg(m_colors.tooltipBg.name(), m_colors.tooltipText.name(), m_colors.crosshair.name()));
     rebuildGaps();
@@ -293,20 +349,34 @@ void QcpChartView::setUtc(bool utc)
 {
     m_utc = utc;
     for (int i = 0; i < kPanels; ++i) {
-        auto ticker = qSharedPointerCast<QCPAxisTickerDateTime>(m_x[i]->ticker());
+        auto ticker = qSharedPointerCast<TimeTicker>(m_x[i]->ticker());
         if (ticker)
-            ticker->setTimeZone(utc ? QTimeZone::utc() : QTimeZone::systemTimeZone());
+            ticker->setZone(utc ? QTimeZone::utc() : QTimeZone::systemTimeZone());
     }
     if (m_cursorBin >= 0)
         m_tooltip->setText(binTooltip(m_snap, m_cursorBin, m_utc));
     m_plot->replot(QCustomPlot::rpQueuedReplot);
 }
 
+QString QcpChartView::axisFormat() const
+{
+    auto ticker = qSharedPointerCast<TimeTicker>(m_x[kPanels - 1]->ticker());
+    return ticker ? ticker->currentFormat() : QString();
+}
+
 void QcpChartView::setSnapshot(const ChartSnapshot &snapshot)
 {
-    const bool follow = m_snap.bins.isEmpty() || !zoomed();
+    // A zoom belongs to one series: another symbol or timeframe starts at the full range.
+    const bool sameSeries = !m_snap.bins.isEmpty() && m_snap.exchange == snapshot.exchange && m_snap.symbol == snapshot.symbol &&
+                            m_snap.spec.timeframe == snapshot.spec.timeframe;
+    const bool follow = !sameSeries || !zoomed();
     const qint64 oldFirst = m_snap.firstStart();
     m_snap = snapshot;
+    for (QCPAxis *x : m_x) {
+        auto ticker = qSharedPointerCast<TimeTicker>(x->ticker());
+        if (ticker)
+            ticker->setBaseFormat(axisLabelFormat(m_snap.spec.timeframe));
+    }
     updateTitles();
     applyData();
     rebuildGaps();
@@ -386,8 +456,41 @@ void QcpChartView::rebuildGaps()
     for (QCPAbstractItem *item : std::as_const(m_gapItems))
         m_plot->removeItem(item);
     m_gapItems.clear();
+    for (QCPAbstractItem *item : std::as_const(m_partialItems))
+        m_plot->removeItem(item);
+    m_partialItems.clear();
     if (m_snap.bins.isEmpty())
         return;
+    // Runs of bins the server marked partial: one hatched rectangle per run and panel.
+    for (int i = 0; i < m_snap.bins.size();) {
+        if (!m_snap.bins.at(i).serverPartial) {
+            ++i;
+            continue;
+        }
+        int j = i;
+        while (j + 1 < m_snap.bins.size() && m_snap.bins.at(j + 1).serverPartial)
+            ++j;
+        const double from = m_snap.bins.at(i).start / 1000.0;
+        const double to = (m_snap.bins.at(j).start + m_snap.spec.timeframe.ms) / 1000.0;
+        for (int p = 0; p < kPanels; ++p) {
+            auto *r = new QCPItemRect(m_plot);
+            r->setLayer(QStringLiteral("overlay"));
+            r->setClipAxisRect(m_rects[p]);
+            r->setClipToAxisRect(true);
+            for (QCPItemPosition *pos : {r->topLeft, r->bottomRight}) {
+                pos->setAxes(m_x[p], m_y[p]);
+                pos->setTypeX(QCPItemPosition::ptPlotCoords);
+                pos->setTypeY(QCPItemPosition::ptAxisRectRatio);
+                pos->setAxisRect(m_rects[p]);
+            }
+            r->topLeft->setCoords(from, 0);
+            r->bottomRight->setCoords(to, 1);
+            r->setPen(Qt::NoPen);
+            r->setBrush(QBrush(m_colors.partialHatch, Qt::BDiagPattern));
+            m_partialItems.append(r);
+        }
+        i = j + 1;
+    }
     const double lo = fullRange().lower;
     const double hi = fullRange().upper;
     for (const GapBand &g : std::as_const(m_snap.gaps)) {
@@ -433,10 +536,17 @@ void QcpChartView::applyStates()
     }
     m_badge->setVisible(m_snap.approximatePrice);
     m_badge->setToolTip(m_snap.approximateReason.isEmpty()
-                            ? QStringLiteral("Candles are built from the mark prices seen in the stream (30 s samples).")
-                            : QStringLiteral("Exchange candles are unavailable (%1). Candles are built from the mark prices "
-                                             "seen in the stream (30 s samples).")
+                            ? QStringLiteral("Candles are built from mark prices (the server's samples or the stream's, every 30 s).")
+                            : QStringLiteral("Exchange candles are unavailable (%1). Candles are built from mark prices "
+                                             "(the server's samples or the stream's, every 30 s).")
                                   .arg(m_snap.approximateReason));
+    m_partialBadge->setVisible(m_snap.serverPartial);
+    const QString status = !m_snap.note.isEmpty() ? m_snap.note : m_snap.busy;
+    m_status->setText(status);
+    m_status->setVisible(!status.isEmpty());
+    QPalette sp = m_status->palette();
+    sp.setColor(QPalette::WindowText, !m_snap.note.isEmpty() ? m_colors.warningText : m_colors.tooltipText);
+    m_status->setPalette(sp);
 }
 
 void QcpChartView::updateYRanges()
@@ -620,6 +730,22 @@ void QcpChartView::positionOverlays()
         const QPoint tl = m_plot->mapTo(this, r.topRight());
         m_badge->move(tl.x() - m_badge->width() - 6, tl.y() + 4);
         m_badge->raise();
+    }
+    if (m_partialBadge->isVisible() || m_snap.serverPartial) {
+        m_partialBadge->adjustSize();
+        const QRect r = m_rects[1]->rect();
+        const QPoint tr = m_plot->mapTo(this, r.topRight());
+        // beside the right axis labels of the OI panel, inside the plot
+        m_partialBadge->move(tr.x() - m_partialBadge->width() - 6, tr.y() + 4);
+        m_partialBadge->raise();
+    }
+    if (m_status->isVisible()) {
+        m_status->adjustSize();
+        const QRect r = m_rects[0]->rect();
+        const QPoint tl = m_plot->mapTo(this, r.topLeft());
+        // top-centre of the price panel
+        m_status->move(tl.x() + (r.width() - m_status->width()) / 2, tl.y() + 22);
+        m_status->raise();
     }
 }
 

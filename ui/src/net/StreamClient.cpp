@@ -2,12 +2,10 @@
 #include "net/StreamClient.h"
 
 #include "net/ErrorText.h"
+#include "net/GrpcChannel.h"
 #include "net/ReplayCursor.h"
 
 #include <QDateTime>
-#include <QFile>
-#include <QSslCertificate>
-#include <QSslConfiguration>
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/security/credentials.h>
@@ -110,18 +108,6 @@ bool convert(const v1::Event &ev, Interner &names, FeedEvent *out)
     default:
         return false;
     }
-}
-
-std::string systemRootsPem()
-{
-    static const std::string pem = [] {
-        QByteArray all;
-        const auto certs = QSslConfiguration::systemCaCertificates();
-        for (const QSslCertificate &c : certs)
-            all += c.toPem();
-        return all.toStdString();
-    }();
-    return pem;
 }
 
 } // namespace
@@ -282,25 +268,14 @@ void StreamClient::run(ConnectionConfig config, Options options)
     };
 
     // Channel: TLS with the user's CA file or the system roots; plaintext only for loopback (validated).
-    std::shared_ptr<grpc::ChannelCredentials> creds;
-    if (config.tls) {
-        grpc::SslCredentialsOptions ssl;
-        if (!config.caFile.isEmpty()) {
-            QFile f(config.caFile);
-            if (!f.open(QIODevice::ReadOnly)) {
-                ConnectionStatus st;
-                st.state = ConnState::Error;
-                st.message = QStringLiteral("Cannot read the CA file: %1").arg(f.errorString());
-                postStatus(st);
-                return;
-            }
-            ssl.pem_root_certs = f.readAll().toStdString();
-        } else {
-            ssl.pem_root_certs = systemRootsPem(); // empty = gRPC built-in roots
-        }
-        creds = grpc::SslCredentials(ssl);
-    } else {
-        creds = grpc::InsecureChannelCredentials();
+    QString credentialsError;
+    std::shared_ptr<grpc::ChannelCredentials> creds = makeCredentials(config, &credentialsError);
+    if (!creds) {
+        ConnectionStatus st;
+        st.state = ConnState::Error;
+        st.message = credentialsError;
+        postStatus(st);
+        return;
     }
     grpc::ChannelArguments args;
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, options.keepaliveMs);

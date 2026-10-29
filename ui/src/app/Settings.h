@@ -28,6 +28,9 @@ public:
 
     bool utc() const;
     void setUtc(bool utc);
+    /// Timeframe of the chart ("1m" ... "1d"), global, not per symbol. An unknown or missing value reads as "5m".
+    QString chartTimeframe() const;
+    void setChartTimeframe(const QString &label);
     double largeThresholdUsd() const;
     void setLargeThresholdUsd(double usd);
     bool notificationsEnabled() const;

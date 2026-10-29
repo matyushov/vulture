@@ -146,9 +146,48 @@ bool hasKlineSource(const QString &exchange)
     return exchange == QLatin1String("binance") || exchange == QLatin1String("bybit") || exchange == QLatin1String("okx");
 }
 
-QUrl klineUrl(const QString &exchange, const QString &rawSymbol, const Timeframe &tf, int count, const QString &baseUrl)
+QString klineInterval(const QString &exchange, const Timeframe &tf)
 {
     const qint64 minutes = tf.ms / 60'000;
+    const bool known = minutes == 1 || minutes == 5 || minutes == 15 || minutes == 60 || minutes == 240 || minutes == 1440;
+    if (!known)
+        return {};
+    // "1m", "1h", "4h", "1d" from the length, whatever the label says.
+    const QString lower = minutes >= 1440 ? QStringLiteral("%1d").arg(minutes / 1440)
+                          : minutes >= 60 ? QStringLiteral("%1h").arg(minutes / 60)
+                                          : QStringLiteral("%1m").arg(minutes);
+    if (exchange == QLatin1String("binance"))
+        return lower;
+    if (exchange == QLatin1String("bybit"))
+        return minutes == 1440 ? QStringLiteral("D") : QString::number(minutes);
+    if (exchange == QLatin1String("okx")) {
+        // OKX's plain "1D" opens at 16:00 UTC (Hong Kong midnight); "1Dutc" opens at 00:00 UTC like our bins. The
+        // hourly bars ("1H", "4H") already open on UTC multiples.
+        if (minutes == 1440)
+            return QStringLiteral("1Dutc");
+        return minutes >= 60 ? lower.toUpper() : lower;
+    }
+    return {};
+}
+
+int klinePageLimit(const QString &exchange)
+{
+    if (exchange == QLatin1String("binance"))
+        return 1500;
+    if (exchange == QLatin1String("bybit"))
+        return 1000;
+    if (exchange == QLatin1String("okx"))
+        return 300;
+    return 0;
+}
+
+QUrl klineUrl(const QString &exchange, const QString &rawSymbol, const Timeframe &tf, int count, const QString &baseUrl,
+              qint64 endExclusiveMs)
+{
+    const int limit = std::clamp(count, 1, std::max(1, klinePageLimit(exchange)));
+    const QString interval = klineInterval(exchange, tf);
+    if (interval.isEmpty())
+        return {};
     QUrlQuery q;
     QString host;
     QString path;
@@ -156,21 +195,27 @@ QUrl klineUrl(const QString &exchange, const QString &rawSymbol, const Timeframe
         host = QString::fromLatin1(kBinanceHost);
         path = QStringLiteral("/fapi/v1/klines");
         q.addQueryItem(QStringLiteral("symbol"), rawSymbol);
-        q.addQueryItem(QStringLiteral("interval"), tf.label); // "5m"
-        q.addQueryItem(QStringLiteral("limit"), QString::number(count));
+        q.addQueryItem(QStringLiteral("interval"), interval);
+        if (endExclusiveMs > 0) // endTime is inclusive: the last candle that opens before the bound
+            q.addQueryItem(QStringLiteral("endTime"), QString::number(endExclusiveMs - 1));
+        q.addQueryItem(QStringLiteral("limit"), QString::number(limit));
     } else if (exchange == QLatin1String("bybit")) {
         host = QString::fromLatin1(kBybitHost);
         path = QStringLiteral("/v5/market/kline");
         q.addQueryItem(QStringLiteral("category"), QStringLiteral("linear"));
         q.addQueryItem(QStringLiteral("symbol"), rawSymbol);
-        q.addQueryItem(QStringLiteral("interval"), QString::number(minutes)); // "5"
-        q.addQueryItem(QStringLiteral("limit"), QString::number(count));
+        q.addQueryItem(QStringLiteral("interval"), interval);
+        if (endExclusiveMs > 0)
+            q.addQueryItem(QStringLiteral("end"), QString::number(endExclusiveMs - 1));
+        q.addQueryItem(QStringLiteral("limit"), QString::number(limit));
     } else if (exchange == QLatin1String("okx")) {
         host = QString::fromLatin1(kOkxHost);
         path = QStringLiteral("/api/v5/market/candles");
         q.addQueryItem(QStringLiteral("instId"), rawSymbol);
-        q.addQueryItem(QStringLiteral("bar"), tf.label); // "5m"
-        q.addQueryItem(QStringLiteral("limit"), QString::number(count));
+        q.addQueryItem(QStringLiteral("bar"), interval);
+        if (endExclusiveMs > 0) // "after": records earlier than this timestamp
+            q.addQueryItem(QStringLiteral("after"), QString::number(endExclusiveMs));
+        q.addQueryItem(QStringLiteral("limit"), QString::number(limit));
     } else {
         return {};
     }

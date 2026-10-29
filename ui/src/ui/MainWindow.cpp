@@ -5,6 +5,7 @@
 #include "ui/PreferencesDialog.h"
 #include "util/Format.h"
 
+#include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
 #include <QGuiApplication>
@@ -30,6 +31,11 @@ MainWindow::MainWindow(Settings *settings, QWidget *parent)
     m_options.setUtc(settings->utc());
     m_options.setLargeThresholdUsd(settings->largeThresholdUsd());
     m_notifier.setEnabled(settings->notificationsEnabled());
+    // The timeframe of the chart is global and remembered; set it before the first symbol is selected.
+    if (const auto tf = Timeframe::fromLabel(settings->chartTimeframe()))
+        m_chart.setTimeframe(*tf);
+    connect(&m_chart, &ChartController::timeframeChanged, this,
+            [this](const Timeframe &tf) { m_settings->setChartTimeframe(tf.label); });
     m_favorites.fromList(settings->favorites());
     connect(&m_favorites, &Favorites::changed, this, [this] { m_settings->setFavorites(m_favorites.toList()); });
 
@@ -126,6 +132,30 @@ void MainWindow::buildMenus()
         m_options.setUtc(utc);
         m_settings->setUtc(utc);
     });
+    QMenu *timeframe = view->addMenu(QStringLiteral("Chart &timeframe"));
+    auto *timeframeGroup = new QActionGroup(this);
+    timeframeGroup->setExclusive(true);
+    int number = 1;
+    for (const Timeframe &tf : Timeframe::all()) {
+        QAction *a = timeframe->addAction(QStringLiteral("%1 (%2)").arg(tf.label, spanText(ChartSpec::defaultSpanMs(tf))));
+        a->setCheckable(true);
+        a->setActionGroup(timeframeGroup);
+        a->setShortcut(QKeySequence(Qt::CTRL | static_cast<Qt::Key>(Qt::Key_0 + number++)));
+        a->setData(tf.label);
+        m_timeframeActions.insert(tf.label, a);
+        connect(a, &QAction::triggered, this, [this, tf] { m_chart.setTimeframe(tf); });
+    }
+    auto syncTimeframes = [this] {
+        for (const Timeframe &tf : Timeframe::all()) {
+            if (QAction *a = m_timeframeActions.value(tf.label)) {
+                a->setChecked(tf == m_chart.timeframe());
+                a->setEnabled(m_chart.timeframeAvailable(tf));
+            }
+        }
+    };
+    syncTimeframes();
+    connect(&m_chart, &ChartController::timeframeChanged, this, syncTimeframes);
+    connect(&m_chart, &ChartController::availabilityChanged, this, syncTimeframes);
     m_panelsMenu = view->addMenu(QStringLiteral("&Panels"));
     connect(m_panelsMenu, &QMenu::aboutToShow, this, [this] {
         m_panelsMenu->clear();

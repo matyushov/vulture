@@ -37,6 +37,8 @@ SemanticColors semanticColors(const QPalette &palette)
     c.oiLine = blend(text, base, 0.15);
     c.gapBand = c.warningText;
     c.gapBand.setAlphaF(0.17);
+    c.partialHatch = c.warningText;
+    c.partialHatch.setAlphaF(0.6);
     c.chartGrid = blend(base, text, 0.12);
     c.chartAxis = blend(text, base, 0.20);
     c.crosshair = blend(base, text, 0.70);

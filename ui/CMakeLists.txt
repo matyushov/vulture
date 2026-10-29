@@ -106,6 +106,8 @@ set(VULTURE_UI_CORE_SOURCES
     src/net/ConnectionConfig.h src/net/ConnectionConfig.cpp
     src/net/ConnectionStatus.h
     src/net/ErrorText.h src/net/ErrorText.cpp
+    src/net/GrpcChannel.h src/net/GrpcChannel.cpp
+    src/net/HistoryClient.h src/net/HistoryProto.h src/net/HistoryClient.cpp
     src/net/StreamClient.h src/net/StreamClient.cpp
     src/app/Settings.h src/app/Settings.cpp
     src/app/LargeLiquidationNotifier.h src/app/LargeLiquidationNotifier.cpp

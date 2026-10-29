@@ -1,8 +1,8 @@
 # vulture-ui
 
 Desktop client for the vulture server (GPLv3, Qt 6 Widgets, grpc++, vendored QCustomPlot). Stage 1: connection and live
-views; stage 1.1: resizable columns, OI change columns, the three-panel symbol chart. History/Aggregate screens, alert
-settings and administration come in later stages.
+views; stage 1.1: resizable columns, OI change columns, the three-panel symbol chart; stage 1.2: the chart's timeframe
+switch (1m to 1d) over `History.Aggregate` and exchange klines. Alert settings and administration come in later stages.
 
 ## Build and test
 
@@ -31,7 +31,7 @@ resubscribes live and adds a warning row; `UNAUTHENTICATED` stops retrying; `RES
 ## Layout
 
 One tab per exchange (Binance, Bybit, OKX, then others), created when the stream shows the exchange, plus Alerts
-and Admin placeholder tabs. Each exchange tab has movable, closable docks: Symbols, Live feed, Chart (placeholder),
+and Admin placeholder tabs. Each exchange tab has movable, closable docks: Symbols, Live feed, Chart,
 Summary. View > Panels re-opens a closed dock, View > Reset layout restores the defaults.
 
 * Symbols: favorites star, search, favorites-only, sortable columns (latest OI USD, **OI Δ5m**, **OI Δ15m**, mark price,
@@ -54,25 +54,69 @@ Summary. View > Panels re-opens a closed dock, View > Reset layout restores the 
   not highlighted, do not count in the session counters; replayed OI snapshots only feed the symbol list. The replay
   (tens of thousands of events) is ingested in slices (<= 8 ms per event-loop turn). The client clock should be NTP
   synchronized: events written before the call start minus 2 s (server id time against the local clock) count as replayed.
-* Chart dock (the selected symbol, one chart stream at a time): three panels over 2 hours with 5 minute bins aligned to UTC
-  (the timeframe is a parameter, `ChartSpec` in `chart/Timeframe.h`): price candles, OI change per bin (bars, up/down) with
-  the OI level as a line on the right axis, liquidations per bin (USD of liquidated shorts up, longs down). One time axis,
-  synchronized zoom/pan on X (wheel, drag, double click or "Reset zoom"), Y scaled independently to the visible bins. A
-  through cursor: a vertical line across all panels snapped to bin centers, a horizontal guide in the hovered panel and one
-  tooltip with the time and the values of all three panels (arrows and signs, not only colors). Server Gap events are
-  shaded across the panels. States are written in the panels ("Loading 2h of history...", "No data...", the error text,
-  "Not connected").
-  * Candles come from the exchange's public REST klines (no keys; Binance USDT-M `/fapi/v1/klines`, Bybit v5
-    `/v5/market/kline?category=linear`, OKX `/api/v5/market/candles`), 24 candles, refreshed at each bin rollover; the
-    forming candle follows the stream's mark price. Prices of multiplier contracts are divided and volumes multiplied by the
-    multiplier: the leading digits of the raw symbol when they are a power of ten above 1 (`1000PEPEUSDT`, `10000...`) or `1M`
-    (a million), only when the normalized base lost the prefix (`PEPE-USDT-PERP`; `1000PEPE-USDT-PERP` after an alias
-    collision is unscaled); `1INCH` is not a multiplier; OKX is never scaled. If the request fails, candles are built from
-    the mark prices of the stream (30 s samples) and the panel carries an "approximate" badge with the reason.
-  * OI and liquidations come from a dedicated `Stream.Subscribe` with the exchange and symbol filter and `resume_from = now - 2h
-    - one bin` (one bin more gives the first bin a baseline), cancelled when the symbol changes.
-  * Binning: OI change of a bin = last level of the bin minus the last level before it (across empty bins); the first bin
-    without an earlier level uses the first sample of the bin, with a single sample it is unknown (no bar).
+* Chart dock (the selected symbol): three panels (price candles; OI change per bin as bars with the OI level as a line on the
+  right axis; liquidations per bin, USD of liquidated shorts up and longs down) on one time axis, with a **timeframe switch**
+  in the dock's header and a through cursor.
+  * **Timeframes.** Buttons **1m, 5m, 15m, 1h, 4h, 1d** (checkable, one active; the same choice is in View > Chart timeframe
+    with Ctrl/Cmd+1 ... Ctrl/Cmd+6). The choice is global (not per symbol) and saved in the settings (`chart/timeframe`, default
+    5m; an unknown saved value reads as 5m). Default ranges (owner's decision of 2026-10-25), ending with the bin that contains
+    "now":
+
+    | Timeframe | 1m | 5m | 15m | 1h | 4h | 1d |
+    |---|---|---|---|---|---|---|
+    | Range | 2 h | 6 h | 24 h | 7 days | 30 days | 90 days |
+    | Bins | 120 | 72 | 96 | 168 | 180 | 90 |
+
+    Bins are aligned to UTC for every timeframe (4h and 1d bins start at 00:00 UTC multiples), exactly like the server's
+    `Aggregate` bins. Axis labels follow the timeframe: time of day (`HH:mm`) for 1m, 5m, 15m; `MM-dd HH:mm` for 1h; the date
+    (`MM-dd`) for 4h and 1d (zoomed in, so that ticks are closer than a day, the date-only format gains the time); the UTC/local
+    switch applies to labels and tooltip. The tooltip starts with the bin start (`yyyy-MM-dd HH:mm`, the date only for 1d), the
+    zone and the timeframe, then price, OI and liquidations. A zoom belongs to one series: another symbol or timeframe shows
+    the full range; double click or "Reset zoom" returns to the default range.
+  * **Data sources.**
+    * Open interest and liquidations: one `History.Aggregate` request per chart load (group by symbol, filtered to the exchange
+      and symbol, the step of the timeframe, the range widened by one bin before it so the first bin has an OI change). Metrics:
+      liquidation USD by side and the count, OI level and OI change per bin (base units), mark price OHLC (kept as the price
+      fallback). The forming (last) bin stays live from a dedicated `Stream.Subscribe` filtered to the symbol, live only (no
+      replay), started **before** the request so nothing falls between them: events whose time is at or after the moment the
+      request was sent are added to the server's numbers (liquidation sums, counts; the last OI sample sets the level and the
+      change against the bin before), older ones are taken to be in the answer already. When the next bin starts the aggregate
+      is requested once more (and the candles once); live events then move the new bin. The client clock should be NTP
+      synchronized (the same as for the replay marking). The server counts liquidations without the side, so the tooltip of a
+      server bin shows `(n events)` instead of a count per side.
+    * Price candles: the exchanges' public REST klines, no keys (Binance USDT-M `1m/5m/15m/1h/4h/1d`, Bybit v5
+      `1/5/15/60/240/D`, OKX `1m/5m/15m/1H/4H/1Dutc`: OKX's plain `1D` opens at 16:00 UTC, `1Dutc` at 00:00 UTC like our bins).
+      The range is read in **pages** walking back from the newest candle (one page is at most 1500 candles on Binance, 1000 on
+      Bybit, 300 on OKX; the default ranges fit one page, a free range may need several), requests to one exchange are spaced
+      at least 250 ms, an HTTP 429 or 418 fails the request and is never retried, answers are cached per (exchange, raw symbol,
+      interval) for 20 s and serve any later request they cover (so switching back and forth does not hit the exchange), and
+      prices of multiplier contracts are scaled as in 1.1. The newest candle is the forming one and follows the stream's mark
+      price.
+    * Fallbacks: if the klines fail, candles are built from the server's mark price OHLC of the bins (an approximation, the
+      "approximate" badge with the reason) and, without that, from the marks seen in the stream; with nothing at all the price
+      panel shows the error. If the aggregate fails (`UNAVAILABLE`, `OUT_OF_RANGE`, `RESOURCE_EXHAUSTED`, a timeout) the panels
+      say so, or, when data is already on screen, a note appears beside it and the request is repeated after 30 s.
+  * **An old server (History `UNIMPLEMENTED`).** The chart falls back to the stage 1.1 behavior: a bounded stream replay of
+    at most six hours for 1m, 5m and 15m (15m shows 6 h instead of 24 h), and the buttons for 1h, 4h and 1d are disabled with
+    a tooltip; with 1h/4h/1d selected the OI and liquidation panels say that the server has no History API while the exchange
+    candles still show. A new connection forgets this and asks the server again.
+  * **Honest states.** "Loading 1h data..." (a label over the chart) while a request is in flight; the previous chart (same
+    exchange) stays visible until something of the new one arrives; "Updating..." for the refresh at a bin rollover;
+    "No open interest data in the last 6h", errors, "Not connected" notes. A request in flight is cancelled when the symbol or
+    timeframe changes (one aggregate request, one candle request and one chart subscription at a time); an answer of an
+    earlier request is dropped by its id and never overwrites a newer selection.
+  * **`partial` markers.** A bin the server marks `partial` (it overlaps a Gap of a source the metrics need, or lies inside a
+    data hole) is hatched across all three panels, the OI panel carries a "partial data" badge, and its tooltip says "server
+    data partial": liquidation sums there are lower bounds and the OI change is an estimate. Stream `Gap` events are still
+    shaded (solid tint). Bins the server did not return, and OI the server reported as absent, stay empty (no bar), never
+    zero.
+  * **Free ranges.** The range is a first-class value (`ChartRange {from, to}` in `chart/Timeframe.h`, `ChartSpec::custom`,
+    `ChartController::setCustomRange()`): the aggregate request, the kline pages and the model's bins all work for any range
+    within the server's limits (a range that ends in the past has no forming bin and no live stream). There is no UI for it
+    yet (planned: selection by mouse and "load history for the interval").
+  * Server Gap events are shaded across the panels; the OI Δ5m / Δ15m columns of the symbols list are unchanged (still from the
+    20 minute replay): `oi_movers` returns only the top lists (`limit` per side), not a value for every symbol, so it cannot
+    replace them as they are.
 * Live feed: newest first, last 50 000 events kept; filters (kind, side, minimum USD, symbol), search (Ctrl/Cmd+F),
   pause with queued counter (Space), copy, CSV export of the visible rows. UTC/local switch in View. USD sign: a
   liquidated long is a forced sale (minus, down arrow), a liquidated short a forced purchase (plus, up arrow).
@@ -85,7 +129,7 @@ Summary. View > Panels re-opens a closed dock, View > Reset layout restores the 
 INI file in the user profile (macOS: `~/Library/Preferences/vulture/vulture-ui.ini`); `--settings-file <path>`
 overrides it. It is created and kept with mode 0600 where the platform supports it (not on Windows). It holds the
 server address, TLS flag, CA path, the token (only if "Remember" is ticked, in plain text), window geometry, dock
-layouts, UTC switch, favorites, threshold and notification flag.
+layouts, UTC switch, the chart timeframe, favorites, threshold and notification flag.
 
 ## Colors
 
@@ -102,8 +146,10 @@ See `research/ui-stage1-notes.md` and `research/ui-1-1-notes.md`.
 
 ## Limitations
 
-No alerts or admin yet; the chart has a fixed 5 minute timeframe and no History data (only what the hot window holds, up
-to 2 hours); one server at a time; the chart needs direct access to the exchange REST endpoints (otherwise the approximate
-fallback is shown); color scheme follows the system (Qt color scheme API; on the offscreen plugin it is ignored).
+No alerts or admin yet; no free interval selection (the data path supports it, the UI does not); one server at a time; the
+chart needs direct access to the exchange REST endpoints (otherwise the approximate fallback is shown); the server counts
+liquidations without the side, so server bins have no per-side counts; the chart's live bin and the server's last aggregate
+can double count an event for a moment around the request (corrected by the next refresh); color scheme follows the system
+(Qt color scheme API; on the offscreen plugin it is ignored).
 
 Settings from stage 1: the saved dock layouts are ignored once (key `layout_v2`), because the chart dock needs more room.

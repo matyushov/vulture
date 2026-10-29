@@ -2,6 +2,7 @@
 #include "TestUtil.h"
 #include "app/LargeLiquidationNotifier.h"
 #include "app/Settings.h"
+#include "chart/Timeframe.h"
 #include "model/Favorites.h"
 #include "net/ConnectionConfig.h"
 #include "net/ErrorText.h"
@@ -87,6 +88,29 @@ private slots:
         QVERIFY(s.dockLayout("bybit").isEmpty());
         s.clearDockLayouts();
         QVERIFY(s.dockLayout("binance").isEmpty());
+    }
+
+    void chartTimeframeIsRememberedGloballyAndValidated()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("settings.ini");
+        {
+            Settings s(path);
+            QCOMPARE(s.chartTimeframe(), QString("5m")); // the default
+            for (const Timeframe &tf : Timeframe::all()) {
+                s.setChartTimeframe(tf.label);
+                QCOMPARE(Settings(path).chartTimeframe(), tf.label); // read back by a fresh object
+            }
+            s.setChartTimeframe("7m"); // not a timeframe of the switch: ignored
+            QCOMPARE(Settings(path).chartTimeframe(), QString("1d"));
+        }
+        QVERIFY(read(path).contains("timeframe=1d"));
+        QVERIFY(!read(path).contains("BTC")); // global: no symbol in the key
+        {
+            QSettings raw(path, QSettings::IniFormat);
+            raw.setValue("chart/timeframe", "bogus");
+        }
+        QCOMPARE(Settings(path).chartTimeframe(), QString("5m"));
     }
 
     void tokenIsNotStoredUnlessRemembered()

@@ -5,8 +5,10 @@
 #include "chart/ChartView.h"
 #include "model/DisplayOptions.h"
 
+#include <QButtonGroup>
 #include <QLabel>
 #include <QPushButton>
+#include <QHash>
 #include <QStackedLayout>
 #include <QWidget>
 
@@ -24,15 +26,20 @@ public:
     ChartView *view() { return m_view; }
     /// True when the chart currently shows a symbol of this exchange.
     bool showing() const { return m_showing; }
+    /// The timeframe switch (1m, 5m, 15m, 1h, 4h, 1d); checkable, exactly one is checked.
+    QPushButton *timeframeButton(const QString &label) const { return m_buttons.value(label, nullptr); }
 
 private:
     void refresh();
+    void refreshButtons();
 
     ChartController *m_controller;
     const DisplayOptions *m_options;
     QString m_exchange;
     QLabel *m_title;
     QPushButton *m_reset;
+    QButtonGroup *m_group;
+    QHash<QString, QPushButton *> m_buttons;
     QLabel *m_hint;
     ChartView *m_view;
     QWidget *m_chartPage;

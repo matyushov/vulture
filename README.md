@@ -54,8 +54,11 @@ ui/build/b/vulture-ui
 ```
 
 Without conan or Qt the UI targets are disabled with a warning. Besides grpc++, the UI vendors QCustomPlot (GPLv3) in
-`ui/third_party/qcustomplot/` for the symbol chart; it adds no conan dependency. Tests never leave the machine: the fake
-gRPC and HTTP servers listen on 127.0.0.1 (`QT_QPA_PLATFORM=offscreen`; screenshots with `VULTURE_UI_SHOT_DIR=<dir>`).
+`ui/third_party/qcustomplot/` for the symbol chart; it adds no conan dependency. The chart has a timeframe switch (1m, 5m,
+15m, 1h, 4h, 1d): open interest and liquidations come from `History.Aggregate` (the V3b API below), the forming bin from a
+live `Stream.Subscribe`, candles from the exchanges' public REST klines; ranges, fallbacks and the `partial` markers are in
+[ui/README.md](ui/README.md). Tests never leave the machine: the fake gRPC (Stream and History) and HTTP servers listen on
+127.0.0.1 (`QT_QPA_PLATFORM=offscreen`; screenshots with `VULTURE_UI_SHOT_DIR=<dir>`).
 
 Example configuration: [config.example.toml](config.example.toml). Secrets are not
 added to the repository.

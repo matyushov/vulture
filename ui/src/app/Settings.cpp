@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "app/Settings.h"
 
+#include "chart/Timeframe.h"
+
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -14,6 +16,7 @@ constexpr auto kCaFile = "connection/ca_file";
 constexpr auto kToken = "connection/token";
 constexpr auto kRemember = "connection/remember_token";
 constexpr auto kUtc = "display/utc";
+constexpr auto kChartTimeframe = "chart/timeframe";
 constexpr auto kThreshold = "display/large_liquidation_usd";
 constexpr auto kNotify = "display/notifications";
 constexpr auto kFavorites = "favorites/list";
@@ -109,6 +112,18 @@ void Settings::setConnection(const ConnectionConfig &config, bool remember)
 
 bool Settings::utc() const { return m_settings->value(kUtc, true).toBool(); }
 void Settings::setUtc(bool v) { m_settings->setValue(kUtc, v); flush(); }
+QString Settings::chartTimeframe() const
+{
+    const QString label = m_settings->value(kChartTimeframe).toString();
+    return Timeframe::fromLabel(label) ? label : Timeframe::defaultFrame().label;
+}
+void Settings::setChartTimeframe(const QString &label)
+{
+    if (!Timeframe::fromLabel(label))
+        return;
+    m_settings->setValue(kChartTimeframe, label);
+    flush();
+}
 double Settings::largeThresholdUsd() const { return m_settings->value(kThreshold, 100'000.0).toDouble(); }
 void Settings::setLargeThresholdUsd(double v) { m_settings->setValue(kThreshold, v); flush(); }
 bool Settings::notificationsEnabled() const { return m_settings->value(kNotify, true).toBool(); }

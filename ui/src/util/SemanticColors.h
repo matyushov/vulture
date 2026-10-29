@@ -36,6 +36,7 @@ struct SemanticColors
     QColor liqShort;     ///< liquidated shorts (forced buying), drawn up
     QColor liqLong;      ///< liquidated longs (forced selling), drawn down
     QColor gapBand;      ///< data-gap shading (translucent, drawn behind the series)
+    QColor partialHatch; ///< hatch over bins the server marked partial (a Gap or a data hole inside the bin)
     QColor chartGrid;
     QColor chartAxis;    ///< axis lines and tick labels
     QColor crosshair;

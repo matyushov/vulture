@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "vulture/v1/history.grpc.pb.h"
 #include "vulture/v1/stream.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
 
 #include <atomic>
+#include <initializer_list>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -48,7 +50,8 @@ struct SeenCall
     std::vector<std::string> symbols;
 };
 
-/// In-process Stream.Subscribe server on 127.0.0.1 for client tests (plaintext, or TLS with the test certificate).
+/// In-process Stream.Subscribe server on 127.0.0.1 for client tests (plaintext, or TLS with the test certificate). It
+/// also hosts History.Aggregate: without a handler that method answers UNIMPLEMENTED, like an old server.
 class FakeStreamServer final : public v1::Stream::Service
 {
 public:
@@ -65,6 +68,16 @@ public:
     /// Sends an event to every open HoldOpen stream.
     void broadcast(const v1::Event &event);
 
+    /// Serves History.Aggregate with `handler` (called on a gRPC thread; `ctx->IsCancelled()` tells a cancelled call).
+    using AggregateHandler =
+        std::function<grpc::Status(grpc::ServerContext *ctx, const v1::AggregateRequest &, v1::AggregateResponse *)>;
+    void setAggregateHandler(AggregateHandler handler);
+    std::vector<v1::AggregateRequest> aggregateRequests() const;
+    /// Aggregate calls whose handler is running now.
+    int runningAggregates() const { return m_aggregateRunning.load(); }
+    /// Aggregate calls the server saw cancelled by the client.
+    int cancelledAggregates() const { return m_aggregateCancelled.load(); }
+
     std::vector<SeenCall> seen() const;
     int subscribeCount() const;
     int openStreams() const { return m_open.load(); }
@@ -76,6 +89,13 @@ public:
                            grpc::ServerWriter<v1::Event> *writer) override;
 
 private:
+    class HistoryImpl;
+    friend class HistoryImpl;
+    std::unique_ptr<HistoryImpl> m_historyService;
+    AggregateHandler m_aggregateHandler;
+    std::vector<v1::AggregateRequest> m_aggregateSeen;
+    std::atomic<int> m_aggregateRunning{0};
+    std::atomic<int> m_aggregateCancelled{0};
     std::string m_token;
     bool m_tls;
     int m_port = 0;
@@ -94,6 +114,10 @@ v1::Event liquidation(const std::string &id, const std::string &exchange, const 
                       double price, double qty, double usd, long long ts = 1'700'000'000'000LL);
 v1::Event openInterest(const std::string &id, const std::string &exchange, const std::string &symbol, double oiBase,
                        double oiUsd, double mark, long long ts = 1'700'000'000'000LL);
+/// Adds a row to an Aggregate answer; a NaN value leaves the metric without a value (no data in the bin).
+void addRow(v1::AggregateResponse &response, const std::string &group, long long start, long long end,
+            std::initializer_list<std::pair<v1::Metric, double>> values, bool partial = false);
+
 v1::Event gap(const std::string &id, const std::string &exchange, const std::string &stream, long long from,
               long long to);
 

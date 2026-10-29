@@ -4,10 +4,13 @@
 #include "chart/Klines.h"
 #include "chart/Timeframe.h"
 #include "model/FeedEvent.h"
+#include "net/HistoryClient.h"
 
 #include <QObject>
 #include <QString>
 #include <QVector>
+
+#include <QMap>
 
 #include <functional>
 
@@ -26,7 +29,8 @@ struct PanelState
 struct ChartBin
 {
     qint64 start = 0; ///< UTC-aligned bin start, ms
-    bool partial = false; ///< the current bin
+    bool partial = false; ///< the current (forming) bin
+    bool serverPartial = false; ///< the server marked the bin partial: a Gap or a data hole, the sums are lower bounds
 
     // price panel
     bool hasCandle = false;
@@ -43,6 +47,9 @@ struct ChartBin
     double liqLongUsd = 0;
     int liqShortCount = 0;
     int liqLongCount = 0;
+    /// False for bins from the server: it counts liquidations without the side, only `liqCountTotal` is known.
+    bool liqCountsBySide = true;
+    int liqCountTotal = 0;
 };
 
 struct GapBand
@@ -65,10 +72,15 @@ struct ChartSnapshot
     PanelState price;
     PanelState oi;
     PanelState liq;
-    bool approximatePrice = false; ///< candles are built from stream mark prices, not exchange klines
+    bool approximatePrice = false; ///< candles are built from mark prices (server or stream), not exchange klines
     QString approximateReason;     ///< why (the kline error), for the badge tooltip
+    bool serverPartial = false;    ///< at least one bin carries the server's `partial` flag
+    QString dataSource;            ///< "server (clickhouse+redis)", "stream replay", ... for the heading tooltip
+    QString busy;                  ///< a request is in flight ("Loading 1h...", "Updating..."); the data shown may be old
+    QString note;                  ///< a warning that does not replace the data (a refresh failed)
 
     qint64 firstStart() const { return bins.isEmpty() ? 0 : bins.first().start; }
+    bool hasData() const { return price.ready() || oi.ready() || liq.ready(); }
     /// Index of the bin containing `ts`, or -1 outside the range.
     int binIndexAt(qint64 ts) const;
 };
@@ -101,6 +113,9 @@ void applyCandles(QVector<ChartBin> &bins, const QVector<Candle> &candles);
 /// Lets marks newer than `since` move the last bin's candle (the forming candle follows the stream's mark price).
 void extendFormingCandle(QVector<ChartBin> &bins, const Timeframe &tf, const QVector<MarkPoint> &marks, qint64 since);
 
+/// The bin start as the tooltip shows it ("2026-10-25 12:05" for intraday and 4h bins, "2026-10-25" for 1d).
+QString binStartText(qint64 start, const Timeframe &tf, bool utc);
+
 /// Text of the shared tooltip for one bin: time, then price, open interest and liquidations (with arrows and signs,
 /// not colors only).
 QString binTooltip(const ChartSnapshot &snap, int index, bool utc);
@@ -112,12 +127,18 @@ class SymbolChartModel : public QObject
     Q_OBJECT
 public:
     using Clock = std::function<qint64()>;
+    /// Where open interest and liquidations come from: the server's `History.Aggregate` bins plus the live stream
+    /// (Server), or the events of a bounded stream replay binned here (Replay, the stage 1.1 behavior and the default
+    /// of a bare model; setHistory() switches to Server).
+    enum class Source { Server, Replay };
 
     explicit SymbolChartModel(QObject *parent = nullptr);
 
     void setClock(Clock clock) { m_clock = std::move(clock); }
     void setSpec(const ChartSpec &spec);
     const ChartSpec &spec() const { return m_spec; }
+    void setSource(Source source);
+    Source source() const { return m_source; }
 
     /// Selects a symbol and drops all data and states (kline and history loading start as Loading when `load`).
     void setTarget(const QString &exchange, const QString &symbol, const QString &symbolRaw, bool load = true);
@@ -128,6 +149,14 @@ public:
 
     /// Events of the chart subscription (already symbol-filtered by the server; others are ignored here too).
     void addEvents(const FeedBatch &batch);
+
+    /// Server bins of the target (replaces the earlier ones). Live events with a time from `result.requestedAt` on are
+    /// added on top of them; older live events are taken to be part of the server's numbers already.
+    void setHistory(const HistoryResult &result);
+    bool hasServerData() const { return m_hasServerData; }
+    /// A short note shown beside the data (for example that a refresh failed); empty clears it.
+    void setNote(const QString &note);
+    void setBusy(const QString &busy);
 
     void setKlines(const QVector<Candle> &candles, qint64 fetchedAtMs);
     void setKlineError(const QString &error);
@@ -148,6 +177,7 @@ private:
 
     Clock m_clock;
     ChartSpec m_spec = ChartSpec::standard();
+    Source m_source = Source::Replay; ///< a bare model bins events; setHistory() switches to the server bins
     QString m_exchange;
     QString m_symbol;
     QString m_symbolRaw;
@@ -157,6 +187,14 @@ private:
     QVector<LiqPoint> m_liq;
     QVector<GapBand> m_gaps;
     qint64 m_lastOiTs = 0;
+
+    QMap<qint64, HistoryBin> m_server; ///< by bin start
+    bool m_hasServerData = false;
+    bool m_serverPartial = false;
+    QString m_serverSource;
+    qint64 m_liveFrom = 0;
+    QString m_busy;
+    QString m_note;
 
     QVector<Candle> m_klines;
     qint64 m_klinesFetchedAt = 0;

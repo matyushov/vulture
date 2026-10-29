@@ -170,6 +170,14 @@ void extendFormingCandle(QVector<ChartBin> &bins, const Timeframe &tf, const QVe
     }
 }
 
+QString binStartText(qint64 start, const Timeframe &tf, bool utc)
+{
+    QDateTime t = QDateTime::fromMSecsSinceEpoch(start, QTimeZone::UTC);
+    if (!utc)
+        t = t.toLocalTime();
+    return t.toString(tooltipTimeFormat(tf));
+}
+
 QString binTooltip(const ChartSnapshot &snap, int index, bool utc)
 {
     if (index < 0 || index >= snap.bins.size())
@@ -179,13 +187,13 @@ QString binTooltip(const ChartSnapshot &snap, int index, bool utc)
     const QString base = snap.baseCoin;
     QStringList lines;
     {
-        QDateTime t = QDateTime::fromMSecsSinceEpoch(b.start, QTimeZone::UTC);
-        if (!utc)
-            t = t.toLocalTime();
-        lines << QStringLiteral("%1  %2-%3 %4 (%5%6)")
-                     .arg(t.toString(QStringLiteral("yyyy-MM-dd")), clock(b.start, utc),
-                          clock(b.start + snap.spec.timeframe.ms, utc), zone, snap.spec.timeframe.label,
-                          b.partial ? QStringLiteral(", current bin, partial") : QString());
+        QStringList flags;
+        flags << snap.spec.timeframe.label;
+        if (b.partial)
+            flags << QStringLiteral("current bin, partial");
+        if (b.serverPartial)
+            flags << QStringLiteral("server data partial: gap or hole, sums are lower bounds");
+        lines << QStringLiteral("%1 %2 (%3)").arg(binStartText(b.start, snap.spec.timeframe, utc), zone, flags.join(QStringLiteral(", ")));
     }
 
     if (b.hasCandle) {
@@ -197,7 +205,7 @@ QString binTooltip(const ChartSnapshot &snap, int index, bool utc)
         if (std::isfinite(b.volume))
             line += QStringLiteral("  Vol %1 %2").arg(fmt::compactNumber(b.volume), base);
         if (snap.approximatePrice)
-            line += QStringLiteral("  [approximate, from stream marks]");
+            line += QStringLiteral("  [approximate, from mark prices]");
         lines << line;
     } else {
         lines << QStringLiteral("Price  no candle");
@@ -212,11 +220,17 @@ QString binTooltip(const ChartSnapshot &snap, int index, bool utc)
     } else {
         lines << QStringLiteral("OI  no samples");
     }
-    lines << QStringLiteral("Liq  shorts ▲ %1 (%2)   longs ▼ %3 (%4)")
-                 .arg(fmt::compactUsd(b.liqShortUsd))
-                 .arg(b.liqShortCount)
-                 .arg(fmt::compactUsd(b.liqLongUsd))
-                 .arg(b.liqLongCount);
+    if (b.liqCountsBySide) {
+        lines << QStringLiteral("Liq  shorts ▲ %1 (%2)   longs ▼ %3 (%4)")
+                     .arg(fmt::compactUsd(b.liqShortUsd))
+                     .arg(b.liqShortCount)
+                     .arg(fmt::compactUsd(b.liqLongUsd))
+                     .arg(b.liqLongCount);
+    } else {
+        lines << QStringLiteral("Liq  shorts ▲ %1   longs ▼ %2   (%3 events)")
+                     .arg(fmt::compactUsd(b.liqShortUsd), fmt::compactUsd(b.liqLongUsd))
+                     .arg(b.liqCountTotal);
+    }
     for (const GapBand &g : snap.gaps) {
         if (g.from < b.start + snap.spec.timeframe.ms && g.to > b.start)
             lines << QStringLiteral("Data gap (%1): %2-%3").arg(g.stream.isEmpty() ? QStringLiteral("stream") : g.stream,
@@ -235,6 +249,12 @@ void SymbolChartModel::setSpec(const ChartSpec &spec)
     emit changed();
 }
 
+void SymbolChartModel::setSource(Source source)
+{
+    m_source = source;
+    emit changed();
+}
+
 void SymbolChartModel::setTarget(const QString &exchange, const QString &symbol, const QString &symbolRaw, bool load)
 {
     m_exchange = exchange;
@@ -245,6 +265,13 @@ void SymbolChartModel::setTarget(const QString &exchange, const QString &symbol,
     m_liq.clear();
     m_gaps.clear();
     m_lastOiTs = 0;
+    m_server.clear();
+    m_hasServerData = false;
+    m_serverPartial = false;
+    m_serverSource.clear();
+    m_liveFrom = 0;
+    m_busy.clear();
+    m_note.clear();
     m_klines.clear();
     m_klinesFetchedAt = 0;
     m_klineError.clear();
@@ -311,6 +338,39 @@ void SymbolChartModel::prune()
         m_gaps.removeFirst();
 }
 
+void SymbolChartModel::setHistory(const HistoryResult &result)
+{
+    m_source = Source::Server;
+    m_server.clear();
+    for (const HistoryBin &b : result.bins)
+        m_server.insert(b.start, b);
+    m_hasServerData = true;
+    m_serverPartial = result.partial;
+    m_serverSource = result.source;
+    m_liveFrom = result.requestedAt;
+    m_historyLoading = false;
+    m_historyError.clear();
+    m_historyText.clear();
+    m_note.clear();
+    emit changed();
+}
+
+void SymbolChartModel::setNote(const QString &note)
+{
+    if (m_note == note)
+        return;
+    m_note = note;
+    emit changed();
+}
+
+void SymbolChartModel::setBusy(const QString &busy)
+{
+    if (m_busy == busy)
+        return;
+    m_busy = busy;
+    emit changed();
+}
+
 void SymbolChartModel::setKlines(const QVector<Candle> &candles, qint64 fetchedAtMs)
 {
     m_klines = candles;
@@ -362,6 +422,18 @@ void SymbolChartModel::setHistoryText(const QString &text)
     emit changed();
 }
 
+namespace {
+
+int binIndex(const QVector<ChartBin> &bins, qint64 ts, qint64 binMs)
+{
+    if (bins.isEmpty() || ts < bins.first().start)
+        return -1;
+    const qint64 i = (ts - bins.first().start) / binMs;
+    return i < bins.size() ? static_cast<int>(i) : -1;
+}
+
+} // namespace
+
 ChartSnapshot SymbolChartModel::snapshot() const
 {
     ChartSnapshot s;
@@ -374,45 +446,128 @@ ChartSnapshot SymbolChartModel::snapshot() const
         s.price = s.oi = s.liq = PanelState{PanelState::Kind::Empty, QStringLiteral("Select a symbol")};
         return s;
     }
+    const Timeframe &tf = m_spec.timeframe;
+    const ChartRange range = m_spec.rangeAt(s.now);
     const int n = m_spec.binCount();
-    const qint64 first = firstBinStart(s.now, m_spec);
+    const qint64 first = range.from;
+    const bool forming = m_spec.reachesNow(s.now);
     s.bins.resize(n);
     for (int i = 0; i < n; ++i) {
-        s.bins[i].start = first + static_cast<qint64>(i) * m_spec.timeframe.ms;
-        s.bins[i].partial = (i == n - 1);
+        s.bins[i].start = first + static_cast<qint64>(i) * tf.ms;
+        s.bins[i].partial = forming && i == n - 1;
     }
     for (const GapBand &g : m_gaps) {
         if (g.to >= first)
             s.gaps.append(g);
     }
+    const QString span = spanText(m_spec.custom ? range.size() : m_spec.spanMs);
 
-    binOpenInterest(s.bins, m_spec.timeframe, m_oi);
-    binLiquidations(s.bins, m_spec.timeframe, m_liq);
+    if (m_source == Source::Replay) {
+        binOpenInterest(s.bins, tf, m_oi);
+        binLiquidations(s.bins, tf, m_liq);
+        s.dataSource = QStringLiteral("stream replay");
+    } else {
+        // Server bins first, then the live events newer than the server's answer on top.
+        for (ChartBin &b : s.bins) {
+            b.liqCountsBySide = false; // the server counts without the side, and so do the live additions
+            const auto it = m_server.constFind(b.start);
+            if (it == m_server.constEnd())
+                continue;
+            const HistoryBin &h = it.value();
+            b.serverPartial = h.partial;
+            b.liqShortUsd = std::isfinite(h.liqShortUsd) ? h.liqShortUsd : 0.0;
+            b.liqLongUsd = std::isfinite(h.liqLongUsd) ? h.liqLongUsd : 0.0;
+            b.liqCountTotal = std::isfinite(h.liqCount) ? static_cast<int>(h.liqCount) : 0;
+            if (std::isfinite(h.oiEnd)) {
+                b.hasOi = true;
+                b.oiLevel = h.oiEnd;
+                b.oiChange = h.oiChange;
+            }
+            s.serverPartial = s.serverPartial || h.partial;
+        }
+        if (m_hasServerData) {
+            // The level before the first bin is the baseline for a first change that the server left out.
+            double prevLevel = kNaN;
+            const auto before = m_server.constFind(first - tf.ms);
+            if (before != m_server.constEnd() && std::isfinite(before->oiEnd))
+                prevLevel = before->oiEnd;
+            QVector<bool> touched(n, false);
+            for (const OiPoint &p : m_oi) {
+                if (p.ts < m_liveFrom)
+                    continue;
+                const int i = binIndex(s.bins, p.ts, tf.ms);
+                if (i < 0)
+                    continue;
+                s.bins[i].hasOi = true;
+                s.bins[i].oiLevel = p.oiBase;
+                touched[i] = true;
+            }
+            for (int i = 0; i < n; ++i) {
+                ChartBin &b = s.bins[i];
+                if (touched[i])
+                    b.oiChange = std::isfinite(prevLevel) ? b.oiLevel - prevLevel : kNaN;
+                if (b.hasOi)
+                    prevLevel = b.oiLevel;
+            }
+            for (const LiqPoint &e : m_liq) {
+                if (e.ts < m_liveFrom || !std::isfinite(e.usd))
+                    continue;
+                const int i = binIndex(s.bins, e.ts, tf.ms);
+                if (i < 0)
+                    continue;
+                ChartBin &b = s.bins[i];
+                if (e.side == LiqSide::Short)
+                    b.liqShortUsd += e.usd;
+                else if (e.side == LiqSide::Long)
+                    b.liqLongUsd += e.usd;
+                else
+                    continue;
+                ++b.liqCountTotal;
+            }
+            s.dataSource = m_serverSource.isEmpty() ? QStringLiteral("server")
+                                                    : QStringLiteral("server (%1)").arg(m_serverSource);
+        }
+    }
 
     // Price panel.
+    auto anyCandle = [&s] {
+        return std::any_of(s.bins.cbegin(), s.bins.cend(), [](const ChartBin &b) { return b.hasCandle; });
+    };
     switch (m_klineState) {
     case KlineState::Ready: {
         applyCandles(s.bins, m_klines);
-        extendFormingCandle(s.bins, m_spec.timeframe, m_marks, m_klinesFetchedAt);
-        bool any = false;
-        for (const ChartBin &b : std::as_const(s.bins))
-            any = any || b.hasCandle;
-        s.price = any ? PanelState{PanelState::Kind::Ready, {}}
-                      : PanelState{PanelState::Kind::Empty, QStringLiteral("No candles for this symbol")};
+        extendFormingCandle(s.bins, tf, m_marks, m_klinesFetchedAt);
+        s.price = anyCandle() ? PanelState{PanelState::Kind::Ready, {}}
+                              : PanelState{PanelState::Kind::Empty, QStringLiteral("No candles for this symbol")};
         break;
     }
     case KlineState::Loading:
         s.price = PanelState{PanelState::Kind::Loading, QStringLiteral("Loading candles...")};
         break;
     case KlineState::Failed: {
-        // Fallback: candles from the mark prices of the stream, badged as approximate.
-        binMarks(s.bins, m_spec.timeframe, m_marks);
-        bool any = false;
-        for (const ChartBin &b : std::as_const(s.bins))
-            any = any || b.hasCandle;
-        s.approximatePrice = any;
+        // Fallback: the server's mark price OHLC of the bins, else the marks seen in the stream; both approximate.
+        if (m_source == Source::Server && m_hasServerData) {
+            for (ChartBin &b : s.bins) {
+                const auto it = m_server.constFind(b.start);
+                if (it == m_server.constEnd())
+                    continue;
+                const HistoryBin &h = it.value();
+                if (std::isfinite(h.markOpen) && std::isfinite(h.markHigh) && std::isfinite(h.markLow) &&
+                    std::isfinite(h.markClose) && h.markOpen > 0) {
+                    b.hasCandle = true;
+                    b.open = h.markOpen;
+                    b.high = h.markHigh;
+                    b.low = h.markLow;
+                    b.close = h.markClose;
+                }
+            }
+            extendFormingCandle(s.bins, tf, m_marks, m_liveFrom);
+        }
+        if (!anyCandle())
+            binMarks(s.bins, tf, m_marks);
+        s.approximatePrice = anyCandle();
         s.approximateReason = m_klineError;
-        if (any)
+        if (s.approximatePrice)
             s.price = PanelState{PanelState::Kind::Ready, {}};
         else if (m_historyLoading)
             s.price = PanelState{PanelState::Kind::Loading, QStringLiteral("Loading candles...")};
@@ -429,25 +584,34 @@ ChartSnapshot SymbolChartModel::snapshot() const
     bool anyOi = false;
     for (const ChartBin &b : std::as_const(s.bins))
         anyOi = anyOi || b.hasOi;
-    const bool anyLiq = std::any_of(s.bins.cbegin(), s.bins.cend(),
-                                    [](const ChartBin &b) { return b.liqShortCount + b.liqLongCount > 0; });
-    if (!m_historyText.isEmpty()) {
+    const bool anyLiq = std::any_of(s.bins.cbegin(), s.bins.cend(), [](const ChartBin &b) {
+        return b.liqShortUsd > 0 || b.liqLongUsd > 0 || b.liqShortCount + b.liqLongCount + b.liqCountTotal > 0;
+    });
+    const bool haveHistory = m_source == Source::Server ? m_hasServerData : anyOi;
+    if (!m_historyText.isEmpty() && !haveHistory) {
         s.oi = s.liq = PanelState{PanelState::Kind::Empty, m_historyText};
-    } else if (!m_historyError.isEmpty() && !anyOi) {
+    } else if (!m_historyError.isEmpty() && !haveHistory) {
         s.oi = s.liq = PanelState{PanelState::Kind::Error, m_historyError};
-    } else if (m_historyLoading && !anyOi) {
-        s.oi = s.liq = PanelState{PanelState::Kind::Loading, QStringLiteral("Loading 2h of history...")};
+    } else if (m_historyLoading && !haveHistory) {
+        s.oi = s.liq = PanelState{PanelState::Kind::Loading, QStringLiteral("Loading %1 of history...").arg(span)};
     } else {
         s.oi = anyOi ? PanelState{PanelState::Kind::Ready, {}}
-                     : PanelState{PanelState::Kind::Empty, QStringLiteral("No open interest data in the last 2 hours")};
-        if (anyLiq || anyOi) {
-            s.liq = PanelState{PanelState::Kind::Ready, anyLiq ? QString() : QStringLiteral("No liquidations in the last 2 hours")};
+                     : PanelState{PanelState::Kind::Empty, QStringLiteral("No open interest data in the last %1").arg(span)};
+        if (anyLiq || anyOi || (m_source == Source::Server && m_hasServerData)) {
+            s.liq = PanelState{PanelState::Kind::Ready, anyLiq ? QString() : QStringLiteral("No liquidations in the last %1").arg(span)};
         } else {
-            s.liq = PanelState{PanelState::Kind::Empty, QStringLiteral("No data in the last 2 hours")};
+            s.liq = PanelState{PanelState::Kind::Empty, QStringLiteral("No data in the last %1").arg(span)};
         }
-        if (m_historyLoading) // data keeps arriving: say it is still filling
+        if (m_historyLoading && m_source == Source::Replay) // data keeps arriving: say it is still filling
             s.oi.text = QStringLiteral("Loading history...");
     }
+    if (!m_historyText.isEmpty() && haveHistory)
+        s.note = m_historyText;
+    if (!m_historyError.isEmpty() && haveHistory)
+        s.note = m_historyError;
+    if (!m_note.isEmpty())
+        s.note = m_note;
+    s.busy = m_busy;
     return s;
 }
 

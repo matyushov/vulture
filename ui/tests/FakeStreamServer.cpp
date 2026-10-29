@@ -4,11 +4,48 @@
 #include "TestCerts.h"
 
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 namespace vulture::testing {
 
-FakeStreamServer::FakeStreamServer(std::string token, bool tls) : m_token(std::move(token)), m_tls(tls) {}
+class FakeStreamServer::HistoryImpl final : public v1::History::Service
+{
+public:
+    explicit HistoryImpl(FakeStreamServer *owner) : m_owner(owner) {}
+
+    grpc::Status Aggregate(grpc::ServerContext *ctx, const v1::AggregateRequest *request, v1::AggregateResponse *response) override
+    {
+        AggregateHandler handler;
+        {
+            std::lock_guard<std::mutex> lock(m_owner->m_mutex);
+            std::string authorization;
+            const auto it = ctx->client_metadata().find("authorization");
+            if (it != ctx->client_metadata().end())
+                authorization.assign(it->second.data(), it->second.size());
+            if (authorization != "Bearer " + m_owner->m_token)
+                return {grpc::StatusCode::UNAUTHENTICATED, "invalid or missing token"};
+            m_owner->m_aggregateSeen.push_back(*request);
+            handler = m_owner->m_aggregateHandler;
+        }
+        if (!handler)
+            return {grpc::StatusCode::UNIMPLEMENTED, "History is not implemented"};
+        ++m_owner->m_aggregateRunning;
+        const grpc::Status status = handler(ctx, *request, response);
+        --m_owner->m_aggregateRunning;
+        if (ctx->IsCancelled())
+            ++m_owner->m_aggregateCancelled;
+        return status;
+    }
+
+private:
+    FakeStreamServer *m_owner;
+};
+
+FakeStreamServer::FakeStreamServer(std::string token, bool tls)
+    : m_historyService(std::make_unique<HistoryImpl>(this)), m_token(std::move(token)), m_tls(tls)
+{
+}
 
 FakeStreamServer::~FakeStreamServer()
 {
@@ -28,6 +65,7 @@ bool FakeStreamServer::start()
     }
     builder.AddListeningPort("127.0.0.1:0", creds, &m_port);
     builder.RegisterService(this);
+    builder.RegisterService(m_historyService.get());
     m_server = builder.BuildAndStart();
     return m_server && m_port > 0;
 }
@@ -53,6 +91,18 @@ void FakeStreamServer::broadcast(const v1::Event &event)
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto *q : m_live)
         q->push_back(event);
+}
+
+void FakeStreamServer::setAggregateHandler(AggregateHandler handler)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_aggregateHandler = std::move(handler);
+}
+
+std::vector<v1::AggregateRequest> FakeStreamServer::aggregateRequests() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_aggregateSeen;
 }
 
 std::vector<SeenCall> FakeStreamServer::seen() const
@@ -214,6 +264,24 @@ v1::Event openInterest(const std::string &id, const std::string &exchange, const
     if (mark >= 0)
         o->set_mark_price(mark);
     return ev;
+}
+
+void addRow(v1::AggregateResponse &response, const std::string &group, long long start, long long end,
+            std::initializer_list<std::pair<v1::Metric, double>> values, bool partial)
+{
+    v1::AggregateRow *row = response.add_rows();
+    row->set_bucket_start(start);
+    row->set_bucket_end(end);
+    row->set_group(group);
+    row->set_partial(partial);
+    for (const auto &[metric, value] : values) {
+        v1::MetricValue *mv = row->add_values();
+        mv->set_metric(metric);
+        if (!std::isnan(value))
+            mv->set_value(value);
+    }
+    if (partial)
+        response.set_partial(true);
 }
 
 v1::Event gap(const std::string &id, const std::string &exchange, const std::string &stream, long long from,

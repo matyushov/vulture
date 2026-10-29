@@ -11,6 +11,7 @@
 #include "ui/ExchangeTab.h"
 #include "ui/StatusIndicator.h"
 
+#include <QHash>
 #include <QMainWindow>
 #include <QMap>
 #include <QSystemTrayIcon>
@@ -96,6 +97,7 @@ private:
     QAction *m_connectAction;
     QAction *m_disconnectAction;
     QAction *m_utcAction;
+    QHash<QString, QAction *> m_timeframeActions;
     QMenu *m_panelsMenu;
 };
 

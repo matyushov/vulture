@@ -43,10 +43,18 @@ double contractMultiplier(const QString &exchange, const QString &rawSymbol, con
 /// (BTC-USDT-PERP -> BTCUSDT, BTC-USDT-SWAP on OKX).
 QString exchangeSymbol(const QString &exchange, const QString &rawSymbol, const QString &normalizedSymbol);
 
-/// Public REST request for the last `count` candles of `timeframe`. `baseUrl` replaces the exchange's host (tests
-/// point it at a local server); empty = the real public endpoint. Empty URL for an exchange without a kline source.
+/// The exchange's interval string for a timeframe: Binance "1m/5m/15m/1h/4h/1d", Bybit "1/5/15/60/240/D", OKX
+/// "1m/5m/15m/1H/4H/1D". Empty for an exchange without a kline source or a timeframe it does not list.
+QString klineInterval(const QString &exchange, const Timeframe &timeframe);
+
+/// Most candles one request of the exchange's endpoint returns (Binance 1500, Bybit 1000, OKX 300); 0 = no source.
+int klinePageLimit(const QString &exchange);
+
+/// Public REST request for the `count` candles that end before `endExclusiveMs` (0 = the latest, forming one
+/// included). `count` is clamped to klinePageLimit(). `baseUrl` replaces the exchange's host (tests point it at a local
+/// server); empty = the real public endpoint. Empty URL for an exchange without a kline source.
 QUrl klineUrl(const QString &exchange, const QString &rawSymbol, const Timeframe &timeframe, int count,
-              const QString &baseUrl = {});
+              const QString &baseUrl = {}, qint64 endExclusiveMs = 0);
 bool hasKlineSource(const QString &exchange);
 
 /// Parsers of the three public kline responses. Candles are returned ascending, prices divided by `multiplier` and

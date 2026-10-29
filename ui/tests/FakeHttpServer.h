@@ -3,11 +3,14 @@
 
 #include <QByteArray>
 #include <QHash>
+#include <QElapsedTimer>
 #include <QObject>
 #include <QStringList>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
+
+#include <functional>
 
 namespace vulture::testing {
 
@@ -35,11 +38,21 @@ public:
         });
     }
 
-    bool start() { return m_server.listen(QHostAddress::LocalHost, 0); }
+    bool start()
+    {
+        m_clock.start();
+        return m_server.listen(QHostAddress::LocalHost, 0);
+    }
     QString baseUrl() const { return QStringLiteral("http://127.0.0.1:%1").arg(m_server.serverPort()); }
     void setReply(const Reply &r) { m_reply = r; }
     /// Request targets ("/path?query") in arrival order.
     QStringList requests() const { return m_requests; }
+    /// Arrival time of each request, ms since the server started (same order as requests()).
+    QList<qint64> requestTimes() const { return m_times; }
+    /// Answers the n-th request (0-based, in arrival order) with `reply` instead of the default one.
+    void setReplyFor(int index, const Reply &reply) { m_replies.insert(index, reply); }
+    /// Answers every request by calling `fn(target)` (overrides the other replies).
+    void setHandler(std::function<Reply(const QString &)> fn) { m_handler = std::move(fn); }
 
 private:
     void onData(QTcpSocket *s)
@@ -49,11 +62,16 @@ private:
         if (!buf.contains("\r\n\r\n"))
             return;
         const QList<QByteArray> parts = buf.left(buf.indexOf("\r\n")).split(' ');
-        m_requests.append(parts.value(1));
+        const int index = static_cast<int>(m_requests.size());
+        const QString target = QString::fromLatin1(parts.value(1));
+        m_requests.append(target);
+        m_times.append(m_clock.elapsed());
         buf.clear();
-        if (m_reply.hang)
+        Reply reply = m_replies.contains(index) ? m_replies.value(index) : m_reply;
+        if (m_handler)
+            reply = m_handler(target);
+        if (reply.hang)
             return;
-        const Reply reply = m_reply;
         QTimer::singleShot(reply.delayMs, s, [s, reply] {
             if (s->state() != QAbstractSocket::ConnectedState)
                 return;
@@ -66,6 +84,10 @@ private:
 
     QTcpServer m_server;
     Reply m_reply;
+    QHash<int, Reply> m_replies;
+    std::function<Reply(const QString &)> m_handler;
+    QElapsedTimer m_clock;
+    QList<qint64> m_times;
     QStringList m_requests;
     QHash<QTcpSocket *, QByteArray> m_buffers;
 };

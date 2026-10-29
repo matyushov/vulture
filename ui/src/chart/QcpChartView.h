@@ -30,6 +30,14 @@ public:
     QString tooltipText() const override { return m_tooltip->isVisible() ? m_tooltip->text() : QString(); }
     int binAtPosition(const QPoint &widgetPos, int *panel = nullptr) const override;
 
+    /// Text of the status label ("Loading 1h data...", a warning), "" when hidden.
+    QString statusText() const { return m_status->isVisible() ? m_status->text() : QString(); }
+    bool partialBadgeVisible() const { return m_partialBadge->isVisible(); }
+    /// Number of hatched rectangles for partial server bins (three per run of bins: one in each panel).
+    int partialBandCount() const { return static_cast<int>(m_partialItems.size()); }
+    /// Format of the time axis labels now in use (QDateTime format).
+    QString axisFormat() const;
+
     QCustomPlot *plot() { return m_plot; }
     bool zoomed() const;
     /// Number of gap rectangles drawn (three per gap: one in each panel).
@@ -74,9 +82,12 @@ private:
     QCPItemStraightLine *m_hline = nullptr;
     std::array<QCPItemText *, kPanels> m_titles{};
     QVector<QCPAbstractItem *> m_gapItems;
+    QVector<QCPAbstractItem *> m_partialItems;
 
     std::array<QLabel *, kPanels> m_stateLabels{};
     QLabel *m_badge = nullptr;
+    QLabel *m_partialBadge = nullptr;
+    QLabel *m_status = nullptr;
     QLabel *m_tooltip = nullptr;
 
     ChartSnapshot m_snap;

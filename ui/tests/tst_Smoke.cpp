@@ -84,28 +84,6 @@ StreamClient::Options fastOptions()
     return o;
 }
 
-QPalette testPalette(bool dark)
-{
-    // Used only where the platform plugin ignores QStyleHints::setColorScheme (offscreen): roughly the macOS palettes.
-    QPalette p;
-    const QColor window = dark ? QColor("#2b2b2b") : QColor("#ececec");
-    const QColor base = dark ? QColor("#1e1e1e") : QColor("#ffffff");
-    const QColor text = dark ? QColor("#f0f0f0") : QColor("#1a1a1a");
-    p.setColor(QPalette::Window, window);
-    p.setColor(QPalette::WindowText, text);
-    p.setColor(QPalette::Base, base);
-    p.setColor(QPalette::AlternateBase, dark ? QColor("#262626") : QColor("#f4f5f5"));
-    p.setColor(QPalette::Text, text);
-    p.setColor(QPalette::Button, dark ? QColor("#3a3a3a") : QColor("#e0e0e0"));
-    p.setColor(QPalette::ButtonText, text);
-    p.setColor(QPalette::PlaceholderText, dark ? QColor("#9a9a9a") : QColor("#707070"));
-    p.setColor(QPalette::Highlight, dark ? QColor("#0a4fb5") : QColor("#b3d4fc"));
-    p.setColor(QPalette::HighlightedText, dark ? QColor("#ffffff") : QColor("#000000"));
-    p.setColor(QPalette::ToolTipBase, base);
-    p.setColor(QPalette::ToolTipText, text);
-    return p;
-}
-
 /// Switches the color scheme through the Qt API; on platforms that ignore it (offscreen) installs an explicit palette.
 bool applyColorScheme(Qt::ColorScheme scheme)
 {
@@ -350,11 +328,11 @@ private slots:
         const qint64 bin = 300'000;
         const qint64 cur = now - now % bin;
         QByteArray klines = "[";
-        for (int i = 0; i < 24; ++i) {
+        for (int i = 0; i < 72; ++i) {
             const double p = 64'000 + 300 * std::sin(i / 3.0);
             const double o = p - 40 + (i % 3) * 30;
             const double c = p + 40 - (i % 4) * 25;
-            klines += (i ? "," : "") + QByteArray("[") + QByteArray::number(cur - (23 - i) * bin) + ",\"" +
+            klines += (i ? "," : "") + QByteArray("[") + QByteArray::number(cur - (71 - i) * bin) + ",\"" +
                       QByteArray::number(o, 'f', 1) + "\",\"" + QByteArray::number(std::max(o, c) + 35, 'f', 1) + "\",\"" +
                       QByteArray::number(std::min(o, c) - 30, 'f', 1) + "\",\"" + QByteArray::number(c, 'f', 1) + "\",\"" +
                       QByteArray::number(120 + i * 3) + "\"]";
@@ -373,6 +351,9 @@ private slots:
                                                      40'000.0 + 25'000.0 * ((i / 7) % 5), ts + 1));
         }
         history.events.push_back(gap("9-0", "binance", "open_interest", cur - 9 * bin, cur - 8 * bin));
+        // This fake server has no History: the chart's first, live-only subscription is dropped and the replay one
+        // (the stage 1.1 fallback) gets the history.
+        m_server->pushPlan(Plan{});
         m_server->pushPlan(history);
 
         // Select BTC in the symbols list: the chart dock loads it.
@@ -393,7 +374,7 @@ private slots:
         for (int i = 0; i < 2; ++i) {
             applyColorScheme(schemes[i]);
             QTest::qWait(200);
-            tab->chart()->view()->setCursorBin(15, 1, 0.0);
+            tab->chart()->view()->setCursorBin(60, 1, 0.0);
             QTest::qWait(150);
             const QImage img = m_window->grab().toImage();
             QVERIFY(!img.isNull());
@@ -420,6 +401,99 @@ private slots:
         }
         QGuiApplication::styleHints()->unsetColorScheme();
         QApplication::setPalette(QPalette());
+        tab->symbols()->searchEdit()->clear();
+        tab->symbols()->clearSelection();
+        QTRY_VERIFY_WITH_TIMEOUT(!chart->selected(), 3000);
+    }
+
+    void timeframeSwitchButtonsMenuShortcutsPersistenceAndOldServerState()
+    {
+        ExchangeTab *tab = m_window->exchangeTab("binance");
+        QVERIFY(tab);
+        m_window->tabs()->setCurrentWidget(tab);
+        ChartController *chart = m_window->chartController();
+        // The earlier chart test found out that this fake server has no History; a new connection forgets that.
+        chart->setConnection(config(), fastOptions());
+        QVERIFY(chart->historyAvailable());
+        QCOMPARE(chart->timeframe().label, QString("5m"));
+        QStringList labels;
+        for (const Timeframe &tf : Timeframe::all()) {
+            labels << tf.label;
+            QPushButton *button = tab->chart()->timeframeButton(tf.label);
+            QVERIFY2(button, qPrintable(tf.label));
+            QVERIFY(button->isCheckable());
+            QVERIFY(button->isEnabled());
+            QCOMPARE(button->isChecked(), tf.label == "5m"); // exactly one is active
+        }
+        QCOMPARE(labels, (QStringList{"1m", "5m", "15m", "1h", "4h", "1d"}));
+
+        // A button switches the controller and the choice is saved (global, not per symbol).
+        QTest::mouseClick(tab->chart()->timeframeButton("1h"), Qt::LeftButton);
+        QCOMPARE(chart->timeframe().label, QString("1h"));
+        QVERIFY(tab->chart()->timeframeButton("1h")->isChecked());
+        QVERIFY(!tab->chart()->timeframeButton("5m")->isChecked());
+        QCOMPARE(m_settings->chartTimeframe(), QString("1h"));
+
+        // The View menu has the same choice with Ctrl+1 ... Ctrl+6.
+        QAction *fifteen = nullptr;
+        QHash<QString, QKeySequence> keys;
+        for (QAction *a : m_window->findChildren<QAction *>()) {
+            if (a->actionGroup() && Timeframe::fromLabel(a->data().toString()).has_value()) {
+                keys.insert(a->data().toString(), a->shortcut());
+                if (a->data().toString() == "15m")
+                    fifteen = a;
+            }
+        }
+        QCOMPARE(keys.size(), 6);
+        QCOMPARE(keys["1m"], QKeySequence(Qt::CTRL | Qt::Key_1));
+        QCOMPARE(keys["1d"], QKeySequence(Qt::CTRL | Qt::Key_6));
+        QVERIFY(fifteen);
+        QVERIFY(!fifteen->isChecked());
+        fifteen->trigger();
+        QCOMPARE(chart->timeframe().label, QString("15m"));
+        QVERIFY(tab->chart()->timeframeButton("15m")->isChecked());
+        QVERIFY(fifteen->isChecked());
+
+        // The choice survives a restart: a new window over the same settings file starts with it.
+        m_settings->sync();
+        {
+            Settings again(settingsPath());
+            QCOMPARE(again.chartTimeframe(), QString("15m"));
+            MainWindow second(&again);
+            second.setInteractive(false);
+            QCOMPARE(second.chartController()->timeframe().label, QString("15m"));
+        }
+        // An unknown saved value reads as the default.
+        {
+            QTemporaryDir dir;
+            const QString path = dir.filePath("bad.ini");
+            {
+                QSettings raw(path, QSettings::IniFormat);
+                raw.setValue("chart/timeframe", "bogus");
+            }
+            QCOMPARE(Settings(path).chartTimeframe(), QString("5m"));
+        }
+
+        // An old server (this fake one has no History): the larger timeframes are disabled with a tooltip.
+        tab->symbols()->searchEdit()->setText("BTC");
+        QTRY_VERIFY_WITH_TIMEOUT(tab->symbols()->proxy()->rowCount() >= 1, 3000);
+        tab->symbols()->view()->selectRow(0);
+        tab->symbols()->view()->setCurrentIndex(tab->symbols()->proxy()->index(0, SymbolModel::Symbol));
+        QTRY_VERIFY_WITH_TIMEOUT(tab->chart()->showing(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(!chart->historyAvailable(), 10000);
+        for (const char *label : {"1h", "4h", "1d"}) {
+            QVERIFY2(!tab->chart()->timeframeButton(label)->isEnabled(), label);
+            QVERIFY(tab->chart()->timeframeButton(label)->toolTip().contains("History API"));
+        }
+        for (const char *label : {"1m", "5m", "15m"})
+            QVERIFY2(tab->chart()->timeframeButton(label)->isEnabled(), label);
+        for (QAction *a : m_window->findChildren<QAction *>()) {
+            if (a->actionGroup() && Timeframe::fromLabel(a->data().toString()).has_value())
+                QCOMPARE(a->isEnabled(), a->data().toString() != "1h" && a->data().toString() != "4h" && a->data().toString() != "1d");
+        }
+
+        QTest::mouseClick(tab->chart()->timeframeButton("5m"), Qt::LeftButton);
+        QCOMPARE(chart->timeframe().label, QString("5m"));
         tab->symbols()->searchEdit()->clear();
         tab->symbols()->clearSelection();
         QTRY_VERIFY_WITH_TIMEOUT(!chart->selected(), 3000);
