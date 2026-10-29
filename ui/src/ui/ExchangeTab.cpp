@@ -36,6 +36,14 @@ ExchangeTab::ExchangeTab(LiveData *data, const QString &exchange, ChartControlle
     m_summary = new SummaryPanel(data, exchange, this);
     m_chart = new ChartPanel(chart, data->options(), exchange, this);
     connect(m_symbols, &SymbolsPanel::symbolSelected, this, &ExchangeTab::onSymbolSelected);
+    connect(m_symbols, &SymbolsPanel::investigateRequested, this, [this](const QString &symbol) {
+        const SymbolModel *model = m_data->symbols(m_exchange);
+        const SymbolModel::Row *row = model ? model->find(symbol) : nullptr;
+        emit investigateRequested(m_exchange, symbol, row ? row->symbolRaw : QString());
+    });
+    connect(m_chart, &ChartPanel::investigateRequested, this, [this](const QString &symbol, const QString &raw) {
+        emit investigateRequested(m_exchange, symbol, raw);
+    });
 
     m_symbolsDock = makeDock(QStringLiteral("Symbols"), QStringLiteral("dock.symbols"), m_symbols);
     m_feedDock = makeDock(QStringLiteral("Live feed"), QStringLiteral("dock.feed"), m_feed);

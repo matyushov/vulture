@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "app/InvestigationService.h"
 #include "app/LargeLiquidationNotifier.h"
 #include "app/Settings.h"
 #include "chart/ChartController.h"
@@ -9,9 +10,11 @@
 #include "net/StreamClient.h"
 #include "ui/AdminPanel.h"
 #include "ui/ExchangeTab.h"
+#include "ui/InvestigationsTab.h"
 #include "ui/StatusIndicator.h"
 
 #include <QHash>
+#include <QLabel>
 #include <QMainWindow>
 #include <QMap>
 #include <QSystemTrayIcon>
@@ -25,6 +28,8 @@ class MainWindow : public QMainWindow
     Q_OBJECT
 public:
     explicit MainWindow(Settings *settings, QWidget *parent = nullptr);
+    /// `investigationClock` replaces the system clock of the investigations (tests).
+    MainWindow(Settings *settings, inv::Clock investigationClock, QWidget *parent = nullptr);
     ~MainWindow() override;
 
     /// Starts a connection (clears the session counters, keeps history and symbol lists).
@@ -45,6 +50,8 @@ public:
     LiveData *liveData() { return &m_data; }
     IngestQueue *ingestQueue() { return &m_ingest; }
     ChartController *chartController() { return &m_chart; }
+    InvestigationService *investigations() { return &m_investigations; }
+    InvestigationsTab *investigationsTab() { return m_invTab; }
     StreamClient *client() { return &m_client; }
     StatusIndicator *statusIndicator() { return m_status; }
     LargeLiquidationNotifier *notifier() { return &m_notifier; }
@@ -66,6 +73,9 @@ private slots:
     void showPreferences();
     void showAbout();
     void showNotification(const QString &title, const QString &body);
+    /// "Investigate" from a symbol's or the chart's context menu, or typed into the Investigations tab.
+    void requestInvestigation(const QString &exchange, const QString &symbol, const QString &symbolRaw);
+    void updateBudgetStatus();
 
 private:
     void buildMenus();
@@ -78,6 +88,7 @@ private:
     LiveData m_data;
     IngestQueue m_ingest;
     ChartController m_chart;
+    InvestigationService m_investigations;
     StreamClient m_client;
     StreamClient::Options m_clientOptions;
     LargeLiquidationNotifier m_notifier;
@@ -87,6 +98,8 @@ private:
     QWidget *m_waiting = nullptr;
     QMap<QString, ExchangeTab *> m_exchangeTabs;
     AdminPanel *m_admin;
+    InvestigationsTab *m_invTab = nullptr;
+    QLabel *m_budgetStatus = nullptr;
     StatusIndicator *m_status;
     QSystemTrayIcon *m_tray = nullptr;
     ConnectionConfig m_config;

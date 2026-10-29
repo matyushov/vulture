@@ -11,7 +11,13 @@ with 6.10 and Linux/macOS with 6.12). Tests (`ctest`, offscreen): `tst_Util`, `t
 `tst_StreamClient` (in-process fake gRPC server on 127.0.0.1, plaintext and TLS), `tst_Columns` (header behavior, OI
 delta, replay cursor, sliced ingest), `tst_Chart` (kline parsers from `tests/fixtures/`, binning, price source against a
 local fake HTTP server, chart controller, widget), `tst_Smoke` (main window against the fake servers; set
-`VULTURE_UI_SHOT_DIR` to also write light/dark screenshots, the chart ones included), `tst_Perf` (throughput).
+`VULTURE_UI_SHOT_DIR` to also write light/dark screenshots, the chart ones included), `tst_Perf` (throughput). Investigations:
+`tst_RateBudget` (token bucket, priorities, 429 and 418, reconciliation with the exchange's counter, fake clock),
+`tst_Binance` (parsers on live fixtures, the REST client against a local fake HTTP server, the aggTrade WebSocket against a
+local fake WS server), `tst_Features` (robust statistics, baseline, CVD, VWAP, p99, lead / lag z-scores and flags on
+constructed data), `tst_Investigation` (the engine against an in-memory exchange: stages, limits, watchlist, restart,
+follow-ups), `tst_InvestigationLog` (JSON Lines, rotation, CSV), `tst_InvestigationsUi` (the whole path from a fake server
+signal to the tab, the restart and a day later; the budget stress test).
 Qt 6.10 compatibility: only APIs that exist in 6.10 are used (checked by review; the Windows CI job builds with 6.10).
 The code compiles with `-Wall -Wextra` without warnings in the UI sources; QCustomPlot's own warnings are silenced in its
 CMake target only.
@@ -124,6 +130,95 @@ Summary. View > Panels re-opens a closed dock, View > Reset layout restores the 
   `QSystemTrayIcon::showMessage`, at most one per 10 s with the rest merged into a digest, no sound.
   Notifications need an app environment that allows them (an unbundled binary may be silenced by macOS).
 
+## Investigations (UI 1.3)
+
+An **Investigations** tab (not per exchange) holds the table of investigations, the watchlist and, for the selected row, the
+detail view. The idea: the server's Binance polling budget is full, so the deep look at one instrument is done **by the client,
+from the client's own IP, only when a signal fires**, and the numbers say whether the instrument deserves attention. Everything is
+descriptive (z-scores against a 30-day norm, plain values, a short list of flags); there is no score, no verdict, no "insider"
+label.
+
+* **Triggers.** A server `Signal` of type `oi_spike_up` / `oi_spike_down` on a Binance symbol starts an investigation (Preferences >
+  Investigations: automatic start on or off, default on). **Investigate** in the context menu of a symbol row or of the chart, or the
+  button in the tab (a name such as `BTCUSDT` or `BTC-USDT-PERP`), starts one by hand. Limits (settings): at most **6 automatic
+  investigations per rolling hour**, at most **2 running at once**; a signal over a limit is listed in the table as **skipped
+  (limit)** and written to the file (nothing is silently lost). The contract carries no severity, so "minimum severity" is the
+  signal's size relative to its threshold (default 1, every signal). A symbol that is already under investigation or on the
+  watchlist is not started again: its TTL is renewed (a counter of merged signals shows on the detail). A manual start waits for a
+  free slot instead of being skipped. Replayed signals (the bounded replay on connect) never start anything.
+* **Stage 1, context** (about ten requests, all through the shared budget): 1h klines for 30 days with the taker buy volumes
+  (the baseline of volume, taker share, hourly range), 1m klines for 2 hours, `openInterestHist` 1h for 30 days (the endpoint returns
+  500 rows per page and keeps 30 days, so two pages; the UI notes a shorter history) and 5m for a few hours, the funding history
+  (10 days), the 24h ticker, the taker buy/sell ratio and the global / top-trader account and position ratios (1h, 3 days), and
+  from **our own server** `History.Aggregate` hourly for 30 days (OI level and change, liquidated USD by side): that part costs the
+  exchange nothing, supplies the liquidation baseline and is cross-checked against the exchange's OI history (the number of matching
+  hours and the median difference). Optional requests may fail (a warning shows); a failure of the hourly or minute klines fails the
+  investigation. Baseline = median and robust sigma (1.4826 x MAD; with MAD 0 the mean absolute deviation, with no spread no
+  z-score; fewer than 5 values no sigma) per hour; windows shorter than an hour are scaled with the square root of their length
+  (an approximation).
+* **Stage 2, trades.** `aggTrades` are backfilled forward from **30 minutes before the OI jump began** (the signal fires at the end
+  of its window, so the jump start is `ts - window_secs`) by `fromId` pages of 1000 (20 weight each, at most 40 pages by default),
+  then the symbol joins the live `<symbol>@aggTrade` stream (combined stream, **at most 5 symbols**, subscribe / unsubscribe
+  without reconnecting, reconnect with backoff, a ping every 20 s, renewal before the 24 h limit). A hole between the stored trades and the live feed (a reconnect, or the
+  first live trade after the backfill) is closed from REST by `fromId`; ids make duplicates impossible. A backfill that hits the page cap says so on
+  the detail (a gap note). Per minute bar and for the sliding windows 1, 5, 15 and 30 minutes the tab shows trades, buy and sell
+  volume, delta, buy share, average and largest trade, trades above p99, VWAP, price move, the volume z-score and the OI change
+  per unit of volume (OI from the server's stream plus the exchange's 5 minute history). The **lead / lag** rows show the same for
+  the 10 and 30 minutes before the jump. "Large" means above the 99th percentile of the notional of the backfilled trades (a
+  limitation: it is estimated from the same window, so it is unreliable under 200 trades and the share above it is about 1 percent by
+  construction; the tab says so).
+* **Flags** (examples with their wording): `volume 6.2 sigma above the 30-day hourly norm (last 15 min)`, `taker buy share 78 percent
+  (last 15 min, 400 trades)`, `OI +1.30 percent in 2 minutes with price move +0.10 percent`, `3 trades above p99 (5000 USDT) in
+  the 10 minutes before the jump`, `volume 3.1 sigma above the norm in the 30 minutes before the jump`, `last funding rate +0.12
+  percent`. The thresholds are in `investigation/Flags.h` (`FlagRules`) and are starting points to calibrate against the outcomes.
+* **Watchlist.** An investigated symbol goes on the watchlist (TTL default 2 hours, at most 5 symbols; Preferences): live trades and
+  the rolling features keep updating (every 2 s). When it is full, the unpinned symbol with the **fewest flags** is dropped (a tie
+  drops the newest; the newcomer is a candidate too; with everything pinned the newcomer does not get in) and shown as dropped. A new signal
+  or **Renew** restarts the TTL, **Pin** removes the expiry, **Remove** ends it. Cancel / remove also stops a running stage.
+  Closing the application saves the state; the next start restores the table and the watchlist (stage 1 does not run again, a
+  35 minute backfill rebuilds the features). An investigation that was running at the close is marked failed (interrupted).
+* **The file.** `investigations.jsonl` in the application data directory (macOS `~/Library/Application Support/vulture/vulture-ui/`,
+  Linux `~/.local/share/vulture/vulture-ui/`, Windows `%LOCALAPPDATA%/vulture/vulture-ui/`; `data/dir` in the settings overrides;
+  "Open data folder" in the tab) is JSON Lines, one object per line, appended at every change of an investigation (start, stage
+  results, the snapshots at the end of the first 5, 15 and 30 minutes, every filled follow-up, the end); **the last line of an id
+  is its state**. A record holds the trigger (signal id, type, time, symbol, percent and base change), the baseline summary, the
+  context, the features, the flags and the follow-ups: price (the open of the 1m candle at the horizon) and OI (the 5 minute
+  history point at or before it) at **+5 min, +15 min, +1 h, +4 h, +24 h** after the trigger, with the price and OI at the trigger
+  (the open of the 1m candle containing it, the OI history point at or before it). They are filled when their time comes, and after a
+  restart the missing ones are filled from the klines history; a request that fails is retried (1 min, 2 min ... up to five
+  tries, then the outcome is recorded with the reason); `"complete": true` when the investigation is over and all five outcomes are
+  recorded. The size is bounded (Preferences: 2000 records and 20 MB by default): past the limit the file is compacted to one line
+  per id (the newest records and every unfinished one) and, if it is still too big, rotated to `investigations.jsonl.1` with the
+  unfinished records carried over. **Export CSV...** writes both files, one row per investigation (flags, z-scores, outcomes as
+  percent changes from the trigger price and OI).
+* **The request budget.** One limiter (`RateBudget`) serves every REST call of the program to an exchange, the chart's Binance klines
+  included (user priority). Binance USDT-M allows 2400 weight per minute per IP; the program uses at most the configured share
+  (default **40 percent, 960 per minute**) in any rolling minute: a token bucket (burst of a quarter of the share) plus a rolling ledger.
+  The limits that are not weight are separate buckets with the same share: `/futures/data/*` (1000 requests per 5 minutes) and
+  `fundingRate` (500 per 5 minutes). Queue: user (the chart, a manual start) before active investigations before background work (follow-ups,
+  restore); at most 4 requests at once. The exchange's own counter (`X-MBX-USED-WEIGHT-1m`) is reconciled: what it shows above our own
+  spending is booked as spent (somebody else uses the address), and a counter at 90 percent of the limit pauses until the next minute. HTTP
+  **429**: all calls to the exchange wait for `Retry-After` (60 s without it). HTTP **418** (IP ban): nothing is sent until the end of the ban
+  (from the body, else `Retry-After`, else 5 minutes), never earlier. The weights are in one table, `investigation/BinanceApi.h`.
+  The bottom line of the tab and the status bar show the budget (percent of our share, the exchange's counter, queued requests) and
+  any pause or ban with its end.
+* **Headless core.** All the logic is in the static library `vulture-investigation` (`src/investigation/`): Qt Core, Network and
+  WebSockets only, no Widgets, no Gui, no gRPC. The exchange is behind `ExchangeMarketData` (Binance USDT-M now; Bybit and OKX
+  later with the same calls), the server's history behind `ServerHistory` (the application adapts `History.Aggregate`), the
+  clock is injected. The Widgets part is a thin layer: `InvestigationService` (wiring), `InvestigationsTab`, the model and the chart.
+* **The detail chart** reuses the symbol chart's view: price candles from the trades with the signal marked (dashed lines at the
+  signal and at the start of the jump), the CVD (bars: delta per minute, line: cumulative), and the aggressive buy volume up and
+  sell volume down, with the through-cursor and the same colors (`semanticColors`).
+* **Notifications.** A system notification when an investigation finishes stage 2 with at least one flag: on for automatic
+  investigations, off for manual ones (Preferences).
+
+Preferences > Investigations: automatic start, minimum severity, per-hour and running limits, TTL, watchlist size, budget share,
+trade backfill page limit, the two notification switches, records and size kept. Settings keys: `investigations/*` (see
+`app/Settings.cpp`).
+
+Not in this version (by design): any score or automatic keep / drop decision, sentiment, Bybit and OKX data sources, order-book
+data, a database (persistence is the JSON Lines file only), alerts to Telegram (the server owns those).
+
 ## Settings
 
 INI file in the user profile (macOS: `~/Library/Preferences/vulture/vulture-ui.ini`); `--settings-file <path>`
@@ -146,7 +241,8 @@ See `research/ui-stage1-notes.md` and `research/ui-1-1-notes.md`.
 
 ## Limitations
 
-No alerts or admin yet; no free interval selection (the data path supports it, the UI does not); one server at a time; the
+Investigations exist for Binance only; prices and volumes there are in the exchange's units (a `1000PEPEUSDT` price is per 1000 coins, not
+scaled); the trades of a very busy symbol can take more pages than the backfill cap, which the detail says; no alerts or admin yet; no free interval selection (the data path supports it, the UI does not); one server at a time; the
 chart needs direct access to the exchange REST endpoints (otherwise the approximate fallback is shown); the server counts
 liquidations without the side, so server bins have no per-side counts; the chart's live bin and the server's last aggregate
 can double count an event for a moment around the request (corrected by the next refresh); color scheme follows the system

@@ -118,6 +118,10 @@ v1::Event openInterest(const std::string &id, const std::string &exchange, const
 void addRow(v1::AggregateResponse &response, const std::string &group, long long start, long long end,
             std::initializer_list<std::pair<v1::Metric, double>> values, bool partial = false);
 
+/// A server Signal event (alert engine). `type` is a v1::SignalType.
+v1::Event signalEvent(const std::string &id, v1::SignalType type, const std::string &exchange, const std::string &symbol, unsigned windowSecs,
+                      double changePct, double changeAbs, double threshold, long long ts);
+
 v1::Event gap(const std::string &id, const std::string &exchange, const std::string &stream, long long from,
               long long to);
 

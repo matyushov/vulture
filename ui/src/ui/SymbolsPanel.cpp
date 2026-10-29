@@ -4,6 +4,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QMenu>
 #include <QVBoxLayout>
 
 namespace vulture {
@@ -85,6 +86,18 @@ SymbolsPanel::SymbolsPanel(LiveData *data, const QString &exchange, QWidget *par
                 m_selected = symbol;
                 emit symbolSelected(symbol);
             });
+    m_view->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_view, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
+        const QModelIndex idx = m_view->indexAt(pos);
+        if (!idx.isValid())
+            return;
+        const QString symbol = idx.data(SymbolModel::SymbolRole).toString();
+        QMenu menu(this);
+        QAction *investigate = menu.addAction(QStringLiteral("Investigate %1").arg(symbol));
+        investigate->setToolTip(QStringLiteral("Read this symbol's context and trades from the exchange and describe what is unusual"));
+        connect(investigate, &QAction::triggered, this, [this, symbol] { emit investigateRequested(symbol); });
+        menu.exec(m_view->viewport()->mapToGlobal(pos));
+    });
     connect(m_proxy, &QAbstractItemModel::rowsInserted, this, &SymbolsPanel::updateCount);
     connect(m_proxy, &QAbstractItemModel::rowsRemoved, this, &SymbolsPanel::updateCount);
     connect(m_proxy, &QAbstractItemModel::modelReset, this, &SymbolsPanel::updateCount);

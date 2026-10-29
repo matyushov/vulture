@@ -59,6 +59,8 @@ jobs:
         with:
           version: ${{ matrix.qt_version || env.QT_VERSION }}
           arch: ${{ matrix.qt_arch }}
+          # the live aggTrade stream of the investigations (src/investigation) uses Qt WebSockets, an add-on module
+          modules: qtwebsockets
           cache: true
 
       - uses: actions/setup-python@v5

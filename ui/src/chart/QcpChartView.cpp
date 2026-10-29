@@ -236,6 +236,11 @@ void QcpChartView::buildPlot()
 
 void QcpChartView::updateTitles()
 {
+    if (m_snap.panelTitles.size() == kPanels) {
+        for (int i = 0; i < kPanels; ++i)
+            m_titles[i]->setText(m_snap.panelTitles.at(i));
+        return;
+    }
     const QString tf = m_snap.spec.timeframe.label;
     m_titles[0]->setText(QStringLiteral("Price (%1 candles)").arg(tf));
     m_titles[1]->setText(QStringLiteral("Open interest: change per bin (bars), level (line, right axis)"));
@@ -490,6 +495,24 @@ void QcpChartView::rebuildGaps()
             m_partialItems.append(r);
         }
         i = j + 1;
+    }
+    for (qint64 ts : std::as_const(m_snap.markerTimes)) {
+        for (int p = 0; p < kPanels; ++p) {
+            auto *line = new QCPItemStraightLine(m_plot);
+            line->setLayer(QStringLiteral("overlay"));
+            line->setClipAxisRect(m_rects[p]);
+            line->setClipToAxisRect(true);
+            for (QCPItemPosition *pos : {line->point1, line->point2}) {
+                pos->setAxes(m_x[p], m_y[p]);
+                pos->setTypeX(QCPItemPosition::ptPlotCoords);
+                pos->setTypeY(QCPItemPosition::ptAxisRectRatio);
+                pos->setAxisRect(m_rects[p]);
+            }
+            line->point1->setCoords(ts / 1000.0, 0);
+            line->point2->setCoords(ts / 1000.0, 1);
+            line->setPen(QPen(m_colors.warningText, 1.4, Qt::DashDotLine));
+            m_partialItems.append(line); // removed with the partial bands at the next rebuild
+        }
     }
     const double lo = fullRange().lower;
     const double hi = fullRange().upper;

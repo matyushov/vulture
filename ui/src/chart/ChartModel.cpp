@@ -182,6 +182,8 @@ QString binTooltip(const ChartSnapshot &snap, int index, bool utc)
 {
     if (index < 0 || index >= snap.bins.size())
         return {};
+    if (!snap.binTexts.isEmpty())
+        return snap.binTexts.value(index);
     const ChartBin &b = snap.bins.at(index);
     const QString zone = utc ? QStringLiteral("UTC") : QStringLiteral("local");
     const QString base = snap.baseCoin;

@@ -29,6 +29,10 @@ public:
     /// The timeframe switch (1m, 5m, 15m, 1h, 4h, 1d); checkable, exactly one is checked.
     QPushButton *timeframeButton(const QString &label) const { return m_buttons.value(label, nullptr); }
 
+signals:
+    /// "Investigate" in the chart's context menu (symbol, exchange name).
+    void investigateRequested(const QString &symbol, const QString &symbolRaw);
+
 private:
     void refresh();
     void refreshButtons();

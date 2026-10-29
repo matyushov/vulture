@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "investigation/InvestigationEngine.h"
 #include "net/ConnectionConfig.h"
 
 #include <QByteArray>
@@ -36,6 +37,18 @@ public:
     bool notificationsEnabled() const;
     void setNotificationsEnabled(bool enabled);
 
+    /// Settings of the investigations (page "Investigations" of the preferences).
+    struct InvestigationSettings
+    {
+        inv::EngineConfig engine;
+        double budgetShare = 0.4; ///< share of the exchange's request weight the program may use
+    };
+    InvestigationSettings investigations() const;
+    void setInvestigations(const InvestigationSettings &s);
+    /// Where investigations.jsonl lives: `data/dir` when set, a folder next to an explicit settings file (tests), otherwise
+    /// the application data directory of the user.
+    QString dataDir() const;
+
     QStringList favorites() const;
     void setFavorites(const QStringList &favorites);
 
@@ -62,6 +75,7 @@ private:
     void harden();
     void flush();
     std::unique_ptr<QSettings> m_settings;
+    bool m_explicitPath = false;
 };
 
 } // namespace vulture

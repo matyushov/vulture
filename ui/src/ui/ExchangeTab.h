@@ -34,6 +34,10 @@ public:
     void resetLayout();
     void refreshPalette(const QPalette &palette);
 
+signals:
+    /// "Investigate" was chosen on a symbol of this exchange (symbol list or chart).
+    void investigateRequested(const QString &exchange, const QString &symbol, const QString &symbolRaw);
+
 protected:
     void showEvent(QShowEvent *event) override;
 

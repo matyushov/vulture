@@ -60,6 +60,17 @@ live `Stream.Subscribe`, candles from the exchanges' public REST klines; ranges,
 [ui/README.md](ui/README.md). Tests never leave the machine: the fake gRPC (Stream and History) and HTTP servers listen on
 127.0.0.1 (`QT_QPA_PLATFORM=offscreen`; screenshots with `VULTURE_UI_SHOT_DIR=<dir>`).
 
+Investigations (UI 1.3, Binance first): when the server reports an open interest spike (`oi_spike_up` / `oi_spike_down`), or
+on **Investigate** in a symbol's or the chart's context menu, the client itself reads the symbol's context and trades from
+the exchange's public endpoints with the client's IP (the server's Binance budget is full) and describes what is unusual
+(z-scores against a 30-day norm, taker imbalance, large trades before the jump, no verdict), keeps the symbol on a watchlist
+(default 2 hours, at most 5 symbols) and appends a record with follow-up outcomes (+5 min ... +24 h) to
+`investigations.jsonl` in the application data directory for later calibration. One request budget (40 percent of Binance's
+2400 weight per minute, reconciled with `X-MBX-USED-WEIGHT-1m`, HTTP 429 and 418 honored) is shared with the chart's klines.
+The logic is a headless static library (`ui/src/investigation/`, Qt Core, Network and WebSockets only). It needs the Qt
+WebSockets module (CI installs it; locally add the `qtwebsockets` module to the Qt installation). Details, limits and the
+files are in [ui/README.md](ui/README.md).
+
 Example configuration: [config.example.toml](config.example.toml). Secrets are not
 added to the repository.
 
@@ -1270,7 +1281,7 @@ GitHub Actions, run on `pull_request` and on `push` to `develop` and `main`; `GI
 | `ci.yml` / `supply-chain` | `cargo-deny` (licenses, sources, advisories per `deny.toml`), `cargo-audit` |
 | `ci.yml` / `secrets` | gitleaks over the whole history |
 | `ci.yml` / `proto` | `buf lint`, `buf breaking` against the base revision |
-| `ui.yml` / `ui` | ubuntu/macos/windows matrix: Qt 6 (`jurplel/install-qt-action`, version in `QT_VERSION`), conan 2 with the profiles in `ui/conan/profiles/`, conan cache; the build does not block the Rust jobs |
+| `ui.yml` / `ui` | ubuntu/macos/windows matrix: Qt 6 (`jurplel/install-qt-action`, version in `QT_VERSION`), conan 2 with the profiles in `ui/conan/profiles/`, conan cache, the Qt WebSockets module (`modules: qtwebsockets`); the build does not block the Rust jobs |
 
 | `conan-deps.yml` / `deps` | ubuntu/macos/windows matrix: builds the missing conan dependencies of the UI (grpc, protobuf, ...) and uploads them to Nexus; runs on `vendor/**` branches and manually (`rebuild_all`), environment `nexus` |
 

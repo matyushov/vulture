@@ -6,6 +6,9 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QStandardPaths>
+
+#include <algorithm>
 
 namespace vulture {
 
@@ -31,6 +34,7 @@ constexpr auto kTableGroup = "tables";
 
 Settings::Settings(const QString &path)
 {
+    m_explicitPath = !path.isEmpty();
     if (path.isEmpty()) {
         QSettings::setDefaultFormat(QSettings::IniFormat);
         m_settings = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope,
@@ -128,6 +132,57 @@ double Settings::largeThresholdUsd() const { return m_settings->value(kThreshold
 void Settings::setLargeThresholdUsd(double v) { m_settings->setValue(kThreshold, v); flush(); }
 bool Settings::notificationsEnabled() const { return m_settings->value(kNotify, true).toBool(); }
 void Settings::setNotificationsEnabled(bool v) { m_settings->setValue(kNotify, v); flush(); }
+Settings::InvestigationSettings Settings::investigations() const
+{
+    InvestigationSettings s;
+    inv::EngineConfig &e = s.engine;
+    auto v = [this](const char *key, const QVariant &def) { return m_settings->value(QString::fromLatin1(key), def); };
+    e.autoStart = v("investigations/auto_start", true).toBool();
+    e.minSeverityRatio = std::clamp(v("investigations/min_severity", 1.0).toDouble(), 0.0, 100.0);
+    e.maxPerHour = std::clamp(v("investigations/max_per_hour", 6).toInt(), 0, 1000);
+    e.maxRunning = std::clamp(v("investigations/max_running", 2).toInt(), 1, 10);
+    e.ttlMs = std::clamp(v("investigations/ttl_minutes", 120).toLongLong(), 1LL, 7LL * 24 * 60) * 60'000;
+    e.maxWatch = std::clamp(v("investigations/max_watch", 5).toInt(), 1, 5);
+    e.maxBackfillPages = std::clamp(v("investigations/max_backfill_pages", 40).toInt(), 1, 500);
+    e.notifyAuto = v("investigations/notify_auto", true).toBool();
+    e.notifyManual = v("investigations/notify_manual", false).toBool();
+    e.retentionRecords = std::clamp(v("investigations/retention_records", 2000).toInt(), 10, 100000);
+    e.retentionBytes = std::clamp(v("investigations/retention_mb", 20).toLongLong(), 1LL, 1000LL) * 1024 * 1024;
+    s.budgetShare = std::clamp(v("investigations/budget_percent", 40.0).toDouble(), 5.0, 90.0) / 100.0;
+    return s;
+}
+
+void Settings::setInvestigations(const InvestigationSettings &s)
+{
+    const inv::EngineConfig &e = s.engine;
+    m_settings->setValue(QStringLiteral("investigations/auto_start"), e.autoStart);
+    m_settings->setValue(QStringLiteral("investigations/min_severity"), e.minSeverityRatio);
+    m_settings->setValue(QStringLiteral("investigations/max_per_hour"), e.maxPerHour);
+    m_settings->setValue(QStringLiteral("investigations/max_running"), e.maxRunning);
+    m_settings->setValue(QStringLiteral("investigations/ttl_minutes"), static_cast<qlonglong>(e.ttlMs / 60'000));
+    m_settings->setValue(QStringLiteral("investigations/max_watch"), e.maxWatch);
+    m_settings->setValue(QStringLiteral("investigations/max_backfill_pages"), e.maxBackfillPages);
+    m_settings->setValue(QStringLiteral("investigations/notify_auto"), e.notifyAuto);
+    m_settings->setValue(QStringLiteral("investigations/notify_manual"), e.notifyManual);
+    m_settings->setValue(QStringLiteral("investigations/retention_records"), e.retentionRecords);
+    m_settings->setValue(QStringLiteral("investigations/retention_mb"), static_cast<qlonglong>(e.retentionBytes / (1024 * 1024)));
+    m_settings->setValue(QStringLiteral("investigations/budget_percent"), s.budgetShare * 100.0);
+    flush();
+}
+
+QString Settings::dataDir() const
+{
+    const QString custom = m_settings->value(QStringLiteral("data/dir")).toString();
+    if (!custom.isEmpty())
+        return custom;
+    if (m_explicitPath)
+        return QFileInfo(m_settings->fileName()).absolutePath() + QStringLiteral("/vulture-data");
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    if (dir.isEmpty())
+        dir = QDir::homePath() + QStringLiteral("/.vulture-ui");
+    return dir;
+}
+
 QStringList Settings::favorites() const { return m_settings->value(kFavorites).toStringList(); }
 void Settings::setFavorites(const QStringList &v)
 {

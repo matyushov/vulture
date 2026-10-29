@@ -266,6 +266,23 @@ v1::Event openInterest(const std::string &id, const std::string &exchange, const
     return ev;
 }
 
+v1::Event signalEvent(const std::string &id, v1::SignalType type, const std::string &exchange, const std::string &symbol, unsigned windowSecs,
+                      double changePct, double changeAbs, double threshold, long long ts)
+{
+    v1::Event ev;
+    ev.set_id(id);
+    auto *s = ev.mutable_signal();
+    s->set_type(type);
+    s->set_exchange(exchange);
+    s->set_symbol(symbol);
+    s->set_window_secs(windowSecs);
+    s->set_change_pct(changePct);
+    s->set_change_abs(changeAbs);
+    s->set_threshold(threshold);
+    s->set_ts(ts);
+    return ev;
+}
+
 void addRow(v1::AggregateResponse &response, const std::string &group, long long start, long long end,
             std::initializer_list<std::pair<v1::Metric, double>> values, bool partial)
 {

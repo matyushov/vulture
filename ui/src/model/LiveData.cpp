@@ -53,6 +53,9 @@ void LiveData::ingest(FeedBatch batch)
     QVector<FeedEvent> serverWideGaps;
     bool dropFromStore = false;
     for (const FeedEvent &e : std::as_const(batch)) {
+        if (m_observer && ((e.kind == EventKind::Signal && !e.replayed) || e.kind == EventKind::OpenInterest ||
+                           e.kind == EventKind::Liquidation))
+            m_observer(e);
         if (hasExchange(e)) {
             if (!m_symbols.contains(e.exchange)) {
                 m_symbols.insert(e.exchange, new SymbolModel(e.exchange, m_favorites, m_options, this));

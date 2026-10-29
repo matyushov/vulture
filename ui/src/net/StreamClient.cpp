@@ -101,6 +101,11 @@ bool convert(const v1::Event &ev, Interner &names, FeedEvent *out)
         out->exchange = names.get(s.exchange());
         out->symbol = names.get(s.symbol());
         out->ts = s.ts();
+        out->signalType = signalName(s.type());
+        out->windowSecs = static_cast<qint32>(s.window_secs());
+        out->changePct = s.change_pct();
+        out->changeAbs = s.change_abs();
+        out->threshold = s.threshold();
         out->text = QStringLiteral("%1 %2%/%3s")
                         .arg(signalName(s.type()), QString::number(s.change_pct(), 'f', 1), QString::number(s.window_secs()));
         return true;

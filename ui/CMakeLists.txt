@@ -49,10 +49,11 @@ endif()
 # If Qt6 is not found and the option is off, configuration succeeds without the vulture-ui target.
 option(VULTURE_UI_REQUIRE_QT "Fail configuration if Qt6 is not found" OFF)
 
+# Qt WebSockets (live aggTrade stream of the investigations) is an add-on module: CI installs it explicitly.
 if(VULTURE_UI_REQUIRE_QT)
-    find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets Network WebSockets)
 else()
-    find_package(Qt6 QUIET COMPONENTS Widgets Network)
+    find_package(Qt6 QUIET COMPONENTS Widgets Network WebSockets)
 endif()
 
 if(NOT Qt6_FOUND)
@@ -75,6 +76,29 @@ target_link_libraries(vulture-qcustomplot PUBLIC Qt6::Widgets)
 target_compile_options(vulture-qcustomplot PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/w>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-w>)
+
+# --- Headless investigation core: Qt Core, Network and WebSockets only (no Widgets / Gui, no gRPC) ---
+add_library(vulture-investigation STATIC
+    src/investigation/Types.h
+    src/investigation/RateBudget.h src/investigation/RateBudget.cpp
+    src/investigation/BinanceApi.h src/investigation/BinanceApi.cpp
+    src/investigation/ExchangeMarketData.h
+    src/investigation/BinanceMarketData.h src/investigation/BinanceMarketData.cpp
+    src/investigation/Stats.h src/investigation/Stats.cpp
+    src/investigation/ServerHistory.h
+    src/investigation/Baseline.h src/investigation/Baseline.cpp
+    src/investigation/Features.h src/investigation/Features.cpp
+    src/investigation/Investigation.h src/investigation/Investigation.cpp
+    src/investigation/Flags.h src/investigation/Flags.cpp
+    src/investigation/InvestigationLog.h src/investigation/InvestigationLog.cpp
+    src/investigation/InvestigationEngine.h src/investigation/InvestigationEngine.cpp
+)
+set_target_properties(vulture-investigation PROPERTIES AUTOMOC ON)
+target_include_directories(vulture-investigation PUBLIC src)
+target_link_libraries(vulture-investigation PUBLIC Qt6::Core Qt6::Network Qt6::WebSockets)
+target_compile_options(vulture-investigation PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>)
 
 # --- Application core: everything except main(), so the tests can link it ---
 set(VULTURE_UI_CORE_SOURCES
@@ -108,9 +132,14 @@ set(VULTURE_UI_CORE_SOURCES
     src/net/ErrorText.h src/net/ErrorText.cpp
     src/net/GrpcChannel.h src/net/GrpcChannel.cpp
     src/net/HistoryClient.h src/net/HistoryProto.h src/net/HistoryClient.cpp
+    src/net/GrpcServerHistory.h src/net/GrpcServerHistory.cpp
     src/net/StreamClient.h src/net/StreamClient.cpp
     src/app/Settings.h src/app/Settings.cpp
     src/app/LargeLiquidationNotifier.h src/app/LargeLiquidationNotifier.cpp
+    src/app/InvestigationService.h src/app/InvestigationService.cpp
+    src/ui/InvestigationChart.h src/ui/InvestigationChart.cpp
+    src/ui/InvestigationsModel.h src/ui/InvestigationsModel.cpp
+    src/ui/InvestigationsTab.h src/ui/InvestigationsTab.cpp
     src/ui/StatusIndicator.h src/ui/StatusIndicator.cpp
     src/ui/ConnectionDialog.h src/ui/ConnectionDialog.cpp
     src/ui/PreferencesDialog.h src/ui/PreferencesDialog.cpp
@@ -124,7 +153,7 @@ set(VULTURE_UI_CORE_SOURCES
 add_library(vulture-ui-core STATIC ${VULTURE_UI_CORE_SOURCES})
 target_include_directories(vulture-ui-core PUBLIC src)
 target_compile_definitions(vulture-ui-core PUBLIC VULTURE_UI_VERSION="${PROJECT_VERSION}")
-target_link_libraries(vulture-ui-core PUBLIC Qt6::Widgets Qt6::Network vulture-proto-cpp vulture-qcustomplot)
+target_link_libraries(vulture-ui-core PUBLIC Qt6::Widgets Qt6::Network vulture-investigation vulture-proto-cpp vulture-qcustomplot)
 target_compile_options(vulture-ui-core PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/W4>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>)

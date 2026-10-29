@@ -4,6 +4,7 @@
 #include "util/Format.h"
 
 #include <QHBoxLayout>
+#include <QMenu>
 #include <QVBoxLayout>
 
 namespace vulture {
@@ -55,6 +56,17 @@ ChartPanel::ChartPanel(ChartController *controller, const DisplayOptions *option
     m_stack->addWidget(m_chartPage);
 
     connect(m_reset, &QPushButton::clicked, this, [this] { m_view->resetZoom(); });
+    m_view->widget()->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_view->widget(), &QWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
+        const SymbolChartModel *model = m_controller->model();
+        if (!m_showing || !model->hasTarget())
+            return;
+        QMenu menu(this);
+        QAction *a = menu.addAction(QStringLiteral("Investigate %1").arg(model->symbol()));
+        const QString symbol = model->symbol(), raw = model->symbolRaw();
+        connect(a, &QAction::triggered, this, [this, symbol, raw] { emit investigateRequested(symbol, raw); });
+        menu.exec(m_view->widget()->mapToGlobal(pos));
+    });
     connect(m_controller, &ChartController::snapshotChanged, this, &ChartPanel::refresh);
     connect(m_controller, &ChartController::timeframeChanged, this, &ChartPanel::refreshButtons);
     connect(m_controller, &ChartController::availabilityChanged, this, &ChartPanel::refreshButtons);

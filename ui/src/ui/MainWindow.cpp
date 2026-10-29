@@ -2,7 +2,9 @@
 #include "ui/MainWindow.h"
 
 #include "ui/ConnectionDialog.h"
+#include "chart/PriceSource.h"
 #include "ui/PreferencesDialog.h"
+#include "util/SemanticColors.h"
 #include "util/Format.h"
 
 #include <QActionGroup>
@@ -15,15 +17,19 @@
 #include <QStyle>
 
 #include <algorithm>
+#include <cmath>
 
 namespace vulture {
 
-MainWindow::MainWindow(Settings *settings, QWidget *parent)
+MainWindow::MainWindow(Settings *settings, QWidget *parent) : MainWindow(settings, inv::Clock(), parent) {}
+
+MainWindow::MainWindow(Settings *settings, inv::Clock investigationClock, QWidget *parent)
     : QMainWindow(parent),
       m_settings(settings),
       m_data(&m_options, &m_favorites),
       m_ingest(&m_data),
       m_chart(),
+      m_investigations(settings, &m_data, std::move(investigationClock)),
       m_notifier(),
       m_tabs(new QTabWidget(this))
 {
@@ -47,6 +53,8 @@ MainWindow::MainWindow(Settings *settings, QWidget *parent)
                                 QStringLiteral("Use File > Connect to subscribe to a server. Exchange tabs appear as soon "
                                                "as events arrive."));
     m_tabs->addTab(m_waiting, QStringLiteral("Live"));
+    m_invTab = new InvestigationsTab(&m_investigations, &m_options, m_settings, this);
+    m_tabs->addTab(m_invTab, QStringLiteral("Investigations"));
     m_tabs->addTab(makePlaceholder(QStringLiteral("Alert settings arrive with the Control API integration"),
                                    QStringLiteral("Rules and channels are managed on the server. This tab will edit them "
                                                   "once the client uses the Control service.")),
@@ -56,6 +64,25 @@ MainWindow::MainWindow(Settings *settings, QWidget *parent)
 
     m_status = new StatusIndicator(this);
     statusBar()->addWidget(m_status, 1);
+    m_budgetStatus = new QLabel(this);
+    statusBar()->addPermanentWidget(m_budgetStatus);
+    // The chart's klines and the investigations share one request budget per exchange.
+    if (auto *klines = dynamic_cast<KlinePriceSource *>(m_chart.priceSource()))
+        klines->setRateBudget(m_investigations.budget());
+    connect(&m_investigations, &InvestigationService::budgetChanged, this, &MainWindow::updateBudgetStatus);
+    connect(m_investigations.engine(), &inv::InvestigationEngine::notification, this, &MainWindow::showNotification);
+    connect(m_invTab, &InvestigationsTab::investigateRequested, this, [this](const QString &text) {
+        QString symbol = text, raw;
+        if (!text.contains(QLatin1Char('-')) && text.endsWith(QLatin1String("USDT")) && text.size() > 4) {
+            raw = text;
+            symbol = text.left(text.size() - 4) + QStringLiteral("-USDT-PERP");
+        }
+        requestInvestigation(QStringLiteral("binance"), symbol, raw);
+    });
+    auto *budgetTimer = new QTimer(this);
+    budgetTimer->setInterval(1000);
+    connect(budgetTimer, &QTimer::timeout, this, &MainWindow::updateBudgetStatus);
+    budgetTimer->start();
 
     buildMenus();
 
@@ -77,6 +104,8 @@ MainWindow::MainWindow(Settings *settings, QWidget *parent)
     if (!state.isEmpty())
         restoreState(state);
     updateActions();
+    updateBudgetStatus();
+    m_investigations.start();
 }
 
 MainWindow::~MainWindow()
@@ -200,6 +229,7 @@ void MainWindow::connectTo(const ConnectionConfig &config)
 {
     m_config = config;
     m_admin->setConnection(config);
+    m_investigations.setConnection(config);
     m_data.resetSession();
     StreamClient::Options options = m_clientOptions;
     // First subscription of the session: a bounded replay fills the OI change columns right away. Reconnects of
@@ -217,6 +247,7 @@ void MainWindow::disconnectNow()
 {
     m_client.stop();
     m_chart.clearConnection();
+    m_investigations.clearConnection();
     updateActions();
 }
 
@@ -231,6 +262,7 @@ void MainWindow::onStatusChanged(const ConnectionStatus &status)
 void MainWindow::onExchangeAdded(const QString &exchange)
 {
     auto *tab = new ExchangeTab(&m_data, exchange, &m_chart, m_settings, m_tabs);
+    connect(tab, &ExchangeTab::investigateRequested, this, &MainWindow::requestInvestigation);
     QByteArray layout = m_settings->dockLayout(exchange);
     if (layout.isEmpty())
         layout = m_settings->dockLayout(QStringLiteral("default"));
@@ -277,6 +309,8 @@ void MainWindow::saveUiState()
         it.value()->saveColumns();
     }
     m_settings->setFavorites(m_favorites.toList());
+    m_invTab->saveColumns();
+    m_investigations.engine()->saveState();
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
@@ -304,9 +338,11 @@ void MainWindow::changeEvent(QEvent *event)
 
 void MainWindow::showPreferences()
 {
-    PreferencesDialog dialog(m_options.largeThresholdUsd(), m_notifier.enabled(), this);
+    PreferencesDialog dialog(m_options.largeThresholdUsd(), m_notifier.enabled(), m_settings->investigations(), this);
     if (dialog.exec() != QDialog::Accepted)
         return;
+    m_settings->setInvestigations(dialog.investigations());
+    m_investigations.applySettings();
     m_options.setLargeThresholdUsd(dialog.thresholdUsd());
     m_notifier.setEnabled(dialog.notifications());
     m_settings->setLargeThresholdUsd(dialog.thresholdUsd());
@@ -323,6 +359,34 @@ void MainWindow::showAbout()
                        "License, or (at your option) any later version. It is distributed without any warranty.<br><br>"
                        "Built with Qt %2.")
             .arg(QStringLiteral(VULTURE_UI_VERSION), QString::fromLatin1(qVersion())));
+}
+
+void MainWindow::requestInvestigation(const QString &exchange, const QString &symbol, const QString &symbolRaw)
+{
+    QString why;
+    if (!m_investigations.investigate(exchange, symbol, symbolRaw, &why)) {
+        if (m_interactive)
+            QMessageBox::information(this, QStringLiteral("Investigate"), why);
+        return;
+    }
+    m_tabs->setCurrentWidget(m_invTab);
+    m_invTab->refreshNow();
+    const auto all = m_investigations.engine()->all();
+    if (!all.isEmpty())
+        m_invTab->selectId(all.first()->id);
+}
+
+void MainWindow::updateBudgetStatus()
+{
+    const InvestigationService::BudgetLine line = m_investigations.budgetLine();
+    const auto st = m_investigations.budget()->status(QStringLiteral("binance"));
+    const bool idle = !st.known;
+    m_budgetStatus->setText(idle ? QString() : line.warning ? QStringLiteral("Binance requests paused")
+                                                           : QStringLiteral("Binance budget %1%").arg(static_cast<int>(std::round(100.0 * line.fraction))));
+    m_budgetStatus->setToolTip(line.text);
+    QPalette p = m_budgetStatus->palette();
+    p.setColor(QPalette::WindowText, line.warning ? semanticColors(palette()).warningText : palette().color(QPalette::PlaceholderText));
+    m_budgetStatus->setPalette(p);
 }
 
 void MainWindow::showNotification(const QString &title, const QString &body)

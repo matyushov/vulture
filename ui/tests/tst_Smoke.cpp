@@ -163,7 +163,7 @@ private slots:
         QStringList titles;
         for (int i = 0; i < m_window->tabs()->count(); ++i)
             titles << m_window->tabs()->tabText(i);
-        QCOMPARE(titles, (QStringList{"Live", "Alerts", "Admin"}));
+        QCOMPARE(titles, (QStringList{"Live", "Investigations", "Alerts", "Admin"}));
         QCOMPARE(m_window->client()->status().state, ConnState::Idle);
         QVERIFY(m_window->statusIndicator()->plainText().contains("Disconnected"));
     }
@@ -180,11 +180,11 @@ private slots:
 
         m_window->setReplayLookbackMs(0); // these tests use old fake event ids; replay has its own tests
         m_window->connectTo(config());
-        QTRY_COMPARE_WITH_TIMEOUT(m_window->tabs()->count(), 5, 8000);
+        QTRY_COMPARE_WITH_TIMEOUT(m_window->tabs()->count(), 6, 8000);
         QStringList titles;
         for (int i = 0; i < m_window->tabs()->count(); ++i)
             titles << m_window->tabs()->tabText(i);
-        QCOMPARE(titles, (QStringList{"Binance", "Bybit", "OKX", "Alerts", "Admin"})); // fixed order, not arrival order
+        QCOMPARE(titles, (QStringList{"Binance", "Bybit", "OKX", "Investigations", "Alerts", "Admin"})); // fixed order, not arrival order
         QCOMPARE(m_window->tabs()->currentWidget(), static_cast<QWidget *>(m_window->exchangeTab("okx"))); // first seen
         QTRY_VERIFY_WITH_TIMEOUT(m_window->liveData()->total().events() >= 3000, 10000);
         QTRY_VERIFY_WITH_TIMEOUT(m_window->statusIndicator()->plainText().startsWith("Live"), 3000);

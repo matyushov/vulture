@@ -45,6 +45,8 @@ public:
     }
     QString baseUrl() const { return QStringLiteral("http://127.0.0.1:%1").arg(m_server.serverPort()); }
     void setReply(const Reply &r) { m_reply = r; }
+    /// Extra raw header lines added to every answer, each ending in "\r\n" (for example the exchange's weight counter).
+    void setHeaders(const QByteArray &headers) { m_headers = headers; }
     /// Request targets ("/path?query") in arrival order.
     QStringList requests() const { return m_requests; }
     /// Arrival time of each request, ms since the server started (same order as requests()).
@@ -72,11 +74,11 @@ private:
             reply = m_handler(target);
         if (reply.hang)
             return;
-        QTimer::singleShot(reply.delayMs, s, [s, reply] {
+        QTimer::singleShot(reply.delayMs, s, [s, reply, extra = m_headers] {
             if (s->state() != QAbstractSocket::ConnectedState)
                 return;
             QByteArray out = "HTTP/1.1 " + QByteArray::number(reply.status) + " X\r\nContent-Type: application/json\r\nContent-Length: " +
-                             QByteArray::number(reply.body.size()) + "\r\nConnection: close\r\n\r\n" + reply.body;
+                             QByteArray::number(reply.body.size()) + "\r\n" + extra + "Connection: close\r\n\r\n" + reply.body;
             s->write(out);
             s->disconnectFromHost();
         });
@@ -84,6 +86,7 @@ private:
 
     QTcpServer m_server;
     Reply m_reply;
+    QByteArray m_headers;
     QHash<int, Reply> m_replies;
     std::function<Reply(const QString &)> m_handler;
     QElapsedTimer m_clock;

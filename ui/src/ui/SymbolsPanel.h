@@ -32,6 +32,7 @@ public slots:
 
 signals:
     void symbolSelected(const QString &symbol); ///< empty = all symbols
+    void investigateRequested(const QString &symbol); ///< context menu of a row
 
 private:
     void updateCount();

@@ -50,6 +50,12 @@ struct FeedEvent
     double oiBase = kNaN;
     double oiUsd = kNaN;
     double markPrice = kNaN;
+    // Signal events (the server's alert engine); the investigations read these.
+    QString signalType;    ///< oi_spike_up, oi_spike_down, liq_cascade
+    qint32 windowSecs = 0;
+    double changePct = kNaN;
+    double changeAbs = kNaN;
+    double threshold = kNaN;
 };
 
 /// Time that places an event on a time axis or in a sample series: the server receive time when known (the same

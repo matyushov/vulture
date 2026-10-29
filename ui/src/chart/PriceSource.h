@@ -15,6 +15,10 @@ class QNetworkReply;
 
 namespace vulture {
 
+namespace inv {
+class RateBudget;
+}
+
 struct PriceQuery
 {
     QString exchange;
@@ -64,6 +68,10 @@ public:
     void setMinRequestIntervalMs(int ms) { m_minIntervalMs = ms; }
     void setCacheTtlMs(int ms) { m_cacheTtlMs = ms; }
     void setMaxPages(int pages) { m_maxPages = pages; }
+    /// Binance requests go through the shared rate budget (the same one the investigations use) at user priority: the
+    /// chart then counts against the address's limit with everything else, and waits when the exchange has paused it.
+    /// Other exchanges keep the spacing of minRequestIntervalMs.
+    void setRateBudget(inv::RateBudget *budget) { m_budget = budget; }
     /// Wall clock in unix ms (decides "the range reaches now" and the cache age); default: the system clock.
     void setClock(std::function<qint64()> clock) { m_clock = std::move(clock); }
     /// Requests sent to the network so far (cache hits do not count).
@@ -96,6 +104,7 @@ private:
     };
 
     qint64 wall() const;
+    bool budgeted() const;
     QString cacheKey(const PriceQuery &q, const QString &raw) const;
     void fetchPage();
     void schedulePage();
@@ -107,6 +116,8 @@ private:
     QNetworkAccessManager m_net;
     QHash<QString, QString> m_baseUrls;
     QPointer<QNetworkReply> m_reply;
+    inv::RateBudget *m_budget = nullptr;
+    quint64 m_ticket = 0; ///< budget ticket of the page in flight or queued
     quint64 m_nextId = 1;
     quint64 m_activeId = 0;
     Job m_job;

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "chart/PriceSource.h"
 
+#include "investigation/BinanceApi.h"
+#include "investigation/RateBudget.h"
+
 #include <QDateTime>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -26,9 +29,19 @@ QString KlinePriceSource::cacheKey(const PriceQuery &q, const QString &raw) cons
     return QStringLiteral("%1|%2|%3").arg(q.exchange, raw).arg(q.timeframe.ms);
 }
 
+bool KlinePriceSource::budgeted() const
+{
+    return m_budget && m_job.query.exchange == QLatin1String("binance");
+}
+
 void KlinePriceSource::cancel()
 {
     m_activeId = 0;
+    if (m_ticket && m_budget) {
+        const quint64 ticket = m_ticket;
+        m_ticket = 0;
+        m_budget->cancel(ticket); // queued: removed; granted: released as aborted
+    }
     if (m_reply) {
         QNetworkReply *reply = m_reply;
         m_reply.clear();
@@ -107,6 +120,18 @@ quint64 KlinePriceSource::request(const PriceQuery &q)
 void KlinePriceSource::schedulePage()
 {
     const quint64 id = m_job.id;
+    if (budgeted()) {
+        const PriceQuery &q = m_job.query;
+        const qint64 upper = m_job.endExclusive > 0 ? m_job.endExclusive : q.range.to;
+        const qint64 remaining = std::max<qint64>(1, (upper - q.range.from + q.timeframe.ms - 1) / q.timeframe.ms);
+        const int count = static_cast<int>(std::min<qint64>(remaining, klinePageLimit(q.exchange)));
+        m_ticket = m_budget->submit(q.exchange, inv::binance::klinesCost(count), inv::Priority::User, [this, id](quint64) {
+            if (id == m_activeId && id == m_job.id)
+                fetchPage();
+            // A superseded request released its ticket in cancel().
+        });
+        return;
+    }
     qint64 delay = 0;
     const auto it = m_lastRequestAt.constFind(m_job.query.exchange);
     if (it != m_lastRequestAt.constEnd())
@@ -156,8 +181,13 @@ void KlinePriceSource::onPage(quint64 id, QNetworkReply *reply)
     if (id != m_activeId || id != m_job.id)
         return;
     m_reply.clear();
-    const QByteArray body = reply->readAll();
+    const QByteArray body = reply->isOpen() ? reply->readAll() : QByteArray();
     const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (m_ticket && m_budget) {
+        const quint64 ticket = m_ticket;
+        m_ticket = 0;
+        m_budget->complete(ticket, inv::binance::outcomeOf(status, reply, body));
+    }
     if (status == 429 || status == 418) {
         fail(QStringLiteral("%1 is rate limiting this address (HTTP %2)").arg(m_job.query.exchange).arg(status));
         return;

@@ -78,6 +78,10 @@ struct ChartSnapshot
     QString dataSource;            ///< "server (clickhouse+redis)", "stream replay", ... for the heading tooltip
     QString busy;                  ///< a request is in flight ("Loading 1h...", "Updating..."); the data shown may be old
     QString note;                  ///< a warning that does not replace the data (a refresh failed)
+    // Reuse by other three-panel views (the investigations draw price, CVD and buy / sell volume on the same view):
+    QStringList panelTitles;       ///< three panel titles replacing the OI / liquidation ones; empty = the defaults
+    QStringList binTexts;          ///< tooltip text of every bin, replacing binTooltip(); empty = the default text
+    QVector<qint64> markerTimes;   ///< vertical markers (for example the moment of a signal), unix ms
 
     qint64 firstStart() const { return bins.isEmpty() ? 0 : bins.first().start; }
     bool hasData() const { return price.ready() || oi.ready() || liq.ready(); }

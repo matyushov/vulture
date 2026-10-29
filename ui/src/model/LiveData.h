@@ -37,6 +37,11 @@ public:
     const SessionStats &total() const { return m_total; }
     qint64 now() const { return m_clock(); }
 
+    /// Called for every Signal event that is news (not replayed) and for every OI snapshot and liquidation, in stream
+    /// order, before the batch reaches the models. The investigations use it; keep it cheap.
+    using Observer = std::function<void(const FeedEvent &)>;
+    void setObserver(Observer observer) { m_observer = std::move(observer); }
+
     /// Distributes a batch (ordered as received) to the store, symbol models and counters.
     void ingest(FeedBatch batch);
     /// Starts a fresh session (new connect): counters are cleared, the symbol list and history are kept.
@@ -52,6 +57,7 @@ private:
     DisplayOptions *m_options;
     Favorites *m_favorites;
     Clock m_clock;
+    Observer m_observer;
     FeedStore m_store;
     QMap<QString, SymbolModel *> m_symbols;
     QMap<QString, SessionStats> m_stats;
